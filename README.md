@@ -12,7 +12,7 @@ _Placeholder — the primary goals and success criteria for this project will be
 
 ## Architecture
 
-_Placeholder — a summary of the system architecture, with a link to [docs/02-architecture/](docs/02-architecture/), will be added here._
+_Placeholder — a summary of the system architecture, with a link to [docs/02-architecture/](docs/02-architecture/README.md), will be added here._
 
 ## Technology Stack
 
@@ -24,16 +24,16 @@ Full project documentation lives in [docs/](docs/README.md).
 
 ## Roadmap
 
-_Placeholder — a summary of the project roadmap, with a link to [docs/roadmap/](docs/roadmap/), will be added here._
+_Placeholder — a summary of the project roadmap, with a link to [docs/roadmap/](docs/roadmap/README.md), will be added here._
 
 ## Development Workflow
 
-_Placeholder — branching strategy, local setup, and development process will be described here. See [docs/09-development/](docs/09-development/)._
+_Placeholder — branching strategy, local setup, and development process will be described here. See [docs/09-development/](docs/09-development/README.md)._
 
 ## Contributing
 
-_Placeholder — contribution guidelines will be added here._
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request, and note that this project follows a [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 
-This project is licensed under the terms of the [MIT License](LICENSE).
+This project is licensed under the terms of the [MIT License](LICENSE). Found a security issue? See [SECURITY.md](SECURITY.md).

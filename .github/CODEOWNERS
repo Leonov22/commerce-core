@@ -1,0 +1,12 @@
+# CODEOWNERS
+# Defines who is automatically requested for review when a pull request
+# changes matching files. Replace the placeholder(s) below with real
+# GitHub usernames or team handles once ownership is decided.
+#
+# Syntax reference: https://docs.github.com/articles/about-code-owners
+
+# Default owners for everything in the repository, unless overridden below.
+* @REPLACE_WITH_OWNER
+
+# Example of a path-specific override (uncomment and adjust when needed):
+# /docs/07-security/ @REPLACE_WITH_SECURITY_OWNER

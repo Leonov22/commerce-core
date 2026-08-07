@@ -1,0 +1,18 @@
+# Normalize line endings for all text files.
+# NOTE: No technology stack has been selected yet. Stack-specific rules
+# (e.g. binary asset handling, generated files) should be appended once
+# the Architect selects the technology stack.
+
+* text=auto eol=lf
+
+# Explicit text files
+*.md    text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# Windows-specific scripts keep CRLF
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
