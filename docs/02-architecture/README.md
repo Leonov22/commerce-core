@@ -10,6 +10,7 @@ requirements.
 
 - [01-SystemOverview.md](01-SystemOverview.md) — System Overview (Approved)
 - [02-ArchitectureStyle.md](02-ArchitectureStyle.md) — Architecture Style (Approved)
+- [03-DomainModel.md](03-DomainModel.md) — Domain Model (Approved)
 - [overview.md](overview.md) — High-level architecture overview
 - [system-context.md](system-context.md) — System context and boundaries
 - [non-functional-requirements.md](non-functional-requirements.md) — Non-functional requirements
