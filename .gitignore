@@ -1,0 +1,49 @@
+# =============================================================================
+# .gitignore
+# NOTE: No technology stack has been selected yet. This file currently covers
+# only OS, editor, and generic artifacts. Stack-specific rules (Node, Python,
+# .NET, etc.) should be appended once the Architect selects the technology
+# stack.
+# =============================================================================
+
+# --- Operating System ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# --- Editors / IDEs ---
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.history/
+
+# --- Environment / Secrets ---
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# --- Local tooling config (machine-specific, not shared) ---
+.claude/settings.local.json
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Generic build / dependency output (kept until a stack is chosen) ---
+dist/
+build/
+out/
+node_modules/
+*.tmp
+*.temp
+.cache/
