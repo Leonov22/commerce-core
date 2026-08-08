@@ -17,6 +17,7 @@ becoming disorganized.
 | [07-security/](07-security/README.md) | Security policies, threat models, and compliance |
 | [08-devops/](08-devops/README.md) | Infrastructure, deployment, and operations documentation |
 | [09-development/](09-development/README.md) | Development workflow, standards, and contributor guidance |
+| [10-product/](10-product/README.md) | Product architecture: MVP scope, site map, navigation, user flows, admin IA |
 | [adr/](adr/README.md) | Architecture Decision Records |
 | [roadmap/](roadmap/README.md) | Project roadmap and milestone planning |
 
