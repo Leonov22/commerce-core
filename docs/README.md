@@ -12,6 +12,7 @@ becoming disorganized.
 | [02-architecture/](02-architecture/README.md) | System architecture, diagrams, and design documentation |
 | [03-database/](03-database/README.md) | Data models, schemas, and database design |
 | [04-api/](04-api/README.md) | API contracts, specifications, and integration documentation |
+| [06-api/](06-api/README.md) | REST API architecture: endpoints, versioning, auth, and response format |
 | [05-frontend/](05-frontend/README.md) | Frontend application design and conventions |
 | [06-admin/](06-admin/README.md) | Admin/back-office application documentation |
 | [07-security/](07-security/README.md) | Security policies, threat models, and compliance |
@@ -19,6 +20,7 @@ becoming disorganized.
 | [09-development/](09-development/README.md) | Development workflow, standards, and contributor guidance |
 | [10-product/](10-product/README.md) | Product architecture: MVP scope, site map, navigation, user flows, admin IA |
 | [adr/](adr/README.md) | Architecture Decision Records |
+| [tdr/](tdr/README.md) | Technology Decision Records |
 | [roadmap/](roadmap/README.md) | Project roadmap and milestone planning |
 
 ## Conventions
