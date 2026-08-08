@@ -3,6 +3,8 @@ import { notFound } from "next/navigation";
 import { NextIntlClientProvider, hasLocale } from "next-intl";
 import { Geist, Geist_Mono } from "next/font/google";
 import { routing } from "@/core/i18n/routing";
+import { SiteHeader } from "@/shared/components/layout/site-header";
+import { SiteFooter } from "@/shared/components/layout/site-footer";
 import "../globals.css";
 
 const geistSans = Geist({
@@ -39,7 +41,11 @@ export default async function LocaleLayout({ children, params }: Props) {
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">
-        <NextIntlClientProvider>{children}</NextIntlClientProvider>
+        <NextIntlClientProvider>
+          <SiteHeader />
+          <main className="flex-1">{children}</main>
+          <SiteFooter />
+        </NextIntlClientProvider>
       </body>
     </html>
   );

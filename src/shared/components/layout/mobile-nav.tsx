@@ -1,0 +1,54 @@
+"use client";
+
+import { useState } from "react";
+import { Menu, X } from "lucide-react";
+import { useTranslations } from "next-intl";
+import { Link } from "@/core/i18n/navigation";
+import { navItems } from "@/shared/components/layout/nav-items";
+
+export function MobileNav() {
+  const [open, setOpen] = useState(false);
+  const tHeader = useTranslations("Header");
+  const tNav = useTranslations("Nav");
+
+  return (
+    <div className="md:hidden">
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls="mobile-nav-panel"
+        aria-label={open ? tHeader("closeMenu") : tHeader("openMenu")}
+        onClick={() => setOpen((value) => !value)}
+        className="inline-flex h-10 w-10 items-center justify-center rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+      >
+        {open ? (
+          <X aria-hidden="true" className="h-5 w-5" />
+        ) : (
+          <Menu aria-hidden="true" className="h-5 w-5" />
+        )}
+      </button>
+
+      {open ? (
+        <nav
+          id="mobile-nav-panel"
+          aria-label={tHeader("brand")}
+          className="absolute inset-x-0 top-16 border-b border-border bg-background px-4 pb-6 pt-2 sm:px-6"
+        >
+          <ul className="flex flex-col gap-1">
+            {navItems.map((item) => (
+              <li key={item.href}>
+                <Link
+                  href={item.href}
+                  onClick={() => setOpen(false)}
+                  className="block rounded-md px-3 py-3 text-base font-medium text-foreground hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                >
+                  {tNav(item.labelKey)}
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </nav>
+      ) : null}
+    </div>
+  );
+}

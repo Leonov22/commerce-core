@@ -1,5 +1,70 @@
 {
-  "HomePage": {
-    "title": "Commerce Core"
+  "Meta": {
+    "home": {
+      "title": "Commerce Core — Design-led commerce platform",
+      "description": "An early visual preview of the Commerce Core storefront — a modular, design-led foundation for modern product brands."
+    }
+  },
+  "Nav": {
+    "shop": "Shop",
+    "about": "About",
+    "contact": "Contact"
+  },
+  "Header": {
+    "brand": "Commerce Core",
+    "openMenu": "Open menu",
+    "closeMenu": "Close menu",
+    "cart": "Cart",
+    "language": "Language"
+  },
+  "Hero": {
+    "eyebrow": "Commerce Core",
+    "headline": "Design-led commerce, built to last.",
+    "subtext": "A calm, considered foundation for showcasing products with clarity — ready for your brand, your catalog, your customers.",
+    "primaryCta": "Explore the shop",
+    "secondaryCta": "About the platform",
+    "visualLabel": "Product showcase placeholder"
+  },
+  "FeaturedProducts": {
+    "eyebrow": "Selected pieces",
+    "title": "Featured products",
+    "subtitle": "A first look at how products will be presented — final catalog and imagery to follow.",
+    "viewAll": "View all products",
+    "newBadge": "New",
+    "limitedBadge": "Limited",
+    "imagePlaceholder": "Product image placeholder"
+  },
+  "BrandValues": {
+    "eyebrow": "Why Commerce Core",
+    "title": "Built around what matters",
+    "materialsTitle": "Considered materials",
+    "materialsBody": "Every product is selected for quality and longevity.",
+    "presentationTitle": "Thoughtful presentation",
+    "presentationBody": "A calm, focused browsing experience — no clutter, no noise.",
+    "scaleTitle": "Built to scale",
+    "scaleBody": "One flexible foundation, ready for future collections and brands."
+  },
+  "Cta": {
+    "title": "Ready to see the full catalog?",
+    "subtitle": "This is an early visual preview. The complete shopping experience is coming next.",
+    "button": "Go to shop"
+  },
+  "Footer": {
+    "brand": "Commerce Core",
+    "tagline": "A modular foundation for modern storefronts.",
+    "navHeading": "Explore",
+    "legalHeading": "Legal",
+    "legal": {
+      "privacy": "Privacy Policy",
+      "terms": "Terms of Service"
+    },
+    "socialHeading": "Follow",
+    "social": {
+      "instagram": "Instagram",
+      "x": "X",
+      "pinterest": "Pinterest"
+    },
+    "language": "Language",
+    "rights": "© {year} Commerce Core. All rights reserved."
   }
 }
