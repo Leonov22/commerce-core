@@ -22,13 +22,13 @@ export async function SiteFooter() {
 
   return (
     <footer className="border-t border-border">
-      <Container className="grid gap-10 py-16 sm:grid-cols-2 lg:grid-cols-4">
-        <div className="lg:col-span-2">
+      <Container className="grid gap-10 py-16 sm:grid-cols-2 sm:gap-x-8 lg:grid-cols-12">
+        <div className="sm:col-span-2 lg:col-span-4">
           <p className="text-base font-semibold tracking-tight">{tFooter("brand")}</p>
           <p className="mt-3 max-w-xs text-sm text-muted-foreground">{tFooter("tagline")}</p>
         </div>
 
-        <nav aria-label={tFooter("navHeading")}>
+        <nav aria-label={tFooter("navHeading")} className="lg:col-span-2">
           <h2 className="text-sm font-medium">{tFooter("navHeading")}</h2>
           <ul className="mt-4 flex flex-col gap-3">
             {navItems.map((item) => (
@@ -44,7 +44,7 @@ export async function SiteFooter() {
           </ul>
         </nav>
 
-        <nav aria-label={tFooter("legalHeading")}>
+        <nav aria-label={tFooter("legalHeading")} className="lg:col-span-2">
           <h2 className="text-sm font-medium">{tFooter("legalHeading")}</h2>
           <ul className="mt-4 flex flex-col gap-3">
             {legalItems.map((item) => (
@@ -60,11 +60,13 @@ export async function SiteFooter() {
           </ul>
         </nav>
 
-        <div>
+        <div className="lg:col-span-2">
           <h2 className="text-sm font-medium">{tFooter("socialHeading")}</h2>
           <p className="mt-4 text-sm text-muted-foreground">{socialLabels.join(" · ")}</p>
+        </div>
 
-          <h2 className="mt-8 text-sm font-medium">{tFooter("language")}</h2>
+        <div className="lg:col-span-2">
+          <h2 className="text-sm font-medium">{tFooter("language")}</h2>
           <LanguageSwitcher className="mt-4 block" />
         </div>
       </Container>

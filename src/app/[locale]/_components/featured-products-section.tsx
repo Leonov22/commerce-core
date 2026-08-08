@@ -2,7 +2,7 @@ import { getTranslations } from "next-intl/server";
 import { ArrowRight } from "lucide-react";
 import { Link } from "@/core/i18n/navigation";
 import { Container } from "@/shared/components/layout/container";
-import { ProductCard } from "@/app/[locale]/_components/product-card";
+import { ProductCard } from "@/shared/components/product-card";
 
 /**
  * Static mock data for visual composition only — not a Product entity.

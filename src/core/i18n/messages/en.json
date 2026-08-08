@@ -56,6 +56,64 @@
       }
     }
   },
+  "Catalog": {
+    "meta": {
+      "title": "Shop — Commerce Core",
+      "description": "Browse the early Commerce Core catalog preview — a first look at how the full product catalog will be presented."
+    },
+    "eyebrow": "Full catalog",
+    "title": "Shop",
+    "intro": "An early look at the full catalog experience — static preview data for now, real inventory to follow.",
+    "filters": {
+      "categoryLabel": "Filter by category",
+      "all": "All"
+    },
+    "categories": {
+      "seating": "Seating",
+      "lighting": "Lighting",
+      "textiles": "Textiles",
+      "decor": "Decor"
+    },
+    "empty": {
+      "title": "No products in this category yet",
+      "body": "Try selecting a different category."
+    },
+    "newBadge": "New",
+    "limitedBadge": "Limited",
+    "imagePlaceholder": "Product image placeholder",
+    "products": {
+      "studioChair": {
+        "name": "Studio Chair",
+        "meta": "Oak & linen",
+        "price": "$240"
+      },
+      "loungeChair": {
+        "name": "Lounge Chair",
+        "meta": "Bouclé & ash",
+        "price": "$310"
+      },
+      "tableLamp": {
+        "name": "Table Lamp",
+        "meta": "Brushed brass",
+        "price": "$96"
+      },
+      "pendantLight": {
+        "name": "Pendant Light",
+        "meta": "Opal glass",
+        "price": "$145"
+      },
+      "woolThrow": {
+        "name": "Wool Throw",
+        "meta": "Undyed merino wool",
+        "price": "$128"
+      },
+      "ceramicVase": {
+        "name": "Ceramic Vase",
+        "meta": "Handmade ceramic",
+        "price": "$86"
+      }
+    }
+  },
   "BrandValues": {
     "eyebrow": "Why Commerce Core",
     "title": "Built around what matters",
