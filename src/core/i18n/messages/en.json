@@ -32,7 +32,29 @@
     "viewAll": "View all products",
     "newBadge": "New",
     "limitedBadge": "Limited",
-    "imagePlaceholder": "Product image placeholder"
+    "imagePlaceholder": "Product image placeholder",
+    "products": {
+      "studioChair": {
+        "name": "Studio Chair",
+        "meta": "Oak & linen",
+        "price": "$240"
+      },
+      "ceramicVase": {
+        "name": "Ceramic Vase",
+        "meta": "Handmade ceramic",
+        "price": "$86"
+      },
+      "woolThrow": {
+        "name": "Wool Throw",
+        "meta": "Undyed merino wool",
+        "price": "$128"
+      },
+      "tableLamp": {
+        "name": "Table Lamp",
+        "meta": "Brushed brass",
+        "price": "$96"
+      }
+    }
   },
   "BrandValues": {
     "eyebrow": "Why Commerce Core",

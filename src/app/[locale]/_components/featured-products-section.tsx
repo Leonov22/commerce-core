@@ -6,21 +6,23 @@ import { ProductCard } from "@/app/[locale]/_components/product-card";
 
 /**
  * Static mock data for visual composition only — not a Product entity.
+ * Display strings (name/meta/price) live in the FeaturedProducts.products
+ * translation namespace; this only references translation keys.
  * Real catalog data will replace this once the catalog module is implemented.
  */
+type MockProductTranslationKey = "studioChair" | "ceramicVase" | "woolThrow" | "tableLamp";
+
 type MockProduct = {
   id: string;
-  name: string;
-  meta: string;
-  price: string;
+  translationKey: MockProductTranslationKey;
   badge?: "New" | "Limited";
 };
 
 const mockProducts: MockProduct[] = [
-  { id: "1", name: "Studio Chair", meta: "Oak & linen", price: "$240", badge: "New" },
-  { id: "2", name: "Ceramic Vase", meta: "Handmade ceramic", price: "$86" },
-  { id: "3", name: "Wool Throw", meta: "Undyed merino wool", price: "$128" },
-  { id: "4", name: "Table Lamp", meta: "Brushed brass", price: "$96", badge: "Limited" },
+  { id: "1", translationKey: "studioChair", badge: "New" },
+  { id: "2", translationKey: "ceramicVase" },
+  { id: "3", translationKey: "woolThrow" },
+  { id: "4", translationKey: "tableLamp", badge: "Limited" },
 ];
 
 export async function FeaturedProductsSection() {
@@ -51,9 +53,9 @@ export async function FeaturedProductsSection() {
           {mockProducts.map((product) => (
             <ProductCard
               key={product.id}
-              name={product.name}
-              meta={product.meta}
-              price={product.price}
+              name={t(`products.${product.translationKey}.name`)}
+              meta={t(`products.${product.translationKey}.meta`)}
+              price={t(`products.${product.translationKey}.price`)}
               badge={
                 product.badge === "New"
                   ? t("newBadge")
