@@ -1,9 +1,6 @@
 # =============================================================================
 # .gitignore
-# NOTE: No technology stack has been selected yet. This file currently covers
-# only OS, editor, and generic artifacts. Stack-specific rules (Node, Python,
-# .NET, etc.) should be appended once the Architect selects the technology
-# stack.
+# Stack: Next.js 15 (App Router) + TypeScript + pnpm, per TDR-001-Tech-Stack.
 # =============================================================================
 
 # --- Operating System ---
@@ -39,7 +36,7 @@ desktop.ini
 *.log
 logs/
 
-# --- Generic build / dependency output (kept until a stack is chosen) ---
+# --- Generic build / dependency output ---
 dist/
 build/
 out/
@@ -47,3 +44,24 @@ node_modules/
 *.tmp
 *.temp
 .cache/
+
+# --- Next.js ---
+/.next/
+next-env.d.ts
+*.tsbuildinfo
+
+# --- pnpm ---
+.pnpm-debug.log*
+.pnpm-store/
+
+# --- Testing ---
+/coverage
+
+# --- Prisma ---
+prisma/*.db
+prisma/*.db-journal
+
+# --- Vercel ---
+.vercel
+
+/src/generated/prisma
