@@ -2,7 +2,7 @@ import { getTranslations } from "next-intl/server";
 import { ArrowLeft, Package } from "lucide-react";
 import { Link } from "@/core/i18n/navigation";
 import { Container } from "@/shared/components/layout/container";
-import { Button } from "@/shared/components/ui/button";
+import { AddToCartButton } from "@/modules/cart";
 import type { CatalogProduct } from "@/modules/catalog/types/catalog-product";
 
 interface ProductDetailsViewProps {
@@ -95,12 +95,7 @@ export async function ProductDetailsView({ product }: ProductDetailsViewProps) {
             </div>
 
             <div className="mt-8">
-              <Button disabled aria-describedby="add-to-cart-note" className="w-full sm:w-auto">
-                {tDetails("addToCart.button")}
-              </Button>
-              <p id="add-to-cart-note" className="mt-2 text-xs text-muted-foreground">
-                {tDetails("addToCart.unavailable")}
-              </p>
+              <AddToCartButton productId={product.id} />
             </div>
           </div>
         </div>

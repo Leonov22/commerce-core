@@ -10,12 +10,24 @@ import type { CatalogCategoryKey, CatalogProduct } from "@/modules/catalog/types
  */
 export function getCatalogProducts(): CatalogProduct[] {
   return [
-    { id: "1", translationKey: "studioChair", categoryKey: "seating", badgeKey: "new" },
-    { id: "2", translationKey: "loungeChair", categoryKey: "seating" },
-    { id: "3", translationKey: "tableLamp", categoryKey: "lighting", badgeKey: "limited" },
-    { id: "4", translationKey: "pendantLight", categoryKey: "lighting" },
-    { id: "5", translationKey: "woolThrow", categoryKey: "textiles" },
-    { id: "6", translationKey: "ceramicVase", categoryKey: "decor" },
+    {
+      id: "1",
+      translationKey: "studioChair",
+      categoryKey: "seating",
+      badgeKey: "new",
+      priceAmount: 240,
+    },
+    { id: "2", translationKey: "loungeChair", categoryKey: "seating", priceAmount: 310 },
+    {
+      id: "3",
+      translationKey: "tableLamp",
+      categoryKey: "lighting",
+      badgeKey: "limited",
+      priceAmount: 96,
+    },
+    { id: "4", translationKey: "pendantLight", categoryKey: "lighting", priceAmount: 145 },
+    { id: "5", translationKey: "woolThrow", categoryKey: "textiles", priceAmount: 128 },
+    { id: "6", translationKey: "ceramicVase", categoryKey: "decor", priceAmount: 86 },
   ];
 }
 

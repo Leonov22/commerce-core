@@ -15,6 +15,7 @@
     "openMenu": "Open menu",
     "closeMenu": "Close menu",
     "cart": "Cart",
+    "cartWithCount": "Cart, {count, plural, one {# item} other {# items}}",
     "language": "Language"
   },
   "Hero": {
@@ -127,7 +128,7 @@
     },
     "addToCart": {
       "button": "Add to cart",
-      "unavailable": "Cart functionality is not available yet in this preview."
+      "addedMessage": "Added to cart."
     },
     "imagePlaceholder": "Product visual placeholder",
     "notFound": {
@@ -185,6 +186,24 @@
         }
       }
     }
+  },
+  "Cart": {
+    "meta": {
+      "title": "Cart — Commerce Core",
+      "description": "Review the items in your cart."
+    },
+    "title": "Cart",
+    "summaryHeading": "Order summary",
+    "subtotal": "Subtotal",
+    "subtotalValue": "${amount}",
+    "checkout": "Checkout",
+    "checkoutUnavailable": "Checkout will be available soon.",
+    "remove": "Remove",
+    "increaseQuantity": "Increase quantity",
+    "decreaseQuantity": "Decrease quantity",
+    "emptyTitle": "Your cart is empty.",
+    "emptyBody": "Discover pieces designed for everyday living.",
+    "continueShopping": "Continue shopping"
   },
   "BrandValues": {
     "eyebrow": "Why Commerce Core",

@@ -12,4 +12,11 @@ export interface CatalogProduct {
   translationKey: string;
   categoryKey?: CatalogCategoryKey;
   badgeKey?: CatalogBadgeKey;
+  /**
+   * Numeric backing value for the translated price string
+   * (`Catalog.products.<key>.price`), used only for presentation-layer
+   * calculations such as the Cart subtotal. Not a source of truth for
+   * checkout — a future backend must recalculate authoritative prices.
+   */
+  priceAmount: number;
 }

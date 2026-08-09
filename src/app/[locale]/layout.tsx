@@ -5,6 +5,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 import { routing } from "@/core/i18n/routing";
 import { SiteHeader } from "@/shared/components/layout/site-header";
 import { SiteFooter } from "@/shared/components/layout/site-footer";
+import { CartProvider, CartNavLink } from "@/modules/cart";
 import "../globals.css";
 
 const geistSans = Geist({
@@ -42,9 +43,11 @@ export default async function LocaleLayout({ children, params }: Props) {
     >
       <body className="min-h-full flex flex-col">
         <NextIntlClientProvider>
-          <SiteHeader />
-          <main className="flex-1">{children}</main>
-          <SiteFooter />
+          <CartProvider>
+            <SiteHeader cartSlot={<CartNavLink />} />
+            <main className="flex-1">{children}</main>
+            <SiteFooter />
+          </CartProvider>
         </NextIntlClientProvider>
       </body>
     </html>

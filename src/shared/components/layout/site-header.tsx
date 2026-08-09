@@ -1,12 +1,21 @@
+import type { ReactNode } from "react";
 import { getTranslations } from "next-intl/server";
-import { ShoppingBag } from "lucide-react";
 import { Link } from "@/core/i18n/navigation";
 import { Container } from "@/shared/components/layout/container";
 import { LanguageSwitcher } from "@/shared/components/layout/language-switcher";
 import { MobileNav } from "@/shared/components/layout/mobile-nav";
 import { navItems } from "@/shared/components/layout/nav-items";
 
-export async function SiteHeader() {
+interface SiteHeaderProps {
+  /**
+   * The cart entry point is a feature-owned widget (it reads Cart Context),
+   * so the layout composes it and passes it in here — this keeps
+   * `shared/` free of any dependency on `modules/cart`.
+   */
+  cartSlot: ReactNode;
+}
+
+export async function SiteHeader({ cartSlot }: SiteHeaderProps) {
   const tHeader = await getTranslations("Header");
   const tNav = await getTranslations("Nav");
 
@@ -37,13 +46,7 @@ export async function SiteHeader() {
 
         <div className="flex items-center gap-3">
           <LanguageSwitcher className="hidden sm:block" />
-          <Link
-            href="/cart"
-            className="inline-flex h-10 w-10 items-center justify-center rounded-md hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-          >
-            <span className="sr-only">{tHeader("cart")}</span>
-            <ShoppingBag aria-hidden="true" className="h-5 w-5" />
-          </Link>
+          {cartSlot}
           <MobileNav />
         </div>
       </Container>
