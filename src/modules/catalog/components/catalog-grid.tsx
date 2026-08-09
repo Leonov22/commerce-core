@@ -34,6 +34,7 @@ export function CatalogGrid({ products }: CatalogGridProps) {
                 : undefined
           }
           imageLabel={t("imagePlaceholder")}
+          href={`/shop/${product.id}`}
         />
       ))}
     </div>

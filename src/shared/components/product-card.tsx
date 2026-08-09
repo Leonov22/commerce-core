@@ -1,4 +1,5 @@
 import { Package } from "lucide-react";
+import { Link } from "@/core/i18n/navigation";
 
 interface ProductCardProps {
   name: string;
@@ -6,15 +7,16 @@ interface ProductCardProps {
   price: string;
   badge?: string;
   imageLabel: string;
+  href?: string;
 }
 
-export function ProductCard({ name, meta, price, badge, imageLabel }: ProductCardProps) {
-  return (
-    <article className="group">
+export function ProductCard({ name, meta, price, badge, imageLabel, href }: ProductCardProps) {
+  const content = (
+    <>
       <div
         role="img"
         aria-label={imageLabel}
-        className="relative flex aspect-square items-center justify-center rounded-lg border border-border bg-muted"
+        className="relative flex aspect-square items-center justify-center rounded-lg border border-border bg-muted transition-colors group-hover:border-foreground/30"
       >
         <Package
           aria-hidden="true"
@@ -31,6 +33,19 @@ export function ProductCard({ name, meta, price, badge, imageLabel }: ProductCar
       <h3 className="mt-4 text-sm font-medium">{name}</h3>
       <p className="mt-1 text-sm text-muted-foreground">{meta}</p>
       <p className="mt-2 text-sm font-medium">{price}</p>
-    </article>
+    </>
   );
+
+  if (href) {
+    return (
+      <Link
+        href={href}
+        className="group block rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+      >
+        {content}
+      </Link>
+    );
+  }
+
+  return <article className="group">{content}</article>;
 }

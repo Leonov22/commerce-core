@@ -114,6 +114,78 @@
       }
     }
   },
+  "ProductDetails": {
+    "meta": {
+      "titleSuffix": "Commerce Core"
+    },
+    "back": "Back to shop",
+    "attributes": {
+      "heading": "Details",
+      "materialLabel": "Material",
+      "dimensionsLabel": "Dimensions",
+      "availabilityLabel": "Availability"
+    },
+    "addToCart": {
+      "button": "Add to cart",
+      "unavailable": "Cart functionality is not available yet in this preview."
+    },
+    "imagePlaceholder": "Product visual placeholder",
+    "notFound": {
+      "title": "Product not found",
+      "body": "This product may have been removed, or the link is incorrect.",
+      "cta": "Back to shop"
+    },
+    "products": {
+      "studioChair": {
+        "description": "A considered studio chair in solid oak with a natural linen seat — designed to feel equally at home in a living room or a studio corner.",
+        "attributes": {
+          "material": "Solid oak, linen upholstery",
+          "dimensions": "58 × 60 × 78 cm",
+          "availability": "Made to order"
+        }
+      },
+      "loungeChair": {
+        "description": "A low, relaxed lounge chair upholstered in bouclé with a solid ash frame — built for slow afternoons.",
+        "attributes": {
+          "material": "Ash frame, bouclé upholstery",
+          "dimensions": "72 × 78 × 74 cm",
+          "availability": "In stock"
+        }
+      },
+      "tableLamp": {
+        "description": "A compact table lamp in brushed brass with a soft, warm glow — a quiet detail for a desk or side table.",
+        "attributes": {
+          "material": "Brushed brass",
+          "dimensions": "18 × 18 × 34 cm",
+          "availability": "In stock"
+        }
+      },
+      "pendantLight": {
+        "description": "An opal glass pendant light that diffuses a soft, even light — a calm centerpiece for a dining table or entryway.",
+        "attributes": {
+          "material": "Opal glass, brass fitting",
+          "dimensions": "Ø 24 × 22 cm",
+          "availability": "Made to order"
+        }
+      },
+      "woolThrow": {
+        "description": "An undyed merino wool throw, kept soft and breathable through a simple, natural finishing process.",
+        "attributes": {
+          "material": "100% merino wool",
+          "dimensions": "130 × 180 cm",
+          "availability": "In stock"
+        }
+      },
+      "ceramicVase": {
+        "description": "A handmade ceramic vase with a subtly uneven glaze — no two pieces are exactly alike.",
+        "attributes": {
+          "material": "Glazed stoneware",
+          "dimensions": "Ø 16 × 28 cm",
+          "availability": "Limited availability"
+        }
+      }
+    }
+  },
   "BrandValues": {
     "eyebrow": "Why Commerce Core",
     "title": "Built around what matters",

@@ -22,3 +22,7 @@ export function getCatalogProducts(): CatalogProduct[] {
 export function getCatalogCategories(): CatalogCategoryKey[] {
   return ["seating", "lighting", "textiles", "decor"];
 }
+
+export function getCatalogProductById(id: string): CatalogProduct | undefined {
+  return getCatalogProducts().find((product) => product.id === id);
+}
