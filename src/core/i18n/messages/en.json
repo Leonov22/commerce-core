@@ -205,6 +205,62 @@
     "emptyBody": "Discover pieces designed for everyday living.",
     "continueShopping": "Continue shopping"
   },
+  "Checkout": {
+    "meta": {
+      "title": "Checkout — Commerce Core",
+      "description": "Complete your order details."
+    },
+    "title": "Checkout",
+    "intro": "Enter your contact and delivery details to continue.",
+    "guestNotice": "Checking out as a guest — no account required.",
+    "empty": {
+      "title": "Your cart is empty.",
+      "body": "Add a few pieces to your cart before checking out.",
+      "continueShopping": "Continue shopping"
+    },
+    "contact": {
+      "heading": "Contact information",
+      "fullName": "Full name",
+      "email": "Email",
+      "phone": "Phone"
+    },
+    "delivery": {
+      "heading": "Delivery",
+      "address": "Address",
+      "city": "City",
+      "postalCode": "Postal code",
+      "methodLabel": "Delivery method",
+      "methods": {
+        "standard": {
+          "label": "Standard delivery",
+          "description": "3–5 business days"
+        },
+        "express": {
+          "label": "Express delivery",
+          "description": "1–2 business days"
+        }
+      }
+    },
+    "summary": {
+      "heading": "Order summary",
+      "quantity": "Qty {quantity}",
+      "subtotal": "Subtotal",
+      "delivery": "Delivery",
+      "deliveryPending": "Select a method",
+      "total": "Total",
+      "amount": "${amount}",
+      "disclaimer": "Final pricing, taxes, and shipping will be confirmed at payment — not yet available in this preview."
+    },
+    "submit": "Continue to payment",
+    "submitNote": "Payment is not available in this preview.",
+    "submitSuccess": "Details look good. Payment isn't available in this preview yet.",
+    "errors": {
+      "required": "This field is required.",
+      "invalidEmail": "Enter a valid email address.",
+      "deliveryMethodRequired": "Select a delivery method.",
+      "summary": "Please review the highlighted fields."
+    }
+  },
   "BrandValues": {
     "eyebrow": "Why Commerce Core",
     "title": "Built around what matters",
