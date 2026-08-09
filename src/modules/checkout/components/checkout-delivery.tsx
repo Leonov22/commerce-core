@@ -59,7 +59,11 @@ export function CheckoutDelivery({
         />
       </div>
 
-      <fieldset className="mt-6">
+      <fieldset
+        className="mt-6"
+        aria-invalid={errors.deliveryMethod ? true : undefined}
+        aria-describedby={errors.deliveryMethod ? "delivery-method-error" : undefined}
+      >
         <legend className="text-sm font-medium">{t("delivery.methodLabel")}</legend>
         <div className="mt-3 flex flex-col gap-3">
           {DELIVERY_OPTIONS.map((option) => (
@@ -92,7 +96,7 @@ export function CheckoutDelivery({
           ))}
         </div>
         {errors.deliveryMethod ? (
-          <p role="alert" className="mt-2 text-xs text-destructive">
+          <p id="delivery-method-error" role="alert" className="mt-2 text-xs text-destructive">
             {errors.deliveryMethod}
           </p>
         ) : null}

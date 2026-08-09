@@ -1,3 +1,5 @@
+import { cn } from "@/core/lib/utils";
+
 interface CheckoutFieldProps {
   id: string;
   label: string;
@@ -32,7 +34,12 @@ export function CheckoutField({
         onChange={(event) => onChange(event.target.value)}
         aria-invalid={error ? true : undefined}
         aria-describedby={error ? errorId : undefined}
-        className="mt-1.5 w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+        className={cn(
+          "mt-1.5 w-full rounded-md border bg-transparent px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+          error
+            ? "border-destructive focus-visible:ring-destructive"
+            : "border-border focus-visible:ring-ring",
+        )}
       />
       {error ? (
         <p id={errorId} className="mt-1.5 text-xs text-destructive">
