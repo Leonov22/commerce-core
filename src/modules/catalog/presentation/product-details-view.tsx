@@ -82,15 +82,17 @@ export async function ProductDetailsView({ product }: ProductDetailsViewProps) {
               {tDetails(`products.${key}.description`)}
             </p>
 
-            <dl className="mt-8 flex flex-col gap-3 border-t border-border pt-6">
+            <div className="mt-8 border-t border-border pt-6">
               <h2 className="sr-only">{tDetails("attributes.heading")}</h2>
-              {attributes.map((attribute) => (
-                <div key={attribute.label} className="flex justify-between gap-4 text-sm">
-                  <dt className="text-muted-foreground">{attribute.label}</dt>
-                  <dd className="font-medium">{attribute.value}</dd>
-                </div>
-              ))}
-            </dl>
+              <dl className="flex flex-col gap-3">
+                {attributes.map((attribute) => (
+                  <div key={attribute.label} className="flex justify-between gap-4 text-sm">
+                    <dt className="text-muted-foreground">{attribute.label}</dt>
+                    <dd className="font-medium">{attribute.value}</dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
 
             <div className="mt-8">
               <Button disabled aria-describedby="add-to-cart-note" className="w-full sm:w-auto">
