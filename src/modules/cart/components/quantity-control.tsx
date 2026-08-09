@@ -3,11 +3,17 @@ import { useTranslations } from "next-intl";
 
 interface QuantityControlProps {
   quantity: number;
+  productName: string;
   onIncrease: () => void;
   onDecrease: () => void;
 }
 
-export function QuantityControl({ quantity, onIncrease, onDecrease }: QuantityControlProps) {
+export function QuantityControl({
+  quantity,
+  productName,
+  onIncrease,
+  onDecrease,
+}: QuantityControlProps) {
   const t = useTranslations("Cart");
 
   return (
@@ -15,7 +21,7 @@ export function QuantityControl({ quantity, onIncrease, onDecrease }: QuantityCo
       <button
         type="button"
         onClick={onDecrease}
-        aria-label={t("decreaseQuantity")}
+        aria-label={t("decreaseQuantity", { product: productName })}
         className="flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
       >
         <Minus aria-hidden="true" className="h-4 w-4" />
@@ -26,7 +32,7 @@ export function QuantityControl({ quantity, onIncrease, onDecrease }: QuantityCo
       <button
         type="button"
         onClick={onIncrease}
-        aria-label={t("increaseQuantity")}
+        aria-label={t("increaseQuantity", { product: productName })}
         className="flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
       >
         <Plus aria-hidden="true" className="h-4 w-4" />

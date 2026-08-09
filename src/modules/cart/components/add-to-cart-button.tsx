@@ -25,8 +25,8 @@ export function AddToCartButton({ productId }: AddToCartButtonProps) {
       >
         {t("addToCart.button")}
       </Button>
-      <p role="status" aria-live="polite" className="mt-2 text-xs text-muted-foreground">
-        {added ? t("addToCart.addedMessage") : " "}
+      <p role="status" aria-live="polite" className="mt-2 h-4 text-xs text-muted-foreground">
+        {added ? t("addToCart.addedMessage") : null}
       </p>
     </div>
   );

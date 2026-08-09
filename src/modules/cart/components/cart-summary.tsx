@@ -1,6 +1,6 @@
 import { useTranslations } from "next-intl";
 import { Button } from "@/shared/components/ui/button";
-import { getCatalogProductById } from "@/modules/catalog/presentation/catalog-data";
+import { getCatalogProductById } from "@/modules/catalog";
 import type { CartItem } from "@/modules/cart/types/cart";
 
 interface CartSummaryProps {

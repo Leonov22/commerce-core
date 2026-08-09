@@ -1,6 +1,6 @@
 import { useTranslations } from "next-intl";
 import { Package, X } from "lucide-react";
-import { getCatalogProductById } from "@/modules/catalog/presentation/catalog-data";
+import { getCatalogProductById } from "@/modules/catalog";
 import { QuantityControl } from "@/modules/cart/components/quantity-control";
 import type { CartItem as CartItemData } from "@/modules/cart/types/cart";
 
@@ -48,6 +48,7 @@ export function CartItem({ item, onIncrease, onDecrease, onRemove }: CartItemPro
         <div className="mt-4 flex items-center justify-between gap-4">
           <QuantityControl
             quantity={item.quantity}
+            productName={name}
             onIncrease={onIncrease}
             onDecrease={onDecrease}
           />

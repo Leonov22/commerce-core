@@ -199,8 +199,8 @@
     "checkout": "Checkout",
     "checkoutUnavailable": "Checkout will be available soon.",
     "remove": "Remove",
-    "increaseQuantity": "Increase quantity",
-    "decreaseQuantity": "Decrease quantity",
+    "increaseQuantity": "Increase quantity — {product}",
+    "decreaseQuantity": "Decrease quantity — {product}",
     "emptyTitle": "Your cart is empty.",
     "emptyBody": "Discover pieces designed for everyday living.",
     "continueShopping": "Continue shopping"
