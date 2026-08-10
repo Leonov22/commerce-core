@@ -1,4 +1,5 @@
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
+import { formatProductPrice } from "@/modules/catalog/client";
 import { CheckoutField } from "@/modules/checkout/components/checkout-field";
 import { DELIVERY_OPTIONS } from "@/modules/checkout/types/checkout";
 import type {
@@ -23,6 +24,7 @@ export function CheckoutDelivery({
   onDeliveryMethodChange,
 }: CheckoutDeliveryProps) {
   const t = useTranslations("Checkout");
+  const locale = useLocale();
 
   return (
     <section aria-labelledby="checkout-delivery-heading">
@@ -90,7 +92,9 @@ export function CheckoutDelivery({
                 </span>
               </span>
               <span className="text-sm text-muted-foreground">
-                {t("summary.amount", { amount: option.priceAmount })}
+                {t("summary.amount", {
+                  amount: formatProductPrice(option.priceAmountMinor, "USD", locale),
+                })}
               </span>
             </label>
           ))}

@@ -1,43 +1,34 @@
-import { getTranslations } from "next-intl/server";
+import { getLocale, getTranslations } from "next-intl/server";
 import { ArrowLeft, Package } from "lucide-react";
 import { Link } from "@/core/i18n/navigation";
 import { Container } from "@/shared/components/layout/container";
 import { AddToCartButton } from "@/modules/cart";
-import type { CatalogProduct } from "@/modules/catalog/types/catalog-product";
+import { formatProductPrice } from "@/modules/catalog/client";
+import type { Product } from "@/modules/catalog";
 
 interface ProductDetailsViewProps {
-  product: CatalogProduct;
+  product: Product;
+  categoryName: string | undefined;
 }
 
-export async function ProductDetailsView({ product }: ProductDetailsViewProps) {
+export async function ProductDetailsView({ product, categoryName }: ProductDetailsViewProps) {
+  const locale = await getLocale();
   const tCatalog = await getTranslations("Catalog");
   const tDetails = await getTranslations("ProductDetails");
-  const key = product.translationKey;
 
-  const name = tCatalog(`products.${key}.name`);
-  const meta = tCatalog(`products.${key}.meta`);
-  const price = tCatalog(`products.${key}.price`);
-  const category = product.categoryKey ? tCatalog(`categories.${product.categoryKey}`) : undefined;
+  const name = product.translation.name;
+  const meta = product.translation.meta;
+  const price = formatProductPrice(product.priceAmountMinor, product.currency, locale);
   const badge =
-    product.badgeKey === "new"
+    product.badge === "NEW"
       ? tCatalog("newBadge")
-      : product.badgeKey === "limited"
+      : product.badge === "LIMITED"
         ? tCatalog("limitedBadge")
         : undefined;
 
   const attributes = [
-    {
-      label: tDetails("attributes.materialLabel"),
-      value: tDetails(`products.${key}.attributes.material`),
-    },
-    {
-      label: tDetails("attributes.dimensionsLabel"),
-      value: tDetails(`products.${key}.attributes.dimensions`),
-    },
-    {
-      label: tDetails("attributes.availabilityLabel"),
-      value: tDetails(`products.${key}.attributes.availability`),
-    },
+    { label: tDetails("attributes.materialLabel"), value: product.translation.material },
+    { label: tDetails("attributes.dimensionsLabel"), value: product.translation.dimensions },
   ];
 
   return (
@@ -70,16 +61,16 @@ export async function ProductDetailsView({ product }: ProductDetailsViewProps) {
           </div>
 
           <div>
-            {category ? (
+            {categoryName ? (
               <p className="text-sm font-medium uppercase tracking-widest text-muted-foreground">
-                {category}
+                {categoryName}
               </p>
             ) : null}
             <h1 className="mt-3 text-3xl font-semibold tracking-tight sm:text-4xl">{name}</h1>
             <p className="mt-2 text-sm text-muted-foreground">{meta}</p>
             <p className="mt-4 text-xl font-medium">{price}</p>
             <p className="mt-6 max-w-md leading-relaxed text-muted-foreground">
-              {tDetails(`products.${key}.description`)}
+              {product.translation.description}
             </p>
 
             <div className="mt-8 border-t border-border pt-6">

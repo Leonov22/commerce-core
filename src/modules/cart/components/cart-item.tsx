@@ -1,30 +1,37 @@
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { Package, X } from "lucide-react";
-import { getCatalogProductById } from "@/modules/catalog";
+import { formatProductPrice } from "@/modules/catalog/client";
+import type { StorefrontProductSummary } from "@/modules/catalog/client";
 import { QuantityControl } from "@/modules/cart/components/quantity-control";
 import type { CartItem as CartItemData } from "@/modules/cart/types/cart";
 
 interface CartItemProps {
   item: CartItemData;
+  product: StorefrontProductSummary | undefined;
+  isLoading: boolean;
   onIncrease: () => void;
   onDecrease: () => void;
   onRemove: () => void;
 }
 
-export function CartItem({ item, onIncrease, onDecrease, onRemove }: CartItemProps) {
+export function CartItem({
+  item,
+  product,
+  isLoading,
+  onIncrease,
+  onDecrease,
+  onRemove,
+}: CartItemProps) {
   const tCatalog = useTranslations("Catalog");
   const tCart = useTranslations("Cart");
-  const product = getCatalogProductById(item.productId);
+  const locale = useLocale();
 
-  // Cart state only stores productId — if the catalog no longer has this
-  // product, there is nothing left to render for this line.
-  if (!product) {
-    return null;
-  }
-
-  const name = tCatalog(`products.${product.translationKey}.name`);
-  const meta = tCatalog(`products.${product.translationKey}.meta`);
-  const price = tCatalog(`products.${product.translationKey}.price`);
+  const name = isLoading ? tCart("loading") : (product?.name ?? tCart("unavailableItem"));
+  const meta = isLoading ? undefined : product?.meta;
+  const price =
+    !isLoading && product
+      ? formatProductPrice(product.priceAmountMinor, product.currency, locale)
+      : undefined;
 
   return (
     <li className="flex gap-4 border-b border-border py-6 last:border-b-0">
@@ -40,15 +47,15 @@ export function CartItem({ item, onIncrease, onDecrease, onRemove }: CartItemPro
         <div className="flex items-start justify-between gap-4">
           <div>
             <p className="text-sm font-medium">{name}</p>
-            <p className="mt-1 text-sm text-muted-foreground">{meta}</p>
+            {meta ? <p className="mt-1 text-sm text-muted-foreground">{meta}</p> : null}
           </div>
-          <p className="text-sm font-medium">{price}</p>
+          {price ? <p className="text-sm font-medium">{price}</p> : null}
         </div>
 
         <div className="mt-4 flex items-center justify-between gap-4">
           <QuantityControl
             quantity={item.quantity}
-            productName={name}
+            productName={product?.name ?? name}
             onIncrease={onIncrease}
             onDecrease={onDecrease}
           />

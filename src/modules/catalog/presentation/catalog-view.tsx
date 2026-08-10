@@ -1,15 +1,12 @@
-import { getTranslations } from "next-intl/server";
+import { getLocale, getTranslations } from "next-intl/server";
 import { Container } from "@/shared/components/layout/container";
 import { CatalogBrowser } from "@/modules/catalog/components/catalog-browser";
-import {
-  getCatalogCategories,
-  getCatalogProducts,
-} from "@/modules/catalog/presentation/catalog-data";
+import { listProducts, listCategories } from "@/modules/catalog";
 
 export async function CatalogView() {
+  const locale = await getLocale();
   const t = await getTranslations("Catalog");
-  const products = getCatalogProducts();
-  const categories = getCatalogCategories();
+  const [products, categories] = await Promise.all([listProducts(locale), listCategories(locale)]);
 
   return (
     <section className="py-16 sm:py-24">

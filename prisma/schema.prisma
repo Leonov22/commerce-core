@@ -11,3 +11,98 @@ generator client {
 datasource db {
   provider = "postgresql"
 }
+
+// =============================================================================
+// Catalog — Product persistence (IMP-021)
+//
+// Source of truth for storefront product/category data. Presentation-facing
+// UI copy (labels, empty states, buttons, etc.) stays in next-intl; only
+// product-specific content (name, meta, description, material, dimensions)
+// lives here, per-locale via *Translation models.
+// =============================================================================
+
+enum ProductStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum ProductBadge {
+  NEW
+  LIMITED
+}
+
+model Category {
+  id        String   @id @default(cuid())
+  slug      String   @unique
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  translations CategoryTranslation[]
+  products     Product[]
+
+  @@map("categories")
+}
+
+model CategoryTranslation {
+  id         String @id @default(cuid())
+  categoryId String
+  locale     String
+  name       String
+
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([categoryId, locale])
+  @@map("category_translations")
+}
+
+model Product {
+  id String @id @default(cuid())
+
+  // Canonical slug for future slug-based routing. Storefront routes remain
+  // ID-based in IMP-021 (existing IDs "1".."6" are preserved; new products
+  // get generated IDs — see the Product ID field default below).
+  slug String @unique
+
+  status ProductStatus @default(DRAFT)
+
+  // Integer minor units (e.g. $240.00 -> 24000). Never floating point.
+  priceAmountMinor Int
+  currency         String @db.Char(3)
+
+  categoryId String
+  badge      ProductBadge?
+  isFeatured Boolean       @default(false)
+  sortOrder  Int           @default(0)
+
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  category     Category             @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  translations ProductTranslation[]
+
+  @@index([status])
+  @@index([categoryId])
+  @@index([isFeatured])
+  @@index([status, sortOrder])
+  @@map("products")
+}
+
+model ProductTranslation {
+  id        String @id @default(cuid())
+  productId String
+  locale    String
+
+  name        String
+  meta        String
+  description String
+  material    String
+  dimensions  String
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, locale])
+  @@map("product_translations")
+}

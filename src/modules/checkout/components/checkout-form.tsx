@@ -1,8 +1,9 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { useCart } from "@/modules/cart";
+import { useCatalogProducts } from "@/modules/catalog/client";
 import { Button } from "@/shared/components/ui/button";
 import { CheckoutContact } from "@/modules/checkout/components/checkout-contact";
 import { CheckoutDelivery } from "@/modules/checkout/components/checkout-delivery";
@@ -20,7 +21,12 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export function CheckoutForm() {
   const t = useTranslations("Checkout");
+  const locale = useLocale();
   const { items } = useCart();
+  const { productsById } = useCatalogProducts(
+    items.map((item) => item.productId),
+    locale,
+  );
   const [values, setValues] = useState<CheckoutFormValues>(initialValues);
   const [errors, setErrors] = useState<CheckoutFormErrors>({});
   const [submitted, setSubmitted] = useState(false);
@@ -116,7 +122,11 @@ export function CheckoutForm() {
         </div>
       </div>
 
-      <CheckoutSummary items={items} deliveryMethod={values.deliveryMethod} />
+      <CheckoutSummary
+        items={items}
+        productsById={productsById}
+        deliveryMethod={values.deliveryMethod}
+      />
     </form>
   );
 }

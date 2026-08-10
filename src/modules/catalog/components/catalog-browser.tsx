@@ -3,13 +3,13 @@
 import { useMemo, useState } from "react";
 import { CategoryFilter } from "@/modules/catalog/components/category-filter";
 import { CatalogGrid } from "@/modules/catalog/components/catalog-grid";
-import type { CatalogCategoryKey, CatalogProduct } from "@/modules/catalog/types/catalog-product";
+import type { Product, Category } from "@/modules/catalog";
 
-type ActiveCategory = CatalogCategoryKey | "all";
+type ActiveCategory = string | "all";
 
 interface CatalogBrowserProps {
-  products: CatalogProduct[];
-  categories: CatalogCategoryKey[];
+  products: Product[];
+  categories: Category[];
 }
 
 export function CatalogBrowser({ products, categories }: CatalogBrowserProps) {
@@ -19,7 +19,7 @@ export function CatalogBrowser({ products, categories }: CatalogBrowserProps) {
     if (activeCategory === "all") {
       return products;
     }
-    return products.filter((product) => product.categoryKey === activeCategory);
+    return products.filter((product) => product.categorySlug === activeCategory);
   }, [products, activeCategory]);
 
   return (

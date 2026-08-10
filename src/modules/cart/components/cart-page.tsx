@@ -1,15 +1,21 @@
 "use client";
 
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { useCart } from "@/modules/cart/state/cart-context";
 import { Container } from "@/shared/components/layout/container";
 import { CartItem } from "@/modules/cart/components/cart-item";
 import { CartSummary } from "@/modules/cart/components/cart-summary";
 import { CartEmptyState } from "@/modules/cart/components/cart-empty-state";
+import { useCatalogProducts } from "@/modules/catalog/client";
 
 export function CartPage() {
   const t = useTranslations("Cart");
+  const locale = useLocale();
   const { items, increaseQuantity, decreaseQuantity, removeItem } = useCart();
+  const { productsById, isLoading } = useCatalogProducts(
+    items.map((item) => item.productId),
+    locale,
+  );
 
   return (
     <section className="py-16 sm:py-24">
@@ -27,6 +33,8 @@ export function CartPage() {
                 <CartItem
                   key={item.productId}
                   item={item}
+                  product={productsById.get(item.productId)}
+                  isLoading={isLoading}
                   onIncrease={() => increaseQuantity(item.productId)}
                   onDecrease={() => decreaseQuantity(item.productId)}
                   onRemove={() => removeItem(item.productId)}
@@ -34,7 +42,7 @@ export function CartPage() {
               ))}
             </ul>
 
-            <CartSummary items={items} />
+            <CartSummary items={items} productsById={productsById} />
           </div>
         )}
       </Container>

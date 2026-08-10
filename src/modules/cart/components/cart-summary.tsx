@@ -1,21 +1,30 @@
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { Button } from "@/shared/components/ui/button";
-import { getCatalogProductById } from "@/modules/catalog";
+import { formatProductPrice } from "@/modules/catalog/client";
+import type { StorefrontProductSummary } from "@/modules/catalog/client";
 import type { CartItem } from "@/modules/cart/types/cart";
 
 interface CartSummaryProps {
   items: CartItem[];
+  productsById: Map<string, StorefrontProductSummary>;
 }
 
-export function CartSummary({ items }: CartSummaryProps) {
+export function CartSummary({ items, productsById }: CartSummaryProps) {
   const t = useTranslations("Cart");
+  const locale = useLocale();
 
-  // Presentation-only calculation from the static catalog's price values.
-  // A future backend checkout must recalculate authoritative prices.
-  const subtotalAmount = items.reduce((sum, item) => {
-    const product = getCatalogProductById(item.productId);
-    return product ? sum + product.priceAmount * item.quantity : sum;
-  }, 0);
+  // Presentation-only calculation from currently-resolved catalog prices.
+  // Checkout must recalculate authoritative prices server-side.
+  let subtotalAmountMinor = 0;
+  let currency = "USD";
+  for (const item of items) {
+    const product = productsById.get(item.productId);
+    if (product) {
+      subtotalAmountMinor += product.priceAmountMinor * item.quantity;
+      currency = product.currency;
+    }
+  }
+  const subtotal = formatProductPrice(subtotalAmountMinor, currency, locale);
 
   return (
     <div className="rounded-lg border border-border p-6">
@@ -23,7 +32,7 @@ export function CartSummary({ items }: CartSummaryProps) {
 
       <div className="mt-6 flex items-center justify-between border-t border-border pt-4 text-sm">
         <span className="text-muted-foreground">{t("subtotal")}</span>
-        <span className="font-medium">{t("subtotalValue", { amount: subtotalAmount })}</span>
+        <span className="font-medium">{t("subtotalValue", { amount: subtotal })}</span>
       </div>
 
       <Button disabled aria-describedby="checkout-note" className="mt-6 w-full">

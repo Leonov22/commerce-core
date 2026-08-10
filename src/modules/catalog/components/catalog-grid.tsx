@@ -1,13 +1,15 @@
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { ProductCard } from "@/shared/components/product-card";
-import type { CatalogProduct } from "@/modules/catalog/types/catalog-product";
+import { formatProductPrice } from "@/modules/catalog/client";
+import type { Product } from "@/modules/catalog";
 
 interface CatalogGridProps {
-  products: CatalogProduct[];
+  products: Product[];
 }
 
 export function CatalogGrid({ products }: CatalogGridProps) {
   const t = useTranslations("Catalog");
+  const locale = useLocale();
 
   if (products.length === 0) {
     return (
@@ -23,13 +25,13 @@ export function CatalogGrid({ products }: CatalogGridProps) {
       {products.map((product) => (
         <ProductCard
           key={product.id}
-          name={t(`products.${product.translationKey}.name`)}
-          meta={t(`products.${product.translationKey}.meta`)}
-          price={t(`products.${product.translationKey}.price`)}
+          name={product.translation.name}
+          meta={product.translation.meta}
+          price={formatProductPrice(product.priceAmountMinor, product.currency, locale)}
           badge={
-            product.badgeKey === "new"
+            product.badge === "NEW"
               ? t("newBadge")
-              : product.badgeKey === "limited"
+              : product.badge === "LIMITED"
                 ? t("limitedBadge")
                 : undefined
           }

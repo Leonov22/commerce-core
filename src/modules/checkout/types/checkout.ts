@@ -1,5 +1,5 @@
 import type { useCart } from "@/modules/cart";
-import type { getCatalogProductById } from "@/modules/catalog";
+import type { StorefrontProductSummary } from "@/modules/catalog/client";
 
 /**
  * Derived from Cart's own public shape rather than duplicated here —
@@ -9,11 +9,12 @@ import type { getCatalogProductById } from "@/modules/catalog";
 export type CheckoutCartItem = ReturnType<typeof useCart>["items"][number];
 
 /**
- * Derived from Catalog's own public shape rather than duplicated here —
- * Checkout only reads product data through Catalog's public API
- * (`@/modules/catalog`).
+ * Checkout only reads product data through Catalog's client-safe transport
+ * (`@/modules/catalog/client`), the same read-only DTO Cart uses — Checkout
+ * runs entirely client-side and can never import the Prisma-backed
+ * `@/modules/catalog` entry point.
  */
-export type CheckoutCatalogProduct = NonNullable<ReturnType<typeof getCatalogProductById>>;
+export type CheckoutCatalogProduct = StorefrontProductSummary;
 
 export interface CheckoutContactValues {
   fullName: string;
@@ -44,15 +45,16 @@ export type CheckoutFormErrors = Partial<
 
 /**
  * Presentation-level delivery options only — no real shipping provider
- * integration. `priceAmount` backs the same kind of display-only
- * calculation already used by Cart's subtotal.
+ * integration. `priceAmountMinor` uses the same integer minor-unit
+ * convention as Catalog pricing so it can be combined with the product
+ * subtotal and formatted through a single `formatProductPrice` call.
  */
 export interface DeliveryOption {
   key: DeliveryMethodKey;
-  priceAmount: number;
+  priceAmountMinor: number;
 }
 
 export const DELIVERY_OPTIONS: DeliveryOption[] = [
-  { key: "standard", priceAmount: 8 },
-  { key: "express", priceAmount: 18 },
+  { key: "standard", priceAmountMinor: 800 },
+  { key: "express", priceAmountMinor: 1800 },
 ];

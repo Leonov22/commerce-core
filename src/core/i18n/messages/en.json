@@ -69,51 +69,13 @@
       "categoryLabel": "Filter by category",
       "all": "All"
     },
-    "categories": {
-      "seating": "Seating",
-      "lighting": "Lighting",
-      "textiles": "Textiles",
-      "decor": "Decor"
-    },
     "empty": {
       "title": "No products in this category yet",
       "body": "Try selecting a different category."
     },
     "newBadge": "New",
     "limitedBadge": "Limited",
-    "imagePlaceholder": "Product image placeholder",
-    "products": {
-      "studioChair": {
-        "name": "Studio Chair",
-        "meta": "Oak & linen",
-        "price": "$240"
-      },
-      "loungeChair": {
-        "name": "Lounge Chair",
-        "meta": "Bouclé & ash",
-        "price": "$310"
-      },
-      "tableLamp": {
-        "name": "Table Lamp",
-        "meta": "Brushed brass",
-        "price": "$96"
-      },
-      "pendantLight": {
-        "name": "Pendant Light",
-        "meta": "Opal glass",
-        "price": "$145"
-      },
-      "woolThrow": {
-        "name": "Wool Throw",
-        "meta": "Undyed merino wool",
-        "price": "$128"
-      },
-      "ceramicVase": {
-        "name": "Ceramic Vase",
-        "meta": "Handmade ceramic",
-        "price": "$86"
-      }
-    }
+    "imagePlaceholder": "Product image placeholder"
   },
   "ProductDetails": {
     "meta": {
@@ -123,8 +85,7 @@
     "attributes": {
       "heading": "Details",
       "materialLabel": "Material",
-      "dimensionsLabel": "Dimensions",
-      "availabilityLabel": "Availability"
+      "dimensionsLabel": "Dimensions"
     },
     "addToCart": {
       "button": "Add to cart",
@@ -135,56 +96,6 @@
       "title": "Product not found",
       "body": "This product may have been removed, or the link is incorrect.",
       "cta": "Back to shop"
-    },
-    "products": {
-      "studioChair": {
-        "description": "A considered studio chair in solid oak with a natural linen seat — designed to feel equally at home in a living room or a studio corner.",
-        "attributes": {
-          "material": "Solid oak, linen upholstery",
-          "dimensions": "58 × 60 × 78 cm",
-          "availability": "Made to order"
-        }
-      },
-      "loungeChair": {
-        "description": "A low, relaxed lounge chair upholstered in bouclé with a solid ash frame — built for slow afternoons.",
-        "attributes": {
-          "material": "Ash frame, bouclé upholstery",
-          "dimensions": "72 × 78 × 74 cm",
-          "availability": "In stock"
-        }
-      },
-      "tableLamp": {
-        "description": "A compact table lamp in brushed brass with a soft, warm glow — a quiet detail for a desk or side table.",
-        "attributes": {
-          "material": "Brushed brass",
-          "dimensions": "18 × 18 × 34 cm",
-          "availability": "In stock"
-        }
-      },
-      "pendantLight": {
-        "description": "An opal glass pendant light that diffuses a soft, even light — a calm centerpiece for a dining table or entryway.",
-        "attributes": {
-          "material": "Opal glass, brass fitting",
-          "dimensions": "Ø 24 × 22 cm",
-          "availability": "Made to order"
-        }
-      },
-      "woolThrow": {
-        "description": "An undyed merino wool throw, kept soft and breathable through a simple, natural finishing process.",
-        "attributes": {
-          "material": "100% merino wool",
-          "dimensions": "130 × 180 cm",
-          "availability": "In stock"
-        }
-      },
-      "ceramicVase": {
-        "description": "A handmade ceramic vase with a subtly uneven glaze — no two pieces are exactly alike.",
-        "attributes": {
-          "material": "Glazed stoneware",
-          "dimensions": "Ø 16 × 28 cm",
-          "availability": "Limited availability"
-        }
-      }
     }
   },
   "Cart": {
@@ -195,7 +106,7 @@
     "title": "Cart",
     "summaryHeading": "Order summary",
     "subtotal": "Subtotal",
-    "subtotalValue": "${amount}",
+    "subtotalValue": "{amount}",
     "checkout": "Checkout",
     "checkoutUnavailable": "Checkout will be available soon.",
     "remove": "Remove",
@@ -203,7 +114,9 @@
     "decreaseQuantity": "Decrease quantity — {product}",
     "emptyTitle": "Your cart is empty.",
     "emptyBody": "Discover pieces designed for everyday living.",
-    "continueShopping": "Continue shopping"
+    "continueShopping": "Continue shopping",
+    "loading": "Loading…",
+    "unavailableItem": "This item is no longer available."
   },
   "Checkout": {
     "meta": {
@@ -248,7 +161,7 @@
       "delivery": "Delivery",
       "deliveryPending": "Select a method",
       "total": "Total",
-      "amount": "${amount}",
+      "amount": "{amount}",
       "disclaimer": "Final pricing, taxes, and shipping will be confirmed at payment — not yet available in this preview."
     },
     "submit": "Continue to payment",
