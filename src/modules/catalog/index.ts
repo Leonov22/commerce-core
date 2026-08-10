@@ -19,6 +19,7 @@ export type {
 export type { Category, CategoryTranslation } from "@/modules/catalog/domain/category";
 export type { ProductListFilter } from "@/modules/catalog/repositories/product-repository";
 export type { StorefrontProductSummary } from "@/modules/catalog/presentation/storefront-product";
+export { toStorefrontProductSummary } from "@/modules/catalog/presentation/storefront-product";
 
 export function getProductById(id: string, locale: string) {
   return catalogQueries.getProductById(prismaProductRepository, id, locale);

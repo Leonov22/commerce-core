@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { getProductsByIds } from "@/modules/catalog";
-import { toStorefrontProductSummary } from "@/modules/catalog/presentation/storefront-product";
+import { getProductsByIds, toStorefrontProductSummary } from "@/modules/catalog";
 import { routing } from "@/core/i18n/routing";
 
 /**
