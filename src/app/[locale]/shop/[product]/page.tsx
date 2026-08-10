@@ -2,15 +2,9 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { getTranslations } from "next-intl/server";
 import { ProductDetailsView } from "@/modules/catalog/presentation/product-details-view";
-import { getProductById, listProducts, listCategories } from "@/modules/catalog";
-import { routing } from "@/core/i18n/routing";
+import { getProductById, listCategories } from "@/modules/catalog";
 
 type Props = PageProps<"/[locale]/shop/[product]">;
-
-export async function generateStaticParams() {
-  const products = await listProducts(routing.defaultLocale);
-  return products.map((product) => ({ product: product.id }));
-}
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { locale, product: productId } = await params;
