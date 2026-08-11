@@ -42,7 +42,7 @@ export function CartPage() {
               ))}
             </ul>
 
-            <CartSummary items={items} productsById={productsById} />
+            <CartSummary items={items} productsById={productsById} isLoading={isLoading} />
           </div>
         )}
       </Container>

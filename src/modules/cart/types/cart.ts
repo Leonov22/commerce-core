@@ -10,3 +10,22 @@ export interface CartItem {
 }
 
 export type CartState = CartItem[];
+
+/**
+ * Checkout is reachable only once Catalog resolution has finished and every
+ * Cart line resolves to a real, currently-ACTIVE product. `resolvedProductIds`
+ * is whatever the Catalog transport returned for the requested ids — a
+ * missing id there means unresolved, unavailable, or non-ACTIVE, and Cart
+ * has no way (and no need) to tell those apart.
+ */
+export function canCheckout(
+  items: CartItem[],
+  resolvedProductIds: ReadonlyMap<string, unknown>,
+  isCatalogLoading: boolean,
+): boolean {
+  return (
+    items.length > 0 &&
+    !isCatalogLoading &&
+    items.every((item) => resolvedProductIds.has(item.productId))
+  );
+}
