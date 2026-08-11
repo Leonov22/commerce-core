@@ -168,15 +168,22 @@
       "amount": "{amount}",
       "disclaimer": "Final pricing, taxes, and shipping will be confirmed at payment — not yet available in this preview."
     },
-    "submit": "Continue to payment",
-    "submitNote": "Payment is not available in this preview.",
-    "submitSuccess": "Details look good. Payment isn't available in this preview yet.",
+    "submit": "Place order",
+    "submitting": "Placing order…",
+    "submitNote": "Your order will be created with Pending status. Payment isn't available in this preview yet.",
     "errors": {
       "required": "This field is required.",
       "invalidEmail": "Enter a valid email address.",
       "invalidPhone": "Enter a valid phone number.",
       "deliveryMethodRequired": "Select a delivery method.",
-      "summary": "Please review the highlighted fields."
+      "summary": "Please review the highlighted fields.",
+      "orderFailed": "Something went wrong creating your order. Please try again."
+    },
+    "success": {
+      "title": "Order created successfully.",
+      "orderId": "Order ID: {id}",
+      "status": "Status: Pending — awaiting payment.",
+      "continueShopping": "Continue shopping"
     }
   },
   "BrandValues": {

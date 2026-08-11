@@ -67,6 +67,16 @@ export const DELIVERY_OPTIONS: DeliveryOption[] = [
   { key: "express", priceAmountMinor: 1800 },
 ];
 
+/**
+ * Resolves a submitted delivery method to its authoritative price. Returns
+ * `null` for anything that isn't one of `DELIVERY_OPTIONS`'s keys — callers
+ * must treat that as a validation failure, never default it to 0 or guess.
+ */
+export function getDeliveryAmountMinor(method: string): number | null {
+  const option = DELIVERY_OPTIONS.find((candidate) => candidate.key === method);
+  return option ? option.priceAmountMinor : null;
+}
+
 export interface CheckoutLine {
   item: CheckoutCartItem;
   product: CheckoutCatalogProduct;

@@ -9,7 +9,11 @@ import { CheckoutContact } from "@/modules/checkout/components/checkout-contact"
 import { CheckoutDelivery } from "@/modules/checkout/components/checkout-delivery";
 import { CheckoutSummary } from "@/modules/checkout/components/checkout-summary";
 import { CheckoutEmptyState } from "@/modules/checkout/components/checkout-empty-state";
-import { validateCustomerInformation } from "@/modules/checkout/types/checkout";
+import { CheckoutSuccess } from "@/modules/checkout/components/checkout-success";
+import {
+  resolveCheckoutSummary,
+  validateCustomerInformation,
+} from "@/modules/checkout/types/checkout";
 import type {
   CheckoutFormErrors,
   CheckoutFormValues,
@@ -22,10 +26,14 @@ const initialValues: CheckoutFormValues = {
   deliveryMethod: null,
 };
 
+interface CreatedOrder {
+  id: string;
+}
+
 export function CheckoutForm() {
   const t = useTranslations("Checkout");
   const locale = useLocale();
-  const { items } = useCart();
+  const { items, clearCart } = useCart();
   const { productsById, isLoading } = useCatalogProducts(
     items.map((item) => item.productId),
     locale,
@@ -36,6 +44,16 @@ export function CheckoutForm() {
   const [touchedContactFields, setTouchedContactFields] = useState<
     Partial<Record<keyof CustomerInformation, boolean>>
   >({});
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState(false);
+  const [createdOrder, setCreatedOrder] = useState<CreatedOrder | null>(null);
+
+  // A just-created Order clears the Cart, which would otherwise fall
+  // through to the empty-cart branch below and hide the confirmation the
+  // user is meant to see — so this check comes first.
+  if (createdOrder) {
+    return <CheckoutSuccess orderId={createdOrder.id} />;
+  }
 
   if (items.length === 0) {
     return <CheckoutEmptyState />;
@@ -46,9 +64,8 @@ export function CheckoutForm() {
   }
 
   // Live, per-field feedback (validate on blur, then stay up to date as the
-  // user types) rather than gated behind submit — the submit button is
-  // permanently disabled (IMP-024 does not create Orders), so a
-  // submit-gated validation flow would never be reachable at all.
+  // user types) for Customer Information specifically — the raw result
+  // (ignoring touched-state) also feeds the submit-readiness check below.
   const contactValidation = validateCustomerInformation(values.contact);
   const contactErrors: CheckoutFormErrors = {};
   (Object.keys(contactValidation) as (keyof CustomerInformation)[]).forEach((field) => {
@@ -56,6 +73,13 @@ export function CheckoutForm() {
       contactErrors[field] = t(`errors.${contactValidation[field]}`);
     }
   });
+  const isCustomerInformationValid = Object.keys(contactValidation).length === 0;
+
+  const summary = resolveCheckoutSummary(items, productsById, isLoading);
+  const isCartReady = summary.status === "ready" && summary.unresolvedCount === 0;
+
+  const canSubmit =
+    isCustomerInformationValid && isCartReady && values.deliveryMethod !== null && !isSubmitting;
 
   function validate(): CheckoutFormErrors {
     const nextErrors: CheckoutFormErrors = {};
@@ -76,14 +100,54 @@ export function CheckoutForm() {
     return nextErrors;
   }
 
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setErrors(validate());
+
+    if (isSubmitting) {
+      return;
+    }
+
+    const deliveryErrors = validate();
+    const nextErrors: CheckoutFormErrors = { ...deliveryErrors, ...contactErrors };
+    setErrors(nextErrors);
     setSubmitted(true);
+    setSubmitError(false);
+
+    if (Object.keys(deliveryErrors).length > 0 || !isCustomerInformationValid || !isCartReady) {
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const response = await fetch("/api/orders", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          customer: values.contact,
+          items: items.map((item) => ({ productId: item.productId, quantity: item.quantity })),
+          deliveryMethod: values.deliveryMethod,
+          locale,
+        }),
+      });
+
+      if (!response.ok) {
+        setSubmitError(true);
+        return;
+      }
+
+      const data: { order: { id: string } } = await response.json();
+      // Cart is only cleared after the server confirms the Order exists —
+      // never before, so a failed request always leaves the Cart intact.
+      clearCart();
+      setCreatedOrder({ id: data.order.id });
+    } catch {
+      setSubmitError(true);
+    } finally {
+      setIsSubmitting(false);
+    }
   }
 
-  const hasErrors = submitted && Object.keys(errors).length > 0;
-  const isComplete = submitted && Object.keys(errors).length === 0;
+  const hasErrors = submitted && (Object.keys(errors).length > 0 || submitError);
 
   return (
     <form
@@ -97,7 +161,7 @@ export function CheckoutForm() {
             role="alert"
             className="rounded-md border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive"
           >
-            {t("errors.summary")}
+            {submitError ? t("errors.orderFailed") : t("errors.summary")}
           </div>
         ) : null}
 
@@ -121,30 +185,17 @@ export function CheckoutForm() {
         />
 
         <div>
-          {/* Order creation is a future milestone (IMP-024+) — this control
-              never submits a real order, so it stays disabled here. */}
           <Button
             type="submit"
-            disabled
+            disabled={!canSubmit}
             aria-describedby="checkout-submit-note"
             className="w-full sm:w-auto"
           >
-            {t("submit")}
+            {isSubmitting ? t("submitting") : t("submit")}
           </Button>
-          {isComplete ? (
-            <p
-              id="checkout-submit-note"
-              role="status"
-              aria-live="polite"
-              className="mt-2 text-xs text-muted-foreground"
-            >
-              {t("submitSuccess")}
-            </p>
-          ) : (
-            <p id="checkout-submit-note" className="mt-2 text-xs text-muted-foreground">
-              {t("submitNote")}
-            </p>
-          )}
+          <p id="checkout-submit-note" className="mt-2 text-xs text-muted-foreground">
+            {t("submitNote")}
+          </p>
         </div>
       </div>
 

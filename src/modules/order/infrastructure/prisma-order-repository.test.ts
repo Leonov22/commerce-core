@@ -189,6 +189,44 @@ describe("prismaOrderRepository", () => {
     ).rejects.toThrow();
   });
 
+  it("leaves no partial Order when an OrderItem in the same create fails a constraint", async () => {
+    // A unique marker lets this test prove a negative — that no matching
+    // Order row exists at all — rather than relying only on the create()
+    // call having thrown, since Prisma's nested `create` is a single
+    // statement and should roll back the Order row too, not just skip the
+    // invalid item.
+    const marker = `atomicity-test-${Date.now()}@example.com`;
+
+    await expect(
+      prismaOrderRepository.create(
+        baseInput({
+          email: marker,
+          items: [
+            {
+              productId: "1",
+              productName: "Studio Chair",
+              unitPriceAmountMinor: 24000,
+              quantity: 1,
+              lineTotalAmountMinor: 24000,
+              currency: "USD",
+            },
+            {
+              productId: "3",
+              productName: "Table Lamp",
+              unitPriceAmountMinor: 9600,
+              quantity: 0, // violates order_items_quantity_at_least_one
+              lineTotalAmountMinor: 0,
+              currency: "USD",
+            },
+          ],
+        }),
+      ),
+    ).rejects.toThrow();
+
+    const partialOrders = await prisma.order.findMany({ where: { email: marker } });
+    expect(partialOrders).toHaveLength(0);
+  });
+
   it("enforces non-negative money amounts at the database level", async () => {
     await expect(
       prismaOrderRepository.create(baseInput({ totalAmountMinor: -100 })),
