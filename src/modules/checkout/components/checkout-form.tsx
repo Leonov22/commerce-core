@@ -23,7 +23,7 @@ export function CheckoutForm() {
   const t = useTranslations("Checkout");
   const locale = useLocale();
   const { items } = useCart();
-  const { productsById } = useCatalogProducts(
+  const { productsById, isLoading } = useCatalogProducts(
     items.map((item) => item.productId),
     locale,
   );
@@ -109,15 +109,29 @@ export function CheckoutForm() {
         />
 
         <div>
-          <Button type="submit" className="w-full sm:w-auto">
+          {/* Order creation is a future milestone (IMP-024+) — this control
+              never submits a real order, so it stays disabled here. */}
+          <Button
+            type="submit"
+            disabled
+            aria-describedby="checkout-submit-note"
+            className="w-full sm:w-auto"
+          >
             {t("submit")}
           </Button>
           {isComplete ? (
-            <p role="status" aria-live="polite" className="mt-2 text-xs text-muted-foreground">
+            <p
+              id="checkout-submit-note"
+              role="status"
+              aria-live="polite"
+              className="mt-2 text-xs text-muted-foreground"
+            >
               {t("submitSuccess")}
             </p>
           ) : (
-            <p className="mt-2 text-xs text-muted-foreground">{t("submitNote")}</p>
+            <p id="checkout-submit-note" className="mt-2 text-xs text-muted-foreground">
+              {t("submitNote")}
+            </p>
           )}
         </div>
       </div>
@@ -125,6 +139,7 @@ export function CheckoutForm() {
       <CheckoutSummary
         items={items}
         productsById={productsById}
+        isLoading={isLoading}
         deliveryMethod={values.deliveryMethod}
       />
     </form>

@@ -156,7 +156,10 @@
     },
     "summary": {
       "heading": "Order summary",
+      "loading": "Loading order summary…",
       "quantity": "Qty {quantity}",
+      "unitPrice": "{amount} each",
+      "unavailableNotice": "{count, plural, one {# item} other {# items}} no longer available — excluded from this total.",
       "subtotal": "Subtotal",
       "delivery": "Delivery",
       "deliveryPending": "Select a method",

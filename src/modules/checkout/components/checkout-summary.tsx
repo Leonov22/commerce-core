@@ -2,37 +2,40 @@ import { useLocale, useTranslations } from "next-intl";
 import { Package } from "lucide-react";
 import { formatProductPrice } from "@/modules/catalog/client";
 import type { StorefrontProductSummary } from "@/modules/catalog/client";
-import { DELIVERY_OPTIONS } from "@/modules/checkout/types/checkout";
+import { DELIVERY_OPTIONS, resolveCheckoutSummary } from "@/modules/checkout/types/checkout";
 import type { CheckoutCartItem, DeliveryMethodKey } from "@/modules/checkout/types/checkout";
 
 interface CheckoutSummaryProps {
   items: CheckoutCartItem[];
   productsById: Map<string, StorefrontProductSummary>;
+  isLoading: boolean;
   deliveryMethod: DeliveryMethodKey | null;
 }
 
-interface ResolvedLine {
-  item: CheckoutCartItem;
-  product: StorefrontProductSummary;
-}
-
-export function CheckoutSummary({ items, productsById, deliveryMethod }: CheckoutSummaryProps) {
+export function CheckoutSummary({
+  items,
+  productsById,
+  isLoading,
+  deliveryMethod,
+}: CheckoutSummaryProps) {
   const t = useTranslations("Checkout");
   const tCatalog = useTranslations("Catalog");
   const locale = useLocale();
 
-  // A cart line that no longer resolves through the catalog transport is
-  // skipped rather than guessed at — no replacement data is invented.
-  const resolvedLines = items.reduce<ResolvedLine[]>((lines, item) => {
-    const product = productsById.get(item.productId);
-    return product ? [...lines, { item, product }] : lines;
-  }, []);
+  const summary = resolveCheckoutSummary(items, productsById, isLoading);
 
-  const subtotalAmountMinor = resolvedLines.reduce(
-    (sum, { item, product }) => sum + product.priceAmountMinor * item.quantity,
-    0,
-  );
-  const currency = resolvedLines[0]?.product.currency ?? "USD";
+  if (summary.status === "loading") {
+    return (
+      <div className="rounded-lg border border-border p-6">
+        <h2 className="text-base font-medium">{t("summary.heading")}</h2>
+        <p role="status" className="mt-6 text-sm text-muted-foreground">
+          {t("summary.loading")}
+        </p>
+      </div>
+    );
+  }
+
+  const { lines, unresolvedCount, subtotalAmountMinor, currency } = summary;
   const deliveryOption = DELIVERY_OPTIONS.find((option) => option.key === deliveryMethod);
   const deliveryAmountMinor = deliveryOption?.priceAmountMinor ?? 0;
   const totalAmountMinor = subtotalAmountMinor + deliveryAmountMinor;
@@ -41,8 +44,14 @@ export function CheckoutSummary({ items, productsById, deliveryMethod }: Checkou
     <div className="rounded-lg border border-border p-6">
       <h2 className="text-base font-medium">{t("summary.heading")}</h2>
 
+      {unresolvedCount > 0 ? (
+        <p role="status" className="mt-4 text-xs text-muted-foreground">
+          {t("summary.unavailableNotice", { count: unresolvedCount })}
+        </p>
+      ) : null}
+
       <ul className="mt-6 flex flex-col gap-4">
-        {resolvedLines.map(({ item, product }) => (
+        {lines.map(({ item, product, lineTotalAmountMinor }) => (
           <li key={item.productId} className="flex items-start gap-3">
             <div
               role="img"
@@ -62,9 +71,16 @@ export function CheckoutSummary({ items, productsById, deliveryMethod }: Checkou
                   {t("summary.quantity", { quantity: item.quantity })}
                 </p>
               </div>
-              <p className="font-medium">
-                {formatProductPrice(product.priceAmountMinor, product.currency, locale)}
-              </p>
+              <div className="text-right">
+                <p className="font-medium">
+                  {formatProductPrice(lineTotalAmountMinor, product.currency, locale)}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {t("summary.unitPrice", {
+                    amount: formatProductPrice(product.priceAmountMinor, product.currency, locale),
+                  })}
+                </p>
+              </div>
             </div>
           </li>
         ))}
