@@ -133,7 +133,8 @@
     },
     "contact": {
       "heading": "Contact information",
-      "fullName": "Full name",
+      "firstName": "First name",
+      "lastName": "Last name",
       "email": "Email",
       "phone": "Phone"
     },
@@ -173,6 +174,7 @@
     "errors": {
       "required": "This field is required.",
       "invalidEmail": "Enter a valid email address.",
+      "invalidPhone": "Enter a valid phone number.",
       "deliveryMethodRequired": "Select a delivery method.",
       "summary": "Please review the highlighted fields."
     }

@@ -7,7 +7,9 @@ interface CheckoutFieldProps {
   autoComplete?: string;
   value: string;
   error?: string;
+  required?: boolean;
   onChange: (value: string) => void;
+  onBlur?: () => void;
 }
 
 export function CheckoutField({
@@ -17,7 +19,9 @@ export function CheckoutField({
   autoComplete,
   value,
   error,
+  required,
   onChange,
+  onBlur,
 }: CheckoutFieldProps) {
   const errorId = `${id}-error`;
 
@@ -25,13 +29,21 @@ export function CheckoutField({
     <div>
       <label htmlFor={id} className="text-sm font-medium">
         {label}
+        {required ? (
+          <span aria-hidden="true" className="text-destructive">
+            {" "}
+            *
+          </span>
+        ) : null}
       </label>
       <input
         id={id}
         type={type}
         autoComplete={autoComplete}
         value={value}
+        required={required}
         onChange={(event) => onChange(event.target.value)}
+        onBlur={onBlur}
         aria-invalid={error ? true : undefined}
         aria-describedby={error ? errorId : undefined}
         className={cn(

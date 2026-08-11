@@ -17,10 +17,18 @@ export type CheckoutCartItem = ReturnType<typeof useCart>["items"][number];
 export type CheckoutCatalogProduct = StorefrontProductSummary;
 
 export interface CheckoutContactValues {
-  fullName: string;
+  firstName: string;
+  lastName: string;
   email: string;
   phone: string;
 }
+
+/**
+ * The customer-information Checkout will eventually hand to Order creation.
+ * Same shape as `CheckoutContactValues` — this alias just names it the way
+ * the rest of the domain will refer to it once an Order step exists.
+ */
+export type CustomerInformation = CheckoutContactValues;
 
 export interface CheckoutDeliveryAddressValues {
   address: string;
@@ -116,4 +124,65 @@ export function resolveCheckoutSummary(
   const currency = lines[0]?.product.currency ?? "USD";
 
   return { status: "ready", lines, unresolvedCount, subtotalAmountMinor, currency };
+}
+
+/**
+ * Error *codes*, not localized strings — the presentation layer maps these
+ * to `Checkout.errors.*` translations. Keeping the code here instead of a
+ * ready-made message is what lets this function stay free of next-intl/React
+ * and be tested directly.
+ */
+export type CustomerInformationErrorCode = "required" | "invalidEmail" | "invalidPhone";
+
+export type CustomerInformationErrors = Partial<
+  Record<keyof CustomerInformation, CustomerInformationErrorCode>
+>;
+
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * Deliberately lenient: accepts an optional leading `+` and any mix of
+ * digits/spaces/hyphens/parentheses, as long as there are enough digits to
+ * plausibly be a phone number. Not a telecom-grade parser — this project
+ * has no such requirement, and international formats vary too much for a
+ * single strict pattern to be correct.
+ */
+function isPlausiblePhone(value: string): boolean {
+  const digitCount = (value.match(/\d/g) ?? []).length;
+  return digitCount >= 7 && /^\+?[\d\s()-]+$/.test(value);
+}
+
+/**
+ * Pure validation for Checkout's customer-information fields — no Prisma,
+ * no fetch, no React hooks, no browser APIs. Operates on trimmed copies of
+ * the input without mutating it; the caller decides whether/when to store a
+ * trimmed value. Returns one error code per invalid field, or an empty
+ * object when everything is valid.
+ */
+export function validateCustomerInformation(value: CustomerInformation): CustomerInformationErrors {
+  const errors: CustomerInformationErrors = {};
+
+  if (!value.firstName.trim()) {
+    errors.firstName = "required";
+  }
+
+  if (!value.lastName.trim()) {
+    errors.lastName = "required";
+  }
+
+  const email = value.email.trim();
+  if (!email) {
+    errors.email = "required";
+  } else if (!EMAIL_PATTERN.test(email)) {
+    errors.email = "invalidEmail";
+  }
+
+  const phone = value.phone.trim();
+  if (!phone) {
+    errors.phone = "required";
+  } else if (!isPlausiblePhone(phone)) {
+    errors.phone = "invalidPhone";
+  }
+
+  return errors;
 }

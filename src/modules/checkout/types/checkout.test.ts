@@ -1,6 +1,25 @@
 import { describe, expect, it } from "vitest";
-import { resolveCheckoutSummary } from "@/modules/checkout/types/checkout";
-import type { CheckoutCartItem, CheckoutCatalogProduct } from "@/modules/checkout/types/checkout";
+import {
+  resolveCheckoutSummary,
+  validateCustomerInformation,
+} from "@/modules/checkout/types/checkout";
+import type {
+  CheckoutCartItem,
+  CheckoutCatalogProduct,
+  CustomerInformation,
+} from "@/modules/checkout/types/checkout";
+
+function makeCustomerInformation(
+  overrides: Partial<CustomerInformation> = {},
+): CustomerInformation {
+  return {
+    firstName: "John",
+    lastName: "Smith",
+    email: "john.smith@example.com",
+    phone: "+421 900 123 456",
+    ...overrides,
+  };
+}
 
 function makeItem(productId: string, quantity: number): CheckoutCartItem {
   return { productId, quantity };
@@ -109,5 +128,106 @@ describe("resolveCheckoutSummary", () => {
     expect(result.status).toBe("ready");
     if (result.status !== "ready") return;
     expect(result.currency).toBe("EUR");
+  });
+});
+
+describe("validateCustomerInformation", () => {
+  it("rejects a completely empty form with a required error on every field", () => {
+    const errors = validateCustomerInformation(
+      makeCustomerInformation({ firstName: "", lastName: "", email: "", phone: "" }),
+    );
+    expect(errors).toEqual({
+      firstName: "required",
+      lastName: "required",
+      email: "required",
+      phone: "required",
+    });
+  });
+
+  it("accepts fully valid customer information", () => {
+    const errors = validateCustomerInformation(makeCustomerInformation());
+    expect(errors).toEqual({});
+  });
+
+  it("flags a missing first name only", () => {
+    const errors = validateCustomerInformation(makeCustomerInformation({ firstName: "" }));
+    expect(errors.firstName).toBe("required");
+    expect(errors.lastName).toBeUndefined();
+    expect(errors.email).toBeUndefined();
+    expect(errors.phone).toBeUndefined();
+  });
+
+  it("flags a missing last name only", () => {
+    const errors = validateCustomerInformation(makeCustomerInformation({ lastName: "" }));
+    expect(errors.lastName).toBe("required");
+    expect(errors.firstName).toBeUndefined();
+  });
+
+  it("flags a missing email as required", () => {
+    const errors = validateCustomerInformation(makeCustomerInformation({ email: "" }));
+    expect(errors.email).toBe("required");
+  });
+
+  it("flags a malformed email as invalid, not merely missing", () => {
+    for (const email of ["john", "john@", "@example.com"]) {
+      const errors = validateCustomerInformation(makeCustomerInformation({ email }));
+      expect(errors.email).toBe("invalidEmail");
+    }
+  });
+
+  it("accepts realistic email formats", () => {
+    for (const email of ["john@example.com", "john.smith@example.com"]) {
+      const errors = validateCustomerInformation(makeCustomerInformation({ email }));
+      expect(errors.email).toBeUndefined();
+    }
+  });
+
+  it("flags a missing phone as required", () => {
+    const errors = validateCustomerInformation(makeCustomerInformation({ phone: "" }));
+    expect(errors.phone).toBe("required");
+  });
+
+  it("accepts valid international phone numbers", () => {
+    for (const phone of ["+421 900 123 456", "+33 6 12 34 56 78", "+380 67 123 4567"]) {
+      const errors = validateCustomerInformation(makeCustomerInformation({ phone }));
+      expect(errors.phone).toBeUndefined();
+    }
+  });
+
+  it("treats whitespace-only fields as empty, not valid", () => {
+    const errors = validateCustomerInformation(
+      makeCustomerInformation({ firstName: "   ", lastName: "\t", email: "   ", phone: "  " }),
+    );
+    expect(errors).toEqual({
+      firstName: "required",
+      lastName: "required",
+      email: "required",
+      phone: "required",
+    });
+  });
+
+  it("trims values before validating — leading/trailing whitespace around an otherwise valid value is not an error", () => {
+    const errors = validateCustomerInformation(
+      makeCustomerInformation({ firstName: "  John  ", lastName: "  Smith  " }),
+    );
+    expect(errors.firstName).toBeUndefined();
+    expect(errors.lastName).toBeUndefined();
+  });
+
+  it("reports field-specific errors when multiple fields are invalid at once", () => {
+    const errors = validateCustomerInformation(
+      makeCustomerInformation({ firstName: "", email: "not-an-email" }),
+    );
+    expect(errors).toEqual({ firstName: "required", email: "invalidEmail" });
+  });
+
+  it("does not reject names with apostrophes or non-Latin characters", () => {
+    for (const name of ["O'Connor", "Марія", "Іван", "Jean"]) {
+      const errors = validateCustomerInformation(
+        makeCustomerInformation({ firstName: name, lastName: name }),
+      );
+      expect(errors.firstName).toBeUndefined();
+      expect(errors.lastName).toBeUndefined();
+    }
   });
 });

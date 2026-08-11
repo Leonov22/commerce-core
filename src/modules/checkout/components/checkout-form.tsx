@@ -9,15 +9,18 @@ import { CheckoutContact } from "@/modules/checkout/components/checkout-contact"
 import { CheckoutDelivery } from "@/modules/checkout/components/checkout-delivery";
 import { CheckoutSummary } from "@/modules/checkout/components/checkout-summary";
 import { CheckoutEmptyState } from "@/modules/checkout/components/checkout-empty-state";
-import type { CheckoutFormErrors, CheckoutFormValues } from "@/modules/checkout/types/checkout";
+import { validateCustomerInformation } from "@/modules/checkout/types/checkout";
+import type {
+  CheckoutFormErrors,
+  CheckoutFormValues,
+  CustomerInformation,
+} from "@/modules/checkout/types/checkout";
 
 const initialValues: CheckoutFormValues = {
-  contact: { fullName: "", email: "", phone: "" },
+  contact: { firstName: "", lastName: "", email: "", phone: "" },
   deliveryAddress: { address: "", city: "", postalCode: "" },
   deliveryMethod: null,
 };
-
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export function CheckoutForm() {
   const t = useTranslations("Checkout");
@@ -30,25 +33,33 @@ export function CheckoutForm() {
   const [values, setValues] = useState<CheckoutFormValues>(initialValues);
   const [errors, setErrors] = useState<CheckoutFormErrors>({});
   const [submitted, setSubmitted] = useState(false);
+  const [touchedContactFields, setTouchedContactFields] = useState<
+    Partial<Record<keyof CustomerInformation, boolean>>
+  >({});
 
   if (items.length === 0) {
     return <CheckoutEmptyState />;
   }
 
+  function handleContactBlur(field: keyof CustomerInformation) {
+    setTouchedContactFields((previous) => ({ ...previous, [field]: true }));
+  }
+
+  // Live, per-field feedback (validate on blur, then stay up to date as the
+  // user types) rather than gated behind submit — the submit button is
+  // permanently disabled (IMP-024 does not create Orders), so a
+  // submit-gated validation flow would never be reachable at all.
+  const contactValidation = validateCustomerInformation(values.contact);
+  const contactErrors: CheckoutFormErrors = {};
+  (Object.keys(contactValidation) as (keyof CustomerInformation)[]).forEach((field) => {
+    if (touchedContactFields[field]) {
+      contactErrors[field] = t(`errors.${contactValidation[field]}`);
+    }
+  });
+
   function validate(): CheckoutFormErrors {
     const nextErrors: CheckoutFormErrors = {};
 
-    if (!values.contact.fullName.trim()) {
-      nextErrors.fullName = t("errors.required");
-    }
-    if (!values.contact.email.trim()) {
-      nextErrors.email = t("errors.required");
-    } else if (!EMAIL_PATTERN.test(values.contact.email)) {
-      nextErrors.email = t("errors.invalidEmail");
-    }
-    if (!values.contact.phone.trim()) {
-      nextErrors.phone = t("errors.required");
-    }
     if (!values.deliveryAddress.address.trim()) {
       nextErrors.address = t("errors.required");
     }
@@ -92,8 +103,9 @@ export function CheckoutForm() {
 
         <CheckoutContact
           value={values.contact}
-          errors={errors}
+          errors={contactErrors}
           onChange={(contact) => setValues((previous) => ({ ...previous, contact }))}
+          onFieldBlur={handleContactBlur}
         />
 
         <CheckoutDelivery
