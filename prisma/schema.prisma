@@ -106,3 +106,72 @@ model ProductTranslation {
   @@unique([productId, locale])
   @@map("product_translations")
 }
+
+// =============================================================================
+// Order — persistent purchase snapshot foundation (IMP-025 / ARCH-025)
+//
+// Order creation itself is a future milestone; this only establishes the
+// persistence model so it exists without redesign later. An Order is a
+// point-in-time snapshot: customer details and each line's product name/price
+// are copied onto the Order/OrderItem at creation time and never re-derived
+// from Product or a Customer entity (neither of which this stores a live
+// reference to) — an Order must stay valid even if the Product it referenced
+// later changes, is archived, or (in principle) no longer exists.
+// =============================================================================
+
+enum OrderStatus {
+  PENDING
+  PAID
+  CANCELLED
+}
+
+model Order {
+  id String @id @default(cuid())
+
+  status OrderStatus @default(PENDING)
+
+  // Customer snapshot — no User/Customer entity exists yet (auth is out of
+  // scope), so this is the only record of who the order is for.
+  firstName String
+  lastName  String
+  email     String
+  phone     String
+
+  // Integer minor units, never floating point — same convention as Catalog.
+  subtotalAmountMinor Int
+  deliveryAmountMinor Int
+  totalAmountMinor    Int
+  currency            String @db.Char(3)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items OrderItem[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id      String @id @default(cuid())
+  orderId String
+
+  // Product snapshot, deliberately not a foreign key to Product: productId
+  // is kept only for traceability (e.g. "which orders included product X"),
+  // never dereferenced to reconstruct this line's name or price. Product
+  // deletion/status changes must never affect an existing OrderItem.
+  productId   String
+  productName String
+
+  unitPriceAmountMinor Int
+  quantity             Int
+  lineTotalAmountMinor Int
+  currency             String @db.Char(3)
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([productId])
+  @@map("order_items")
+}
