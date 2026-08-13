@@ -460,9 +460,12 @@ describe("prismaOrderRepository — customer order history", () => {
     const order = await prismaOrderRepository.create(baseInput({ userId }));
     historyOrderIds.push(order.id);
 
+    // `.resolves` itself proves the call doesn't reject; `toHaveProperty`
+    // is a valid matcher against the resolved value (unlike `toThrow()`,
+    // which expects a function to invoke, not an already-resolved object).
     await expect(
       prismaOrderRepository.findManyByUserId(userId, { take: 10, cursor: "not-a-valid-cursor!!" }),
-    ).resolves.not.toThrow();
+    ).resolves.toHaveProperty("orders");
 
     const page = await prismaOrderRepository.findManyByUserId(userId, {
       take: 10,
