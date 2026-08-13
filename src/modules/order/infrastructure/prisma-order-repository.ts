@@ -1,5 +1,6 @@
 import "server-only";
 import { prisma } from "@/modules/order/infrastructure/prisma-client";
+import { encodeOrderCursor, decodeOrderCursor } from "@/modules/order/application/order-cursor";
 import type {
   OrderRepository,
   NewOrderInput,
@@ -85,22 +86,53 @@ export const prismaOrderRepository: OrderRepository = {
     userId: string,
     { cursor, take }: FindManyByUserIdOptions,
   ): Promise<OrderListPage> {
+    // CR029-01: genuine keyset (seek) pagination for the composite
+    // `createdAt DESC, id DESC` ordering — a cursor built from `id` alone
+    // cannot represent a position in a multi-column sort, and this
+    // deliberately does not lean on Prisma's `cursor: { id }` + `skip: 1`
+    // option to do that translation implicitly. The cursor decodes to
+    // `{ createdAt, id }`; a malformed/tampered cursor fails safe to a
+    // first page rather than throwing or leaking a database error. The
+    // cursor never carries `userId` — ownership below is always applied
+    // fresh from the caller's own argument, never from the cursor.
+    let position: { createdAt: Date; id: string } | null = null;
+    if (cursor) {
+      const decoded = decodeOrderCursor(cursor);
+      if (decoded.ok) {
+        position = decoded.cursor;
+      }
+      // else: treated exactly like "no cursor" — starts from the first page.
+    }
+
     // Fetch one extra row to know whether a next page exists, without a
     // separate count query.
     const rows = await prisma.order.findMany({
-      where: { userId },
+      where: {
+        userId,
+        ...(position
+          ? {
+              OR: [
+                { createdAt: { lt: position.createdAt } },
+                { createdAt: position.createdAt, id: { lt: position.id } },
+              ],
+            }
+          : {}),
+      },
       orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       take: take + 1,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
       include: { items: true },
     });
 
     const hasNextPage = rows.length > take;
     const page = hasNextPage ? rows.slice(0, take) : rows;
+    const lastRow = page[page.length - 1];
 
     return {
       orders: page.map(toDomainOrder),
-      nextCursor: hasNextPage ? page[page.length - 1]!.id : null,
+      nextCursor:
+        hasNextPage && lastRow
+          ? encodeOrderCursor({ createdAt: lastRow.createdAt, id: lastRow.id })
+          : null,
     };
   },
 

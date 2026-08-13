@@ -348,7 +348,10 @@ describe("prismaOrderRepository — customer order history", () => {
 
     const firstPage = await prismaOrderRepository.findManyByUserId(userId, { take: 2 });
     expect(firstPage.orders.map((order) => order.id)).toEqual(expectedOrder.slice(0, 2));
-    expect(firstPage.nextCursor).toBe(expectedOrder[1]);
+    // CR029-01: nextCursor is now an opaque encoded position, not the raw
+    // order id — assert only that it's present and genuinely opaque.
+    expect(firstPage.nextCursor).not.toBeNull();
+    expect(firstPage.nextCursor).not.toBe(expectedOrder[1]);
 
     const secondPage = await prismaOrderRepository.findManyByUserId(userId, {
       take: 2,
@@ -356,6 +359,116 @@ describe("prismaOrderRepository — customer order history", () => {
     });
     expect(secondPage.orders.map((order) => order.id)).toEqual(expectedOrder.slice(2));
     expect(secondPage.nextCursor).toBeNull();
+  });
+
+  it("CR029-01/04: paginates correctly across orders sharing the exact same createdAt, using id DESC as the tiebreaker", async () => {
+    const userId = await createTestUser("duplicate-createdat");
+    const fixedTimestamp = new Date("2026-01-01T00:00:00.000Z");
+
+    const createdIds: string[] = [];
+    for (let i = 0; i < 4; i += 1) {
+      const order = await prismaOrderRepository.create(baseInput({ userId }));
+      historyOrderIds.push(order.id);
+      createdIds.push(order.id);
+    }
+    // Force all four rows to share the exact same createdAt — the only way
+    // to deterministically reproduce a tie in this ordering.
+    await prisma.order.updateMany({
+      where: { id: { in: createdIds } },
+      data: { createdAt: fixedTimestamp },
+    });
+
+    // With identical createdAt, expected order is id DESC.
+    const expectedOrder = [...createdIds].sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
+
+    const page1 = await prismaOrderRepository.findManyByUserId(userId, { take: 2 });
+    expect(page1.orders.map((order) => order.id)).toEqual(expectedOrder.slice(0, 2));
+    expect(page1.nextCursor).not.toBeNull();
+
+    const page2 = await prismaOrderRepository.findManyByUserId(userId, {
+      take: 2,
+      cursor: page1.nextCursor!,
+    });
+    expect(page2.orders.map((order) => order.id)).toEqual(expectedOrder.slice(2, 4));
+    expect(page2.nextCursor).toBeNull();
+
+    // Every order appears exactly once across both pages — none duplicated, none skipped.
+    const allSeenIds = [...page1.orders, ...page2.orders].map((order) => order.id);
+    expect(new Set(allSeenIds).size).toBe(4);
+    expect([...allSeenIds].sort()).toEqual([...createdIds].sort());
+  });
+
+  it("CR029-04: orders correctly across pages when createdAt values genuinely differ", async () => {
+    const userId = await createTestUser("differing-createdat");
+    const order1 = await prismaOrderRepository.create(baseInput({ userId }));
+    historyOrderIds.push(order1.id);
+    const order2 = await prismaOrderRepository.create(baseInput({ userId }));
+    historyOrderIds.push(order2.id);
+    const order3 = await prismaOrderRepository.create(baseInput({ userId }));
+    historyOrderIds.push(order3.id);
+
+    const base = new Date("2026-02-01T00:00:00.000Z");
+    await prisma.order.update({ where: { id: order1.id }, data: { createdAt: base } });
+    await prisma.order.update({
+      where: { id: order2.id },
+      data: { createdAt: new Date(base.getTime() + 60_000) },
+    });
+    await prisma.order.update({
+      where: { id: order3.id },
+      data: { createdAt: new Date(base.getTime() + 120_000) },
+    });
+
+    const page1 = await prismaOrderRepository.findManyByUserId(userId, { take: 2 });
+    expect(page1.orders.map((order) => order.id)).toEqual([order3.id, order2.id]);
+    expect(page1.nextCursor).not.toBeNull();
+
+    const page2 = await prismaOrderRepository.findManyByUserId(userId, {
+      take: 2,
+      cursor: page1.nextCursor!,
+    });
+    expect(page2.orders.map((order) => order.id)).toEqual([order1.id]);
+    expect(page2.nextCursor).toBeNull();
+  });
+
+  it("keeps historical page results stable when a new order is inserted after page 1 was fetched", async () => {
+    const userId = await createTestUser("insertion-stability");
+    const order1 = await prismaOrderRepository.create(baseInput({ userId }));
+    historyOrderIds.push(order1.id);
+    const order2 = await prismaOrderRepository.create(baseInput({ userId }));
+    historyOrderIds.push(order2.id);
+
+    const page1 = await prismaOrderRepository.findManyByUserId(userId, { take: 1 });
+    expect(page1.orders.map((order) => order.id)).toEqual([order2.id]);
+    expect(page1.nextCursor).not.toBeNull();
+
+    // A brand-new order, inserted AFTER page 1's cursor was obtained.
+    const newOrder = await prismaOrderRepository.create(baseInput({ userId }));
+    historyOrderIds.push(newOrder.id);
+
+    // Page 2, using the cursor captured before the insertion, must still
+    // return order1 — the new order (necessarily newer than the cursor
+    // position) must never appear, and order1 must not be skipped.
+    const page2 = await prismaOrderRepository.findManyByUserId(userId, {
+      take: 1,
+      cursor: page1.nextCursor!,
+    });
+    expect(page2.orders.map((order) => order.id)).toEqual([order1.id]);
+  });
+
+  it("falls back to the first page when given a malformed cursor, without throwing", async () => {
+    const userId = await createTestUser("malformed-cursor");
+    const order = await prismaOrderRepository.create(baseInput({ userId }));
+    historyOrderIds.push(order.id);
+
+    await expect(
+      prismaOrderRepository.findManyByUserId(userId, { take: 10, cursor: "not-a-valid-cursor!!" }),
+    ).resolves.not.toThrow();
+
+    const page = await prismaOrderRepository.findManyByUserId(userId, {
+      take: 10,
+      cursor: "not-a-valid-cursor!!",
+    });
+    expect(page.orders.map((o) => o.id)).toEqual([order.id]);
   });
 
   it("IDOR: a user can retrieve their own order but never another user's order", async () => {

@@ -2,7 +2,7 @@ import { getTranslations, getLocale } from "next-intl/server";
 import { Package } from "lucide-react";
 import { Container } from "@/shared/components/layout/container";
 import { Link } from "@/core/i18n/navigation";
-import { formatProductPrice } from "@/modules/catalog/client";
+import { formatProductPrice } from "@/shared/utils/format-price";
 import type { Order } from "@/modules/order/domain/order";
 
 interface CustomerOrderDetailViewProps {

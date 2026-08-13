@@ -1,19 +1,11 @@
 /**
- * Formats integer minor-unit pricing for display. Pure, framework-agnostic
- * (uses only the standard `Intl` API), so it works identically whether
- * called from a Server Component or a Client Component.
+ * Re-exported from the genuinely shared location (CR029-02): this is pure
+ * money formatting, not Catalog domain logic, so the implementation now
+ * lives at `@/shared/utils/format-price`. Kept as a re-export here, rather
+ * than deleted, so Catalog's own existing consumers (`catalog-grid.tsx`,
+ * `product-details-view.tsx`) and `catalog/client.ts`'s public export keep
+ * working unchanged — Cart/Checkout's existing
+ * `import { formatProductPrice } from "@/modules/catalog/client"` is
+ * untouched by this move.
  */
-export function formatProductPrice(
-  priceAmountMinor: number,
-  currency: string,
-  locale: string,
-): string {
-  const isWholeAmount = priceAmountMinor % 100 === 0;
-
-  return new Intl.NumberFormat(locale, {
-    style: "currency",
-    currency,
-    minimumFractionDigits: isWholeAmount ? 0 : 2,
-    maximumFractionDigits: isWholeAmount ? 0 : 2,
-  }).format(priceAmountMinor / 100);
-}
+export { formatProductPrice } from "@/shared/utils/format-price";

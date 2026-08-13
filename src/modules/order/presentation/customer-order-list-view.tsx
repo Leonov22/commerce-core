@@ -2,7 +2,7 @@ import { getTranslations, getLocale } from "next-intl/server";
 import { Container } from "@/shared/components/layout/container";
 import { Link } from "@/core/i18n/navigation";
 import { buttonVariants } from "@/shared/components/ui/button";
-import { formatProductPrice } from "@/modules/catalog/client";
+import { formatProductPrice } from "@/shared/utils/format-price";
 import { cn } from "@/core/lib/utils";
 import type { Order } from "@/modules/order/domain/order";
 
