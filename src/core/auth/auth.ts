@@ -1,10 +1,14 @@
 import NextAuth from "next-auth";
 import Credentials from "next-auth/providers/credentials";
+import { applyUserIdToToken, applyUserIdToSession } from "@/core/auth/session-callbacks";
 
 /**
  * Auth.js integration, per TDR-001-Tech-Stack. Login/registration business
  * logic itself lives in the identity module (IMP-027) — this file only
- * wires Auth.js to it and shapes the JWT/session payload.
+ * wires Auth.js to it. The actual jwt/session token-shaping logic lives in
+ * `session-callbacks.ts`, not inline here — see that file's doc comment for
+ * why (importing this file at all pulls in `next-auth`'s runtime, which is
+ * not loadable under Vitest, so the testable logic can't live here).
  *
  * `verifyCredentials` is imported dynamically inside `authorize`, not
  * statically at the top of this file. Identity's own session boundary
@@ -44,16 +48,10 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   ],
   callbacks: {
     async jwt({ token, user }) {
-      if (user?.id) {
-        token.userId = user.id;
-      }
-      return token;
+      return applyUserIdToToken(token, user);
     },
     async session({ session, token }) {
-      if (typeof token.userId === "string") {
-        session.user.id = token.userId;
-      }
-      return session;
+      return applyUserIdToSession(session, token);
     },
   },
 });
