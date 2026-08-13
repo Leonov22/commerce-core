@@ -175,3 +175,27 @@ model OrderItem {
   @@index([productId])
   @@map("order_items")
 }
+
+// =============================================================================
+// Identity — minimal application User foundation (IMP-027)
+//
+// Deliberately minimal: authentication credentials only. Email is always
+// stored lowercased by the application layer, so the plain `@unique` below
+// is sufficient for case-insensitive uniqueness without a citext extension.
+// Profiles, addresses, roles, and any relation to Order belong to future
+// milestones once those requirements are approved — not introduced here.
+// =============================================================================
+
+model User {
+  id String @id @default(cuid())
+
+  email String @unique
+
+  // Never exposed outside Identity's infrastructure/application layers.
+  passwordHash String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("users")
+}
