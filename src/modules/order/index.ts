@@ -22,6 +22,7 @@ export type {
   CheckoutOrderItemRequest,
   CreateOrderFromCheckoutResult,
 } from "@/modules/order/application/checkout-order";
+export { MAX_QUANTITY_PER_ITEM } from "@/modules/order/application/checkout-order";
 
 export function createOrder(input: NewOrderInput) {
   return orderCommands.createOrder(prismaOrderRepository, input);

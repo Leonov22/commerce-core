@@ -1,6 +1,11 @@
 import "dotenv/config";
 import { describe, expect, it } from "vitest";
-import { createOrderFromCheckout } from "@/modules/order/application/checkout-order";
+import {
+  createOrderFromCheckout,
+  MAX_QUANTITY_PER_ITEM,
+  MAX_AMOUNT_MINOR,
+  isWithinSafeAmountRange,
+} from "@/modules/order/application/checkout-order";
 import type { CheckoutOrderCustomer } from "@/modules/order/application/checkout-order";
 import type { OrderRepository, NewOrderInput } from "@/modules/order/repositories/order-repository";
 import type { Order } from "@/modules/order/domain/order";
@@ -205,6 +210,62 @@ describe("createOrderFromCheckout", () => {
     expect(result.error).toBe("INVALID_QUANTITY");
   });
 
+  it("accepts a quantity of exactly 1", async () => {
+    const { repository, calls } = makeFakeRepository();
+    const result = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 1 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("accepts a quantity of exactly MAX_QUANTITY_PER_ITEM", async () => {
+    const { repository, calls } = makeFakeRepository();
+    const result = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: MAX_QUANTITY_PER_ITEM }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("fails with INVALID_QUANTITY for MAX_QUANTITY_PER_ITEM + 1, and never calls the repository", async () => {
+    const { repository, calls } = makeFakeRepository();
+    const result = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: MAX_QUANTITY_PER_ITEM + 1 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBe("INVALID_QUANTITY");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("fails with INVALID_QUANTITY for an absurdly large quantity, and never calls the repository", async () => {
+    const { repository, calls } = makeFakeRepository();
+    const result = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 9_999_999_999 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBe("INVALID_QUANTITY");
+    expect(calls).toHaveLength(0);
+  });
+
   it("fails with UNRESOLVED_PRODUCTS for a nonexistent product and creates no order at all", async () => {
     const { repository, calls } = makeFakeRepository();
     const result = await createOrderFromCheckout(repository, {
@@ -237,5 +298,41 @@ describe("createOrderFromCheckout", () => {
 
     expect(result.ok).toBe(false);
     expect(calls).toHaveLength(0);
+  });
+});
+
+/**
+ * Real seeded Catalog prices ($86-$310) can never actually drive
+ * `createOrderFromCheckout` to the point of overflowing PostgreSQL's
+ * INTEGER range through the full pipeline, so this boundary is verified
+ * directly instead — see the doc comment on `isWithinSafeAmountRange`.
+ */
+describe("isWithinSafeAmountRange", () => {
+  it("accepts zero", () => {
+    expect(isWithinSafeAmountRange(0)).toBe(true);
+  });
+
+  it("accepts an ordinary amount", () => {
+    expect(isWithinSafeAmountRange(48_800)).toBe(true);
+  });
+
+  it("accepts exactly MAX_AMOUNT_MINOR", () => {
+    expect(isWithinSafeAmountRange(MAX_AMOUNT_MINOR)).toBe(true);
+  });
+
+  it("rejects MAX_AMOUNT_MINOR + 1", () => {
+    expect(isWithinSafeAmountRange(MAX_AMOUNT_MINOR + 1)).toBe(false);
+  });
+
+  it("rejects a value well beyond MAX_AMOUNT_MINOR", () => {
+    expect(isWithinSafeAmountRange(2_200_000_000)).toBe(false);
+  });
+
+  it("rejects a negative amount", () => {
+    expect(isWithinSafeAmountRange(-1)).toBe(false);
+  });
+
+  it("rejects a non-integer amount", () => {
+    expect(isWithinSafeAmountRange(100.5)).toBe(false);
   });
 });

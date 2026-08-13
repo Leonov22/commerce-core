@@ -32,7 +32,40 @@ export type CreateOrderFromCheckoutResult =
   | { ok: false; error: "EMPTY_CART" }
   | { ok: false; error: "INVALID_QUANTITY"; productId: string }
   | { ok: false; error: "UNRESOLVED_PRODUCTS"; productIds: string[] }
-  | { ok: false; error: "INCONSISTENT_CURRENCY" };
+  | { ok: false; error: "INCONSISTENT_CURRENCY" }
+  | { ok: false; error: "AMOUNT_OUT_OF_RANGE" };
+
+/**
+ * A single OrderItem's quantity ceiling. 100 units of one product is
+ * already far beyond a normal consumer checkout for this storefront's
+ * catalog (furniture/lighting/decor, priced $86-$310) — a quantity above
+ * this is treated as invalid input rather than a genuine bulk order, which
+ * this MVP does not support. This is a business-level limit, not a
+ * database-derived one; the separate `MAX_AMOUNT_MINOR` check below is
+ * what actually protects the database range.
+ */
+export const MAX_QUANTITY_PER_ITEM = 100;
+
+/**
+ * PostgreSQL's `INTEGER` (int4) column type — used for every money field in
+ * the Order/OrderItem schema — is a signed 32-bit integer, max 2^31 - 1.
+ * Any calculated amount above this must never reach Prisma: it would
+ * either be silently truncated or throw a raw, unhelpful database error.
+ * `MAX_QUANTITY_PER_ITEM` alone does not guarantee this — a single
+ * absurdly-priced Catalog product multiplied by an in-range quantity, or a
+ * cart with many high-value lines summed together, could still exceed it.
+ */
+export const MAX_AMOUNT_MINOR = 2_147_483_647;
+
+/**
+ * Exported for direct unit testing — real seeded Catalog prices are far too
+ * small to actually trigger an overflow through the full
+ * `createOrderFromCheckout` path without either modifying Catalog data or
+ * an elaborate fake, so the boundary itself is tested in isolation.
+ */
+export function isWithinSafeAmountRange(amountMinor: number): boolean {
+  return Number.isInteger(amountMinor) && amountMinor >= 0 && amountMinor <= MAX_AMOUNT_MINOR;
+}
 
 /**
  * The one path by which a Checkout submission may become a persisted Order.
@@ -60,8 +93,14 @@ export async function createOrderFromCheckout(
     return { ok: false, error: "EMPTY_CART" };
   }
 
+  // Checked before any arithmetic — an out-of-range quantity must never
+  // reach `priceAmountMinor * quantity` below.
   for (const item of request.items) {
-    if (!Number.isInteger(item.quantity) || item.quantity < 1) {
+    if (
+      !Number.isInteger(item.quantity) ||
+      item.quantity < 1 ||
+      item.quantity > MAX_QUANTITY_PER_ITEM
+    ) {
       return { ok: false, error: "INVALID_QUANTITY", productId: item.productId };
     }
   }
@@ -102,8 +141,19 @@ export async function createOrderFromCheckout(
     return { ok: false, error: "INCONSISTENT_CURRENCY" };
   }
 
+  // Defense in depth beyond MAX_QUANTITY_PER_ITEM: guards a single line
+  // total against an unexpectedly high Catalog price, independent of
+  // whether the quantity itself was in range.
+  if (items.some((item) => !isWithinSafeAmountRange(item.lineTotalAmountMinor))) {
+    return { ok: false, error: "AMOUNT_OUT_OF_RANGE" };
+  }
+
   const subtotalAmountMinor = items.reduce((sum, item) => sum + item.lineTotalAmountMinor, 0);
   const totalAmountMinor = subtotalAmountMinor + request.deliveryAmountMinor;
+
+  if (!isWithinSafeAmountRange(subtotalAmountMinor) || !isWithinSafeAmountRange(totalAmountMinor)) {
+    return { ok: false, error: "AMOUNT_OUT_OF_RANGE" };
+  }
 
   const order = await repository.create({
     status: "PENDING",

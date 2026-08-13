@@ -1,8 +1,9 @@
 import { NextResponse } from "next/server";
 import { validateCustomerInformation, getDeliveryAmountMinor } from "@/modules/checkout";
 import type { CustomerInformation, DeliveryMethodKey } from "@/modules/checkout";
-import { createOrderFromCheckout } from "@/modules/order";
+import { createOrderFromCheckout, MAX_QUANTITY_PER_ITEM } from "@/modules/order";
 import { routing } from "@/core/i18n/routing";
+import { isPlainRequestObject } from "@/app/api/orders/validate-request-body";
 
 /**
  * Order Creation boundary for Checkout.
@@ -33,12 +34,17 @@ interface RawOrderItem {
 }
 
 export async function POST(request: Request) {
-  let body: OrderRequestBody;
+  let rawBody: unknown;
   try {
-    body = await request.json();
+    rawBody = await request.json();
   } catch {
     return NextResponse.json({ error: "INVALID_REQUEST" }, { status: 400 });
   }
+
+  if (!isPlainRequestObject(rawBody)) {
+    return NextResponse.json({ error: "INVALID_REQUEST" }, { status: 400 });
+  }
+  const body = rawBody as OrderRequestBody;
 
   const customer: CustomerInformation = {
     firstName: typeof body.customer?.firstName === "string" ? body.customer.firstName : "",
@@ -68,7 +74,12 @@ export async function POST(request: Request) {
     if (typeof productId !== "string" || !productId) {
       return NextResponse.json({ error: "INVALID_CART" }, { status: 400 });
     }
-    if (typeof quantity !== "number" || !Number.isInteger(quantity) || quantity < 1) {
+    if (
+      typeof quantity !== "number" ||
+      !Number.isInteger(quantity) ||
+      quantity < 1 ||
+      quantity > MAX_QUANTITY_PER_ITEM
+    ) {
       return NextResponse.json({ error: "INVALID_QUANTITY", productId }, { status: 400 });
     }
     items.push({ productId, quantity });
@@ -105,6 +116,8 @@ export async function POST(request: Request) {
           );
         case "INCONSISTENT_CURRENCY":
           return NextResponse.json({ error: "INTERNAL_ERROR" }, { status: 500 });
+        case "AMOUNT_OUT_OF_RANGE":
+          return NextResponse.json({ error: "AMOUNT_OUT_OF_RANGE" }, { status: 400 });
         default:
           return NextResponse.json({ error: "INTERNAL_ERROR" }, { status: 500 });
       }
