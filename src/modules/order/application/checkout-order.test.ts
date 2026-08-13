@@ -90,6 +90,7 @@ function makeFakeRepository(): { repository: OrderRepository; calls: NewOrderInp
         lastName: input.lastName,
         email: input.email,
         phone: input.phone,
+        userId: input.userId,
         subtotalAmountMinor: input.subtotalAmountMinor,
         deliveryAmountMinor: input.deliveryAmountMinor,
         totalAmountMinor: input.totalAmountMinor,
@@ -103,6 +104,15 @@ function makeFakeRepository(): { repository: OrderRepository; calls: NewOrderInp
         })),
       };
       return order;
+    },
+    // Not exercised by this file's tests (IMP-026/026-FIX/026-FIX-TESTS
+    // predate customer order history) — present only to satisfy
+    // `OrderRepository`'s shape.
+    async findManyByUserId() {
+      throw new Error("not used by these tests");
+    },
+    async findByIdForUser() {
+      throw new Error("not used by these tests");
     },
   };
   return { repository, calls };
@@ -368,6 +378,61 @@ describe("createOrderFromCheckout", () => {
 
     expect(result.ok).toBe(false);
     expect(calls).toHaveLength(0);
+  });
+});
+
+/**
+ * Customer ownership association (IMP-029): `userId` is trusted exactly as
+ * given by the caller (the API route, which derives it server-side via
+ * Identity's `getCurrentUser()`) — this function never re-derives it, and
+ * never reads it from anywhere but this explicit request field.
+ */
+describe("createOrderFromCheckout — customer ownership (IMP-029)", () => {
+  it("assigns the given userId to the created order for an authenticated checkout", async () => {
+    const { repository, calls } = makeFakeRepository();
+    const result = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 1 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+      userId: "user-123",
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.order.userId).toBe("user-123");
+    expect(calls[0]?.userId).toBe("user-123");
+  });
+
+  it("assigns null for a guest checkout when userId is explicitly null", async () => {
+    const { repository, calls } = makeFakeRepository();
+    const result = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 1 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+      userId: null,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.order.userId).toBeNull();
+    expect(calls[0]?.userId).toBeNull();
+  });
+
+  it("defaults to null for a guest checkout when userId is omitted entirely", async () => {
+    const { repository, calls } = makeFakeRepository();
+    const result = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 1 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.order.userId).toBeNull();
+    expect(calls[0]?.userId).toBeNull();
   });
 });
 

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { validateCustomerInformation, getDeliveryAmountMinor } from "@/modules/checkout";
 import type { CustomerInformation, DeliveryMethodKey } from "@/modules/checkout";
 import { createOrderFromCheckout, MAX_QUANTITY_PER_ITEM } from "@/modules/order";
+import { getCurrentUser } from "@/modules/identity";
 import { routing } from "@/core/i18n/routing";
 import { isPlainRequestObject } from "@/app/api/orders/validate-request-body";
 
@@ -97,8 +98,19 @@ export async function POST(request: Request) {
     ? (body.locale as string)
     : routing.defaultLocale;
 
+  // Server-derived only — the client never supplies or influences this.
+  // Guest checkout remains fully supported: no session simply means `null`.
+  const currentUser = await getCurrentUser();
+  const userId = currentUser?.id ?? null;
+
   try {
-    const result = await createOrderFromCheckout({ customer, items, deliveryAmountMinor, locale });
+    const result = await createOrderFromCheckout({
+      customer,
+      items,
+      deliveryAmountMinor,
+      locale,
+      userId,
+    });
 
     if (!result.ok) {
       switch (result.error) {

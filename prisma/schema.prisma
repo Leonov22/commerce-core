@@ -130,12 +130,20 @@ model Order {
 
   status OrderStatus @default(PENDING)
 
-  // Customer snapshot — no User/Customer entity exists yet (auth is out of
-  // scope), so this is the only record of who the order is for.
+  // Customer snapshot, independent of `userId` below — kept even for
+  // authenticated orders (a User has no name/phone of its own), and is the
+  // only record of who the order is for on a guest order.
   firstName String
   lastName  String
   email     String
   phone     String
+
+  // Nullable: guest checkout remains supported (IMP-029). Set from the
+  // server-derived authenticated user at creation time, never from client
+  // input. `SetNull` on delete — a historical Order must survive its
+  // owning User being deleted, not be deleted or orphaned itself.
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   // Integer minor units, never floating point — same convention as Catalog.
   subtotalAmountMinor Int
@@ -150,6 +158,9 @@ model Order {
 
   @@index([status])
   @@index([createdAt])
+  // Supports the customer order-history query: filter by owner, ordered
+  // deterministically newest-first with `id` as a tiebreaker.
+  @@index([userId, createdAt, id])
   @@map("orders")
 }
 
@@ -196,6 +207,10 @@ model User {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  // Prisma-required opposite side of `Order.user` — purely relational
+  // (virtual, not a real column), not a new business-data User field.
+  orders Order[]
 
   @@map("users")
 }

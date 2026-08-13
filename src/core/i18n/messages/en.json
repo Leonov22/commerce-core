@@ -234,7 +234,35 @@
       },
       "heading": "Your account",
       "signedInAs": "Signed in as {email}",
-      "logout": "Log out"
+      "logout": "Log out",
+      "ordersLink": "View order history"
+    },
+    "orders": {
+      "meta": {
+        "title": "Order history — Commerce Core",
+        "description": "View your past orders."
+      },
+      "detailMeta": {
+        "title": "Order details — Commerce Core",
+        "description": "View the details of your order."
+      },
+      "title": "Order history",
+      "empty": "You haven't placed any orders yet.",
+      "orderReference": "Order {id}",
+      "placedOn": "Placed on {date}",
+      "itemCount": "{count, plural, one {# item} other {# items}}",
+      "loadMore": "Load more",
+      "backToOrders": "Back to order history",
+      "quantity": "Qty {quantity}",
+      "unitPrice": "{amount} each",
+      "subtotal": "Subtotal",
+      "delivery": "Delivery",
+      "total": "Total",
+      "status": {
+        "PENDING": "Pending",
+        "PAID": "Paid",
+        "CANCELLED": "Cancelled"
+      }
     }
   },
   "BrandValues": {

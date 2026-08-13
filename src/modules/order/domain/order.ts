@@ -33,6 +33,8 @@ export interface Order {
   lastName: string;
   email: string;
   phone: string;
+  /** The authenticated customer who placed this order — `null` for a guest order (IMP-029). */
+  userId: string | null;
   subtotalAmountMinor: number;
   deliveryAmountMinor: number;
   totalAmountMinor: number;

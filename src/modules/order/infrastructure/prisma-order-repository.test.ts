@@ -28,6 +28,7 @@ describe("prismaOrderRepository", () => {
       lastName: "Smith",
       email: "john.smith@example.com",
       phone: "+421 900 123 456",
+      userId: null,
       subtotalAmountMinor: 24000,
       deliveryAmountMinor: 800,
       totalAmountMinor: 24800,
@@ -242,5 +243,178 @@ describe("prismaOrderRepository", () => {
     const remainingItems = await prisma.orderItem.findMany({ where: { orderId } });
     expect(remainingItems).toHaveLength(0);
     // Already deleted — do not add it to createdOrderIds for afterAll cleanup.
+  });
+});
+
+/**
+ * Customer order history (IMP-029) — real Postgres integration tests, same
+ * rationale as the suite above. Creates real `User` rows directly via
+ * `prisma.user.create` for FK-valid test data; this touches the shared
+ * database, not the Identity module's application/repository code, so it
+ * does not create a dependency from Order on Identity.
+ */
+describe("prismaOrderRepository — customer order history", () => {
+  const historyOrderIds: string[] = [];
+  const historyUserIds: string[] = [];
+
+  afterAll(async () => {
+    if (historyOrderIds.length > 0) {
+      await prisma.order.deleteMany({ where: { id: { in: historyOrderIds } } });
+    }
+    if (historyUserIds.length > 0) {
+      await prisma.user.deleteMany({ where: { id: { in: historyUserIds } } });
+    }
+    await prisma.$disconnect();
+  });
+
+  async function createTestUser(label: string): Promise<string> {
+    const user = await prisma.user.create({
+      data: {
+        email: `order-history-test-${label}-${Date.now()}@example.com`,
+        passwordHash: "irrelevant-for-this-test",
+      },
+    });
+    historyUserIds.push(user.id);
+    return user.id;
+  }
+
+  function baseInput(overrides: Partial<NewOrderInput> = {}): NewOrderInput {
+    return {
+      firstName: "John",
+      lastName: "Smith",
+      email: "john.smith@example.com",
+      phone: "+421 900 123 456",
+      userId: null,
+      subtotalAmountMinor: 24000,
+      deliveryAmountMinor: 800,
+      totalAmountMinor: 24800,
+      currency: "USD",
+      items: [
+        {
+          productId: "1",
+          productName: "Studio Chair",
+          unitPriceAmountMinor: 24000,
+          quantity: 1,
+          lineTotalAmountMinor: 24000,
+          currency: "USD",
+        },
+      ],
+      ...overrides,
+    };
+  }
+
+  it("lists only the requesting user's own orders", async () => {
+    const userAId = await createTestUser("list-a");
+    const userBId = await createTestUser("list-b");
+
+    const orderA = await prismaOrderRepository.create(baseInput({ userId: userAId }));
+    historyOrderIds.push(orderA.id);
+    const orderB = await prismaOrderRepository.create(baseInput({ userId: userBId }));
+    historyOrderIds.push(orderB.id);
+
+    const pageA = await prismaOrderRepository.findManyByUserId(userAId, { take: 10 });
+    expect(pageA.orders.map((order) => order.id)).toEqual([orderA.id]);
+
+    const pageB = await prismaOrderRepository.findManyByUserId(userBId, { take: 10 });
+    expect(pageB.orders.map((order) => order.id)).toEqual([orderB.id]);
+  });
+
+  it("returns an empty page for a user with no orders", async () => {
+    const userId = await createTestUser("empty");
+    const page = await prismaOrderRepository.findManyByUserId(userId, { take: 10 });
+    expect(page.orders).toEqual([]);
+    expect(page.nextCursor).toBeNull();
+  });
+
+  it("excludes guest orders (userId null) from every customer's order history", async () => {
+    const userId = await createTestUser("guest-exclusion");
+    const guestOrder = await prismaOrderRepository.create(baseInput({ userId: null }));
+    historyOrderIds.push(guestOrder.id);
+
+    const page = await prismaOrderRepository.findManyByUserId(userId, { take: 10 });
+    expect(page.orders.map((order) => order.id)).not.toContain(guestOrder.id);
+  });
+
+  it("paginates deterministically newest-first with a working cursor", async () => {
+    const userId = await createTestUser("pagination");
+    const createdIds: string[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      const order = await prismaOrderRepository.create(baseInput({ userId }));
+      historyOrderIds.push(order.id);
+      createdIds.push(order.id);
+    }
+    // Created oldest -> newest; newest-first (createdAt DESC, id DESC) expected.
+    const expectedOrder = [...createdIds].reverse();
+
+    const firstPage = await prismaOrderRepository.findManyByUserId(userId, { take: 2 });
+    expect(firstPage.orders.map((order) => order.id)).toEqual(expectedOrder.slice(0, 2));
+    expect(firstPage.nextCursor).toBe(expectedOrder[1]);
+
+    const secondPage = await prismaOrderRepository.findManyByUserId(userId, {
+      take: 2,
+      cursor: firstPage.nextCursor!,
+    });
+    expect(secondPage.orders.map((order) => order.id)).toEqual(expectedOrder.slice(2));
+    expect(secondPage.nextCursor).toBeNull();
+  });
+
+  it("IDOR: a user can retrieve their own order but never another user's order", async () => {
+    const userAId = await createTestUser("idor-a");
+    const userBId = await createTestUser("idor-b");
+
+    const orderA = await prismaOrderRepository.create(baseInput({ userId: userAId }));
+    historyOrderIds.push(orderA.id);
+    const orderB = await prismaOrderRepository.create(baseInput({ userId: userBId }));
+    historyOrderIds.push(orderB.id);
+
+    expect(await prismaOrderRepository.findByIdForUser(orderA.id, userAId)).not.toBeNull();
+    expect(await prismaOrderRepository.findByIdForUser(orderB.id, userAId)).toBeNull();
+    expect(await prismaOrderRepository.findByIdForUser(orderB.id, userBId)).not.toBeNull();
+    expect(await prismaOrderRepository.findByIdForUser(orderA.id, userBId)).toBeNull();
+  });
+
+  it("findByIdForUser returns null for a nonexistent order id", async () => {
+    const userId = await createTestUser("nonexistent-order");
+    expect(await prismaOrderRepository.findByIdForUser("nonexistent-order-id", userId)).toBeNull();
+  });
+
+  it("returns the stored OrderItem snapshot even for a product that no longer exists", async () => {
+    const userId = await createTestUser("snapshot");
+    const order = await prismaOrderRepository.create(
+      baseInput({
+        userId,
+        items: [
+          {
+            productId: "no-longer-exists",
+            productName: "Discontinued Item",
+            unitPriceAmountMinor: 1000,
+            quantity: 1,
+            lineTotalAmountMinor: 1000,
+            currency: "USD",
+          },
+        ],
+      }),
+    );
+    historyOrderIds.push(order.id);
+
+    const found = await prismaOrderRepository.findByIdForUser(order.id, userId);
+    expect(found?.items[0]?.productId).toBe("no-longer-exists");
+    expect(found?.items[0]?.productName).toBe("Discontinued Item");
+    expect(found?.items[0]?.unitPriceAmountMinor).toBe(1000);
+  });
+
+  it("SET NULL: deleting the owning User leaves the Order intact with userId = null", async () => {
+    const userId = await createTestUser("delete-set-null");
+    const order = await prismaOrderRepository.create(baseInput({ userId }));
+    historyOrderIds.push(order.id);
+
+    await prisma.user.delete({ where: { id: userId } });
+    // Already deleted — remove so afterAll doesn't attempt a redundant delete.
+    const index = historyUserIds.indexOf(userId);
+    if (index >= 0) historyUserIds.splice(index, 1);
+
+    const stillExists = await prisma.order.findUnique({ where: { id: order.id } });
+    expect(stillExists).not.toBeNull();
+    expect(stillExists?.userId).toBeNull();
   });
 });

@@ -25,6 +25,16 @@ export interface CheckoutOrderRequest {
    */
   deliveryAmountMinor: number;
   locale: string;
+  /**
+   * The authenticated customer's id, or `null`/omitted for a guest
+   * checkout (IMP-029) — resolved server-side by the caller (the API
+   * route, via Identity's `getCurrentUser()`) before this function is ever
+   * invoked. This function trusts it as already-authoritative and never
+   * re-derives or second-guesses it; it must never come from client
+   * request input. Optional (defaults to `null`) so every pre-IMP-029 test
+   * case that doesn't specify it keeps compiling as a guest-order test.
+   */
+  userId?: string | null;
 }
 
 export type CreateOrderFromCheckoutResult =
@@ -161,6 +171,7 @@ export async function createOrderFromCheckout(
     lastName: request.customer.lastName,
     email: request.customer.email,
     phone: request.customer.phone,
+    userId: request.userId ?? null,
     subtotalAmountMinor,
     deliveryAmountMinor: request.deliveryAmountMinor,
     totalAmountMinor,

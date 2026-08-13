@@ -1,6 +1,11 @@
 import "server-only";
 import { prisma } from "@/modules/order/infrastructure/prisma-client";
-import type { OrderRepository, NewOrderInput } from "@/modules/order/repositories/order-repository";
+import type {
+  OrderRepository,
+  NewOrderInput,
+  FindManyByUserIdOptions,
+  OrderListPage,
+} from "@/modules/order/repositories/order-repository";
 import type { Order, OrderItem, OrderStatus } from "@/modules/order/domain/order";
 
 async function createOrderRecord(input: NewOrderInput) {
@@ -11,6 +16,7 @@ async function createOrderRecord(input: NewOrderInput) {
       lastName: input.lastName,
       email: input.email,
       phone: input.phone,
+      userId: input.userId,
       subtotalAmountMinor: input.subtotalAmountMinor,
       deliveryAmountMinor: input.deliveryAmountMinor,
       totalAmountMinor: input.totalAmountMinor,
@@ -53,6 +59,7 @@ function toDomainOrder(row: OrderRow): Order {
     lastName: row.lastName,
     email: row.email,
     phone: row.phone,
+    userId: row.userId,
     subtotalAmountMinor: row.subtotalAmountMinor,
     deliveryAmountMinor: row.deliveryAmountMinor,
     totalAmountMinor: row.totalAmountMinor,
@@ -72,5 +79,39 @@ export const prismaOrderRepository: OrderRepository = {
   async create(input) {
     const row = await createOrderRecord(input);
     return toDomainOrder(row);
+  },
+
+  async findManyByUserId(
+    userId: string,
+    { cursor, take }: FindManyByUserIdOptions,
+  ): Promise<OrderListPage> {
+    // Fetch one extra row to know whether a next page exists, without a
+    // separate count query.
+    const rows = await prisma.order.findMany({
+      where: { userId },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      take: take + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      include: { items: true },
+    });
+
+    const hasNextPage = rows.length > take;
+    const page = hasNextPage ? rows.slice(0, take) : rows;
+
+    return {
+      orders: page.map(toDomainOrder),
+      nextCursor: hasNextPage ? page[page.length - 1]!.id : null,
+    };
+  },
+
+  async findByIdForUser(orderId: string, userId: string): Promise<Order | null> {
+    // `userId` is part of the WHERE clause itself, not a post-fetch check —
+    // an order belonging to another user is indistinguishable from one that
+    // doesn't exist at all.
+    const row = await prisma.order.findFirst({
+      where: { id: orderId, userId },
+      include: { items: true },
+    });
+    return row ? toDomainOrder(row) : null;
   },
 };
