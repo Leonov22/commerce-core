@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createOrderFromCheckout,
   MAX_QUANTITY_PER_ITEM,
@@ -9,6 +9,61 @@ import {
 import type { CheckoutOrderCustomer } from "@/modules/order/application/checkout-order";
 import type { OrderRepository, NewOrderInput } from "@/modules/order/repositories/order-repository";
 import type { Order } from "@/modules/order/domain/order";
+import type { Product } from "@/modules/catalog/domain/product";
+
+/**
+ * `qa-overflow-fixture` is a reserved id intercepted by the `@/modules/catalog`
+ * partial mock below — every other id is passed through to the real Catalog
+ * boundary unchanged. `vi.hoisted` is required (rather than a plain `const`)
+ * because Vitest hoists `vi.mock` factories above all other module code; a
+ * factory that closed over an un-hoisted `const` would hit it before
+ * initialization.
+ */
+const { OVERFLOW_PRODUCT_ID } = vi.hoisted(() => ({
+  OVERFLOW_PRODUCT_ID: "qa-overflow-fixture",
+}));
+
+/**
+ * Real seeded Catalog prices ($86-$310) can never drive
+ * `createOrderFromCheckout` to overflow PostgreSQL's INTEGER range through
+ * the real pipeline, so this partial mock intercepts exactly one reserved
+ * product id and returns a fixture priced high enough to overflow when
+ * multiplied by an in-range quantity — every other id still resolves
+ * against the real seeded Neon data via `importOriginal`, so none of the
+ * other tests in this file are affected.
+ */
+vi.mock("@/modules/catalog", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/modules/catalog")>();
+  const overflowFixture: Product = {
+    id: "qa-overflow-fixture",
+    slug: "qa-overflow-fixture",
+    status: "ACTIVE",
+    priceAmountMinor: 1_200_000_000,
+    currency: "USD",
+    categorySlug: "qa",
+    badge: null,
+    isFeatured: false,
+    sortOrder: 0,
+    translation: {
+      locale: "en",
+      name: "QA Overflow Fixture",
+      meta: "",
+      description: "",
+      material: "",
+      dimensions: "",
+    },
+  };
+
+  return {
+    ...actual,
+    getProductsByIds: async (ids: string[], locale: string) => {
+      if (ids.length === 1 && ids[0] === "qa-overflow-fixture") {
+        return [overflowFixture];
+      }
+      return actual.getProductsByIds(ids, locale);
+    },
+  };
+});
 
 /**
  * Integration-ish tests: `createOrderFromCheckout` resolves products through
@@ -210,6 +265,21 @@ describe("createOrderFromCheckout", () => {
     expect(result.error).toBe("INVALID_QUANTITY");
   });
 
+  it("fails with INVALID_QUANTITY for a fractional quantity, and never calls the repository", async () => {
+    const { repository, calls } = makeFakeRepository();
+    const result = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 1.5 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBe("INVALID_QUANTITY");
+    expect(calls).toHaveLength(0);
+  });
+
   it("accepts a quantity of exactly 1", async () => {
     const { repository, calls } = makeFakeRepository();
     const result = await createOrderFromCheckout(repository, {
@@ -297,6 +367,34 @@ describe("createOrderFromCheckout", () => {
     });
 
     expect(result.ok).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+});
+
+/**
+ * Closes QA-02: proves the monetary-range guard is actually wired into the
+ * real `createOrderFromCheckout` pipeline — Catalog price resolution,
+ * quantity multiplication, and the guard itself, in that order — not just
+ * that `isWithinSafeAmountRange` is correct in isolation. Regression
+ * protection against a future change that moves or removes the guard
+ * relative to `repository.create()`.
+ */
+describe("createOrderFromCheckout — monetary overflow (application path)", () => {
+  it("rejects a Catalog-price-derived line total exceeding MAX_AMOUNT_MINOR with AMOUNT_OUT_OF_RANGE, and never calls the repository", async () => {
+    const { repository, calls } = makeFakeRepository();
+    // 1_200_000_000 * 2 = 2_400_000_000, which exceeds MAX_AMOUNT_MINOR
+    // (2_147_483_647) — the price comes from the mocked Catalog boundary
+    // above, exercised through the real function, not asserted directly.
+    const result = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: OVERFLOW_PRODUCT_ID, quantity: 2 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBe("AMOUNT_OUT_OF_RANGE");
     expect(calls).toHaveLength(0);
   });
 });
