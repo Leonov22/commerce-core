@@ -186,6 +186,57 @@
       "continueShopping": "Continue shopping"
     }
   },
+  "Account": {
+    "register": {
+      "meta": {
+        "title": "Create account — Commerce Core",
+        "description": "Create a Commerce Core account."
+      },
+      "title": "Create your account",
+      "intro": "Register with your email and a password to access your account.",
+      "emailLabel": "Email",
+      "passwordLabel": "Password",
+      "confirmPasswordLabel": "Confirm password",
+      "submit": "Create account",
+      "submitting": "Creating account…",
+      "haveAccount": "Already have an account?",
+      "loginLink": "Log in",
+      "errors": {
+        "required": "Enter a valid email and password.",
+        "passwordMismatch": "Passwords do not match.",
+        "invalidEmail": "Enter a valid email address.",
+        "weakPassword": "Password must be at least 8 characters.",
+        "emailAlreadyRegistered": "An account with this email already exists.",
+        "unexpected": "Something went wrong. Please try again."
+      }
+    },
+    "login": {
+      "meta": {
+        "title": "Log in — Commerce Core",
+        "description": "Log in to your Commerce Core account."
+      },
+      "title": "Log in",
+      "intro": "Enter your email and password to continue.",
+      "emailLabel": "Email",
+      "passwordLabel": "Password",
+      "submit": "Log in",
+      "submitting": "Logging in…",
+      "noAccount": "Don't have an account?",
+      "registerLink": "Create one",
+      "errors": {
+        "invalidCredentials": "Invalid email or password."
+      }
+    },
+    "dashboard": {
+      "meta": {
+        "title": "Your account — Commerce Core",
+        "description": "Manage your Commerce Core account."
+      },
+      "heading": "Your account",
+      "signedInAs": "Signed in as {email}",
+      "logout": "Log out"
+    }
+  },
   "BrandValues": {
     "eyebrow": "Why Commerce Core",
     "title": "Built around what matters",

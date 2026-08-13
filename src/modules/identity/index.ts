@@ -31,6 +31,17 @@ export type {
   VerifyCredentialsResult,
 } from "@/modules/identity/application/verify-credentials";
 export { UnauthenticatedError } from "@/modules/identity/application/current-user";
+export {
+  resolveProtectedPageRedirect,
+  resolveGuestOnlyPageRedirect,
+} from "@/modules/identity/application/account-access";
+
+// Customer-facing account UI (IMP-028) — thin `app/[locale]/account/*`
+// pages render these, the same way `checkout/page.tsx` renders
+// `CheckoutView` from `@/modules/checkout`.
+export { AccountRegisterView } from "@/modules/identity/presentation/account-register-view";
+export { AccountLoginView } from "@/modules/identity/presentation/account-login-view";
+export { AccountDashboardView } from "@/modules/identity/presentation/account-dashboard-view";
 
 export function registerUser(input: RegisterUserInput) {
   return registerUserCommand.registerUser(prismaUserRepository, input);
