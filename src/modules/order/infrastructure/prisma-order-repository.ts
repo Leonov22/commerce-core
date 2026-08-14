@@ -146,4 +146,21 @@ export const prismaOrderRepository: OrderRepository = {
     });
     return row ? toDomainOrder(row) : null;
   },
+
+  async findById(orderId: string): Promise<Order | null> {
+    const row = await prisma.order.findUnique({
+      where: { id: orderId },
+      include: { items: true },
+    });
+    return row ? toDomainOrder(row) : null;
+  },
+
+  async updateStatus(orderId: string, status: OrderStatus): Promise<Order> {
+    const row = await prisma.order.update({
+      where: { id: orderId },
+      data: { status },
+      include: { items: true },
+    });
+    return toDomainOrder(row);
+  },
 };

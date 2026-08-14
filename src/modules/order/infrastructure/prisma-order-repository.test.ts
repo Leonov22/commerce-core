@@ -247,6 +247,77 @@ describe("prismaOrderRepository", () => {
 });
 
 /**
+ * Order lifecycle (IMP-030) — real Postgres integration tests for the two
+ * repository methods `changeOrderStatus` depends on. Transition legality
+ * itself is a pure domain rule, already covered by `order.test.ts` and
+ * `order-status.test.ts`'s fake-repository tests — these only verify the
+ * actual database read/write.
+ */
+describe("prismaOrderRepository — order lifecycle", () => {
+  const lifecycleOrderIds: string[] = [];
+
+  afterAll(async () => {
+    if (lifecycleOrderIds.length > 0) {
+      await prisma.order.deleteMany({ where: { id: { in: lifecycleOrderIds } } });
+    }
+    await prisma.$disconnect();
+  });
+
+  function baseInput(overrides: Partial<NewOrderInput> = {}): NewOrderInput {
+    return {
+      firstName: "John",
+      lastName: "Smith",
+      email: "john.smith@example.com",
+      phone: "+421 900 123 456",
+      userId: null,
+      subtotalAmountMinor: 24000,
+      deliveryAmountMinor: 800,
+      totalAmountMinor: 24800,
+      currency: "USD",
+      items: [
+        {
+          productId: "1",
+          productName: "Studio Chair",
+          unitPriceAmountMinor: 24000,
+          quantity: 1,
+          lineTotalAmountMinor: 24000,
+          currency: "USD",
+        },
+      ],
+      ...overrides,
+    };
+  }
+
+  it("findById returns the order regardless of owner", async () => {
+    const order = await prismaOrderRepository.create(baseInput());
+    lifecycleOrderIds.push(order.id);
+
+    const found = await prismaOrderRepository.findById(order.id);
+
+    expect(found?.id).toBe(order.id);
+    expect(found?.status).toBe("PENDING");
+  });
+
+  it("findById returns null for a nonexistent order id", async () => {
+    const found = await prismaOrderRepository.findById("nonexistent-order-id");
+    expect(found).toBeNull();
+  });
+
+  it("updateStatus persists the new status and returns the updated order", async () => {
+    const order = await prismaOrderRepository.create(baseInput());
+    lifecycleOrderIds.push(order.id);
+    expect(order.status).toBe("PENDING");
+
+    const updated = await prismaOrderRepository.updateStatus(order.id, "PAID");
+    expect(updated.status).toBe("PAID");
+
+    // Re-fetch independently to prove the write actually reached the database.
+    const refetched = await prismaOrderRepository.findById(order.id);
+    expect(refetched?.status).toBe("PAID");
+  });
+});
+
+/**
  * Customer order history (IMP-029) — real Postgres integration tests, same
  * rationale as the suite above. Creates real `User` rows directly via
  * `prisma.user.create` for FK-valid test data; this touches the shared

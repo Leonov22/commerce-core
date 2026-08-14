@@ -12,6 +12,24 @@
 
 export type OrderStatus = "PENDING" | "PAID" | "CANCELLED";
 
+/**
+ * The Order lifecycle (IMP-030). Explicit per-status allow-list rather than
+ * a generic state-machine abstraction — there are exactly three statuses
+ * and two legal transitions, and a framework here would be solving a
+ * problem this domain doesn't have. `PAID` and `CANCELLED` are terminal:
+ * neither has any outgoing transition, by omission from this map rather
+ * than a separate "is terminal" check.
+ */
+const ALLOWED_ORDER_STATUS_TRANSITIONS: Record<OrderStatus, readonly OrderStatus[]> = {
+  PENDING: ["PAID", "CANCELLED"],
+  PAID: [],
+  CANCELLED: [],
+};
+
+export function isValidOrderStatusTransition(from: OrderStatus, to: OrderStatus): boolean {
+  return ALLOWED_ORDER_STATUS_TRANSITIONS[from].includes(to);
+}
+
 export interface OrderItem {
   id: string;
   orderId: string;

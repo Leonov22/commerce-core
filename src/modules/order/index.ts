@@ -9,8 +9,10 @@ import { prismaOrderRepository } from "@/modules/order/infrastructure/prisma-ord
 import * as orderCommands from "@/modules/order/application/order-commands";
 import * as checkoutOrderCommands from "@/modules/order/application/checkout-order";
 import * as customerOrdersCommands from "@/modules/order/application/customer-orders";
+import * as orderStatusCommands from "@/modules/order/application/order-status";
 import type { NewOrderInput } from "@/modules/order/repositories/order-repository";
 import type { CheckoutOrderRequest } from "@/modules/order/application/checkout-order";
+import type { OrderStatus } from "@/modules/order/domain/order";
 
 export type { Order, OrderItem, OrderStatus } from "@/modules/order/domain/order";
 export type {
@@ -25,6 +27,7 @@ export type {
   CreateOrderFromCheckoutResult,
 } from "@/modules/order/application/checkout-order";
 export { MAX_QUANTITY_PER_ITEM } from "@/modules/order/application/checkout-order";
+export type { ChangeOrderStatusResult } from "@/modules/order/application/order-status";
 
 // Customer-facing order-history UI (IMP-029) — thin
 // `app/[locale]/account/orders/*` pages render these, the same way
@@ -60,4 +63,14 @@ export function getCustomerOrders(userId: string, cursor?: string) {
 /** Returns `null` for both "no such order" and "belongs to someone else" — indistinguishable to the caller. */
 export function getCustomerOrder(userId: string, orderId: string) {
   return customerOrdersCommands.getCustomerOrder(prismaOrderRepository, userId, orderId);
+}
+
+/**
+ * Order lifecycle transition (IMP-030). Not customer-scoped and not wired
+ * to any transport — establishes the contract a future Payments/Admin
+ * module will use. No customer-facing route/page calls this; Customers
+ * only ever read `order.status` via `getCustomerOrders`/`getCustomerOrder`.
+ */
+export function changeOrderStatus(orderId: string, nextStatus: OrderStatus) {
+  return orderStatusCommands.changeOrderStatus(prismaOrderRepository, orderId, nextStatus);
 }

@@ -32,7 +32,8 @@ vi.mock("@/modules/checkout", () => ({
   getDeliveryAmountMinor: (method: string) => (method === "standard" ? 800 : null),
 }));
 
-const { POST } = await import("@/app/api/orders/route");
+const orderRouteModule = await import("@/app/api/orders/route");
+const { POST } = orderRouteModule;
 
 function makeRequest(body: unknown): Request {
   return new Request("http://localhost/api/orders", {
@@ -128,5 +129,39 @@ describe("POST /api/orders — ownership cannot be overridden by the client (CR0
     expect(response.status).toBe(201);
     const callArg = mockCreateOrderFromCheckout.mock.calls[0]?.[0];
     expect(callArg.userId).toBeNull();
+  });
+
+  it("ignores a client-supplied status in the checkout body — initial status is never client-selectable (IMP-030)", async () => {
+    mockGetCurrentUser.mockResolvedValueOnce(null);
+    mockCreateOrderFromCheckout.mockResolvedValueOnce({
+      ok: true,
+      order: {
+        id: "order-4",
+        status: "PENDING",
+        userId: null,
+        subtotalAmountMinor: 100,
+        deliveryAmountMinor: 0,
+        totalAmountMinor: 100,
+        currency: "USD",
+      },
+    });
+
+    const response = await POST(makeRequest(validBody({ status: "PAID" })));
+
+    expect(response.status).toBe(201);
+    // `createOrderFromCheckout` was never even given a `status` field to
+    // trust — it hardcodes PENDING internally (see checkout-order.ts).
+    const callArg = mockCreateOrderFromCheckout.mock.calls[0]?.[0];
+    expect(callArg.status).toBeUndefined();
+  });
+});
+
+describe("api/orders/route module surface — no Customer-facing status mutation (IMP-030)", () => {
+  it("exports only POST — no PATCH/PUT/DELETE handler exists for Customers to mutate Order status", () => {
+    const exported = orderRouteModule as unknown as Record<string, unknown>;
+    expect(typeof exported.POST).toBe("function");
+    expect(exported.PATCH).toBeUndefined();
+    expect(exported.PUT).toBeUndefined();
+    expect(exported.DELETE).toBeUndefined();
   });
 });

@@ -38,6 +38,14 @@ function makeFakeRepository(): {
       findByIdCalls.push({ orderId, userId });
       return null;
     },
+    // Not exercised by this file's tests (order lifecycle, IMP-030) —
+    // present only to satisfy `OrderRepository`'s shape.
+    async findById(): Promise<Order | null> {
+      throw new Error("not used by these tests");
+    },
+    async updateStatus(): Promise<Order> {
+      throw new Error("not used by these tests");
+    },
   };
 
   return { repository, findManyCalls, findByIdCalls };

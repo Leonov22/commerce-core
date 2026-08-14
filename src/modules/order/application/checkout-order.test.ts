@@ -106,12 +106,18 @@ function makeFakeRepository(): { repository: OrderRepository; calls: NewOrderInp
       return order;
     },
     // Not exercised by this file's tests (IMP-026/026-FIX/026-FIX-TESTS
-    // predate customer order history) — present only to satisfy
-    // `OrderRepository`'s shape.
+    // predate customer order history and order lifecycle) — present only
+    // to satisfy `OrderRepository`'s shape.
     async findManyByUserId() {
       throw new Error("not used by these tests");
     },
     async findByIdForUser() {
+      throw new Error("not used by these tests");
+    },
+    async findById() {
+      throw new Error("not used by these tests");
+    },
+    async updateStatus() {
       throw new Error("not used by these tests");
     },
   };

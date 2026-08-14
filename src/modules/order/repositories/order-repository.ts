@@ -56,4 +56,12 @@ export interface OrderRepository {
   findManyByUserId(userId: string, options: FindManyByUserIdOptions): Promise<OrderListPage>;
   /** Returns `null` both when the order doesn't exist and when it belongs to a different user — the two cases must be indistinguishable to the caller. */
   findByIdForUser(orderId: string, userId: string): Promise<Order | null>;
+  /**
+   * Unscoped by owner (IMP-030) — for internal application use by
+   * `changeOrderStatus`, not a customer-facing lookup. Never expose this
+   * through a customer-facing transport without adding the same ownership
+   * check `findByIdForUser` already has.
+   */
+  findById(orderId: string): Promise<Order | null>;
+  updateStatus(orderId: string, status: OrderStatus): Promise<Order>;
 }
