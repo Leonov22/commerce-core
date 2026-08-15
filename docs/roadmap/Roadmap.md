@@ -1311,7 +1311,207 @@ honors idempotency by a caller-supplied key (e.g. Stripe's
 `PROVIDER_REFERENCE_ALREADY_SET` conflation (documented above) remains
 deliberately unresolved pending a real status-changing caller.
 
-12. Current Production State
+12. IMP-035 — Stripe Payment Provider Adapter
+
+Status
+
+COMPLETED
+
+Commit
+
+IMP-035 pending — implementation and validation are complete but not yet
+committed at the time this entry was written. Record the actual commit
+SHA through the normal follow-up documentation process once the commit
+exists; do not treat any SHA embedded in this entry before that point as
+authoritative for IMP-035.
+
+Objective
+
+Connect IMP-032/033/034's provider-neutral Payment application flow to one
+real external payment provider — the first concrete implementation of the
+`PaymentProvider` port (IMP-033). The goal is not to build a customer
+payment UI; it is to prove the architecture already approved through
+IMP-032–IMP-034-FIX actually works against a real provider, and
+specifically that the IMP-034-FIX idempotency invariant (same `paymentId`
+→ same provider-side idempotency identity → same external operation) holds
+against that real provider's own semantics, not just against a fake.
+
+Provider Choice
+
+Stripe, via its PaymentIntents API — the currently recommended way to
+create a payment operation without requiring a customer-facing
+confirmation step up front. Verified against Stripe's official API
+documentation before implementation (not assumed):
+
+- Idempotency: Stripe's REST API accepts an `Idempotency-Key` on every
+  `POST` request (the Node SDK exposes this as a `requestOptions.idempotencyKey`
+  second argument). Stripe saves the resulting status/body of the first
+  request made for a given key and returns that same result for any later
+  request reusing the same key with the same parameters, for at least 24
+  hours — exactly the guarantee `PaymentProvider`'s contract requires.
+- `paymentIntents.create({ amount, currency })` can be called with only an
+  amount (integer minor units) and a lowercase three-letter currency code —
+  no payment method is required to create the object, and it is not
+  confirmed/captured by this call. The response's `id` (`pi_...`) is an
+  opaque, stable reference.
+
+Adapter Location
+
+`src/modules/payment/providers/stripe-payment-provider.ts` (+
+`stripe-payment-provider.test.ts`), alongside the existing
+`payment-provider.ts` port. No other Payment module file was touched
+except `index.ts` (composition-boundary export only — see "Application
+Wiring" below).
+
+Dependency Direction
+
+```
+Payment Domain
+    ↓
+Payment Application (processPayment)
+    ↓
+PaymentProvider (port, unchanged)
+    ↑
+Stripe Adapter (createStripePaymentProvider)
+    ↓
+Stripe SDK / API
+```
+
+The Stripe SDK (`stripe` npm package) is imported by exactly one file:
+`stripe-payment-provider.ts`. The Payment domain, `PaymentRepository`, and
+`processPayment` import nothing Stripe-related and remain exactly as
+IMP-034-FIX left them.
+
+Stripe Idempotency Mapping
+
+`createStripePaymentProvider`'s `startPayment` derives Stripe's
+`idempotencyKey` as `` `payment_${input.paymentId}` `` — a pure,
+deterministic function of `paymentId` alone, never a random value, a
+timestamp, or a request counter. The prefix exists only to namespace this
+application's payment-start calls within Stripe's per-account
+idempotency-key space (shared across every endpoint on the account); it
+carries no independent entropy; the same `paymentId` always produces the
+same key, and a different `paymentId` always produces a different one.
+`StartPaymentInput` has no separate idempotency-key field for this
+derivation to diverge from — it cannot vary independently of `paymentId`.
+
+Authoritative Payment Values
+
+The adapter receives exactly `StartPaymentInput` (`paymentId`,
+`amountMinor`, `currency`) — the same shape IMP-033 already established,
+unchanged by this milestone. It performs no Order/Cart/Catalog lookup, no
+price calculation, and accepts no client-supplied monetary value; it only
+lowercases `currency` before sending it to Stripe (Stripe's API requires
+lowercase; the Payment domain's own casing is untouched).
+
+providerReference Handling
+
+The adapter returns Stripe's PaymentIntent `id` as the opaque
+`providerReference` — nothing else from the Stripe response escapes the
+adapter (verified by a dedicated contract test asserting the successful
+result's only keys are `ok` and `providerReference`). Persisting it
+remains `processPayment`'s and `PaymentRepository.setProviderReferenceIfPending`'s
+responsibility, unchanged.
+
+Error Mapping
+
+`startPayment` never throws (matching the pre-existing "never throwing"
+contract test for `PaymentProvider`): every error that is an instance of
+`Stripe.errors.StripeError` (covering card declines, invalid requests, API
+errors, rate limits, connection errors — Stripe's entire REST-API error
+hierarchy) is caught and mapped to the single `{ ok: false, error:
+"PROVIDER_ERROR" }` result the port already defines, after logging the
+error server-side (`console.error`, matching the existing
+`[api/orders]`-style convention used at other boundaries in this
+codebase). A non-Stripe error (a bug in this adapter itself) is
+deliberately NOT caught — it propagates, so a genuine defect surfaces
+rather than being silently absorbed into the provider-failure code path.
+
+Application Wiring
+
+`processPayment`'s exported signature in `index.ts` is unchanged — it
+still takes an injected `PaymentProvider` and remains entirely unaware
+Stripe exists. `index.ts` additionally re-exports `getStripePaymentProvider`,
+a lazy factory that constructs a real `Stripe` client from
+`STRIPE_SECRET_KEY` only on first call, never at module-import time —
+importing the payment module (or anything that transitively imports it,
+including the app's build) does not require `STRIPE_SECRET_KEY` to be set.
+No route or UI calls `getStripePaymentProvider` or `processPayment` in
+this milestone; wiring a concrete transport is explicitly out of scope.
+
+Security
+
+`stripe-payment-provider.ts` starts with `import "server-only"`, so it
+cannot be imported into a client bundle. `STRIPE_SECRET_KEY` is read once,
+server-side, from `process.env`; a placeholder-only entry was added to
+`.env.example` (`.env*` is already gitignored except `.env.example`
+itself). No API key, secret, or provider payload is ever logged or
+returned to a caller. `paymentId`, `amountMinor`, and `currency` all
+originate from the already-persisted, already-authorized `Payment` row —
+this adapter introduces no new place for a client to influence them.
+
+Tests
+
+16 new tests in `stripe-payment-provider.test.ts`. Contract tests (8):
+correct amount/currency (lowercased) sent to Stripe, `paymentId` mapped
+into the idempotency key, Stripe's `PaymentIntent.id` returned as
+`providerReference`, a Stripe error mapped to `PROVIDER_ERROR`, four
+different Stripe error subclasses (`StripeCardError`,
+`StripeInvalidRequestError`, `StripeAPIError`, `StripeRateLimitError`,
+`StripeConnectionError`) all collapsing to the same result, a non-Stripe
+error propagating rather than being swallowed, the successful result
+carrying no field beyond `ok`/`providerReference`, and
+`getStripePaymentProvider()` throwing a clear configuration error when
+`STRIPE_SECRET_KEY` is unset. Idempotency-key-stability tests (4,
+IMP-035's most important acceptance criterion): the same `paymentId`
+produces the same key on a second sequential call (simulates a retry), the
+same key across genuinely concurrent calls, a different `paymentId`
+producing a different key, and the key being a pure function of
+`paymentId` alone (independent of `amountMinor`/`currency`). Real
+Stripe test-mode tests (3, gated by `STRIPE_SECRET_KEY` via
+`describe.skipIf` — not fabricated, see "Runtime Verification" below):
+create a PaymentIntent, prove a repeated call with the same `paymentId`
+returns the identical reference, prove a different `paymentId` creates a
+genuinely different one. Full pre-existing suite (Order, Checkout,
+Catalog, Identity, CR-029/030/031, IMP-032/033/034/034-FIX) re-run and
+confirmed passing unmodified.
+
+Runtime Verification
+
+No `STRIPE_SECRET_KEY` was available in this implementation environment.
+The 3 real-Stripe test-mode tests are implemented and gated correctly
+(`describe.skipIf(!process.env.STRIPE_SECRET_KEY)`) but were **skipped**,
+not run and not fabricated as passing. `pnpm test` reports these 3 tests
+as explicitly skipped, not passing. Real Stripe test-mode verification of
+this adapter against Stripe's actual API remains genuinely pending until
+someone runs the suite with a real Stripe test-mode secret key configured.
+
+Validation Results
+
+`pnpm test`: 309 passing + 3 skipped (the gated real-Stripe tests), 27
+test files, zero regressions in the pre-existing 296. `pnpm typecheck`:
+clean. `pnpm lint`: clean. `pnpm format:check`: limited to the same two
+pre-existing, unrelated warnings already noted for prior milestones
+(`next.config.ts`, `pnpm-workspace.yaml`). `pnpm build`: succeeded, all 15
+routes compiled/prerendered, with no `STRIPE_SECRET_KEY` set — confirming
+the lazy-wiring design does not force a Stripe credential requirement onto
+the build.
+
+What Is Deliberately Deferred
+
+No webhook, no route, no UI, no `confirmPayment`/refund/cancellation, no
+second provider, no customer payment-method management, no
+`PaymentAttempt`, no retry/queue framework, no schema migration
+(`Payment.providerReference` is reused as-is), no new `PaymentStatus`
+value or transition — `processPayment` still only attaches
+`providerReference` while the Payment stays `PENDING`, exactly as
+IMP-034/IMP-034-FIX left it. Real Stripe test-mode verification (above) is
+implemented but unexecuted pending real credentials. A future milestone
+decides how `getStripePaymentProvider()`/`processPayment` actually get
+called from a transport, and is responsible for turning Stripe's eventual
+confirmation (most likely a webhook) into a real status transition.
+
+13. Current Production State
 
 The following functionality is currently implemented:
 
@@ -1351,7 +1551,7 @@ Prisma
    ↓
 Neon PostgreSQL
 
-13. Known Limitations
+14. Known Limitations
 Product Details
 
 Product Details is dynamically rendered because database access must not be required during build.
@@ -1385,22 +1585,18 @@ The project currently has unit/integration tests but no dedicated browser E2E te
 
 Browser-level testing should be introduced when justified by upcoming user-critical flows.
 
-14. Next Milestone
+15. Next Milestone
 
 Status
 
 NOT YET APPROVED
 
-The next milestone after IMP-034 must be explicitly defined by the
+The next milestone after IMP-035 must be explicitly defined by the
 Architect before implementation begins.
 
-The following must NOT be assumed to be approved:
+IMP-035 approved exactly one thing: a concrete Stripe adapter for the
+`PaymentProvider` port. The following must NOT be assumed to be approved:
 
-an external payment provider (Stripe, PayPal, or any other) — IMP-032
-approved only the internal Payment domain/persistence foundation,
-IMP-033 approved only the provider-neutral `PaymentProvider` port's
-shape, and IMP-034 approved only the application flow connecting them;
-none approves provider integration itself;
 payment webhooks;
 a transport layer (API/UI) for `processPayment`, `initializePayment`, or
 `changeOrderStatus`;
@@ -1409,6 +1605,9 @@ a transport layer (API/UI) for `processPayment`, `initializePayment`, or
 any new `PaymentStatus` value (`PROCESSING`, `AUTHORIZING`,
 `REQUIRES_ACTION`, `PROVIDER_FAILED`, or otherwise) or any Payment status
 transition triggered by `processPayment`;
+a second payment provider;
+customer payment-method management;
+`PaymentAttempt` or any retry/queue infrastructure;
 Inventory;
 Admin tooling / Admin UI;
 roles/permissions;
@@ -1420,11 +1619,11 @@ or any other future subsystem.
 
 These require separate requirements and architectural decisions.
 
-15. Future Roadmap Areas
+16. Future Roadmap Areas
 
 The following are possible future areas and are NOT yet approved implementation milestones:
 
-Payments (using the IMP-030 lifecycle contract and the IMP-032 Payment foundation)
+Payments — webhook-driven status confirmation, a transport layer, refunds/cancellation, a second provider (using the IMP-030 lifecycle contract, the IMP-032 Payment foundation, and the IMP-035 Stripe adapter)
 Inventory
 Admin Catalog management
 Admin Order management
@@ -1441,7 +1640,7 @@ Order status history / audit log
 
 No item above should be implemented without explicit Architect approval.
 
-16. Implementation Process
+17. Implementation Process
 
 Every milestone follows this lifecycle:
 
@@ -1470,7 +1669,7 @@ Manual acceptance when required
 Architect approval
     ↓
 Next milestone
-17. Code Review Policy
+18. Code Review Policy
 
 Code Review is performed through:
 
@@ -1494,7 +1693,7 @@ scope compliance.
 
 Claude/local resources should not be used for the primary Code Review when GitHub access is available.
 
-18. Local QA Policy
+19. Local QA Policy
 
 Local QA is performed by Claude/local tooling when possible.
 
@@ -1513,7 +1712,7 @@ relevant performance behavior.
 
 If browser automation is unavailable, browser-only scenarios must be reported as NOT VERIFIED, not assumed to pass.
 
-19. Definition of Done
+20. Definition of Done
 
 A milestone is complete only when:
 
@@ -1527,7 +1726,7 @@ no unresolved P0/P1/P2 defects remain;
 scope has not expanded without approval;
 the milestone commit is traceable;
 this roadmap is updated.
-20. Milestone Summary
+21. Milestone Summary
 Milestone	Status
 IMP-021 — Catalog Persistence Foundation	COMPLETED
 IMP-021-FIX-001 — Public API + Prisma Build Generation	COMPLETED
@@ -1539,8 +1738,9 @@ IMP-031 — Checkout Submission Idempotency (incl. IMP-031-FIX / CR-031)	COMPLET
 IMP-032 — Payment Foundation	COMPLETED
 IMP-033 — Payment Provider Port	COMPLETED
 IMP-034 — Payment Processing Application Flow (incl. IMP-034-FIX / CR-034)	COMPLETED
+IMP-035 — Stripe Payment Provider Adapter	COMPLETED — real Stripe test-mode verification pending (see Section 12)
 Next milestone	NOT YET APPROVED
-21. Source of Truth
+22. Source of Truth
 
 This document is the authoritative roadmap for implementation milestones.
 
