@@ -43,7 +43,7 @@ function makeFakeRepository(): {
     async findById(): Promise<Order | null> {
       throw new Error("not used by these tests");
     },
-    async updateStatus(): Promise<Order> {
+    async updateStatusIfCurrent(): Promise<Order | null> {
       throw new Error("not used by these tests");
     },
   };

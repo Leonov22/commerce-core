@@ -37,6 +37,13 @@ async function createOrderRecord(input: NewOrderInput) {
   });
 }
 
+async function findOrderRecord(orderId: string) {
+  return prisma.order.findUnique({
+    where: { id: orderId },
+    include: { items: true },
+  });
+}
+
 type OrderRow = Awaited<ReturnType<typeof createOrderRecord>>;
 
 function toDomainOrderItem(row: OrderRow["items"][number]): OrderItem {
@@ -148,19 +155,35 @@ export const prismaOrderRepository: OrderRepository = {
   },
 
   async findById(orderId: string): Promise<Order | null> {
-    const row = await prisma.order.findUnique({
-      where: { id: orderId },
-      include: { items: true },
-    });
+    const row = await findOrderRecord(orderId);
     return row ? toDomainOrder(row) : null;
   },
 
-  async updateStatus(orderId: string, status: OrderStatus): Promise<Order> {
-    const row = await prisma.order.update({
-      where: { id: orderId },
-      data: { status },
-      include: { items: true },
+  async updateStatusIfCurrent(
+    orderId: string,
+    expectedStatus: OrderStatus,
+    nextStatus: OrderStatus,
+  ): Promise<Order | null> {
+    // CR-030: `updateMany` (not `update`) so the WHERE clause can include
+    // `status` alongside `id` — Prisma's single-record `update` only
+    // accepts a unique selector. Postgres evaluates this WHERE against the
+    // row's actual committed status at the moment this statement runs,
+    // and serializes concurrent writers to the same row, so a status read
+    // earlier by the application can never be stale by the time this
+    // executes: if another caller already changed the status away from
+    // `expectedStatus`, `count` is 0 here and nothing is overwritten.
+    const result = await prisma.order.updateMany({
+      where: { id: orderId, status: expectedStatus },
+      data: { status: nextStatus },
     });
-    return toDomainOrder(row);
+
+    if (result.count === 0) {
+      return null;
+    }
+
+    // `updateMany` only returns a count, not the updated row — re-fetch
+    // using the same read path `findById` uses.
+    const row = await findOrderRecord(orderId);
+    return row ? toDomainOrder(row) : null;
   },
 };

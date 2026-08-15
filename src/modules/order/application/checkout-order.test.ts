@@ -117,7 +117,7 @@ function makeFakeRepository(): { repository: OrderRepository; calls: NewOrderInp
     async findById() {
       throw new Error("not used by these tests");
     },
-    async updateStatus() {
+    async updateStatusIfCurrent() {
       throw new Error("not used by these tests");
     },
   };

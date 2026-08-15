@@ -260,7 +260,7 @@ in this document's full format was not part of the IMP-030 task and has
 not been done here; git history remains authoritative for that period
 until/unless the Architect requests it be backfilled.
 
-7. IMP-030 — Order Lifecycle & Status Management
+7. IMP-030 — Order Lifecycle & Status Management (incl. CR-030 atomicity fix)
 
 Status
 
@@ -268,9 +268,10 @@ COMPLETED
 
 Commit
 
-Not yet committed at the time this entry was written — implementation
-work only, pending Code Review before a commit is created. Update this
-field with the actual commit hash once committed.
+Pending — this entry covers implementation work completed and validated
+ahead of its commit. Update this field with the actual commit SHA
+immediately once the IMP-030-FIX commit is created; do not leave this
+placeholder in place after that point.
 
 Objective
 
@@ -286,38 +287,69 @@ PENDING → CANCELLED
 PAID and CANCELLED are terminal states for this milestone — no transition
 out of either exists.
 
+QA Finding and Fix (CR-030 / QA-030-01)
+
+Code Review/QA identified a P2 concurrency defect in the initial IMP-030
+implementation: `changeOrderStatus` read the current status, validated
+the transition, and only then wrote the new status as a separate step.
+Two concurrent callers could both read PENDING and both pass validation
+before either write landed, allowing an effectively forbidden
+terminal-state transition (e.g. an Order ending up CANCELLED after
+already being PAID by a racing request). This was fixed by making the
+persistence step itself conditional and atomic — see "Delivered" and
+"Architectural Decisions" below. The fix is implemented, tested (including
+a genuine parallel-execution regression test against the real database),
+and validated as of this entry.
+
 Delivered
 
 isValidOrderStatusTransition(from, to) — an explicit domain policy in
-order/domain/order.ts (a lookup table of allowed transitions), not a
-generic state-machine framework;
+order/domain/order.ts (a lookup table of allowed transitions), unchanged
+by the CR-030 fix — the domain layer was never the source of the race;
 changeOrderStatus(orderId, nextStatus) application operation
-(order/application/order-status.ts): loads the Order through
-OrderRepository, validates the transition via the domain policy, persists
-the new status, and returns a controlled result —
-{ ok: true, order } | ORDER_NOT_FOUND | INVALID_STATUS_TRANSITION;
-OrderRepository extended with findById (unscoped by owner — for future
-internal callers, not customer-facing) and updateStatus;
-Prisma implementation of both in prisma-order-repository.ts, inside
-Order's existing infrastructure boundary;
+(order/application/order-status.ts): loads the Order, validates the
+transition via the domain policy, performs an atomic conditional
+persistence write, and returns a controlled result —
+{ ok: true, order } | ORDER_NOT_FOUND | INVALID_STATUS_TRANSITION |
+ORDER_STATUS_CHANGED (the last one is the CR-030 concurrency-conflict
+result: the transition was valid when checked, but another caller changed
+the Order's status before this operation's write could apply);
+OrderRepository.updateStatusIfCurrent(orderId, expectedStatus, nextStatus)
+replaces the earlier, unconditional updateStatus — implemented as a
+single `UPDATE ... WHERE id = ? AND status = ?` (Prisma `updateMany`),
+so the database itself rejects a write whose expected status no longer
+matches, rather than the application layer trusting a status it read
+earlier; returns the updated Order when the write applied, or null when
+it didn't (zero rows matched);
+OrderRepository.findById remains unscoped by owner — for future internal
+callers, not customer-facing;
 changeOrderStatus exported through @/modules/order's public boundary —
-not wired to any transport (no API route, no UI action) in this milestone;
-zero database schema changes — the OrderStatus enum and Order.status
-column already existed from IMP-025.
+still not wired to any transport (no API route, no UI action);
+zero database schema changes, before or after the CR-030 fix — no
+version/revision column was added; the existing status column itself is
+the condition the atomic write checks.
 
 Architectural Decisions
 
+The concurrency guarantee lives at the persistence boundary
+(`updateStatusIfCurrent`'s WHERE clause), not in application-level
+sequencing — the application layer's earlier read-then-validate step can
+be stale by design; the database write is what actually enforces
+correctness, because Postgres evaluates that WHERE clause against the
+row's real committed state at write time and serializes concurrent
+writers to the same row.
+No version/revision column, no application-level lock, no queue, and no
+generic optimistic-concurrency framework were introduced — the Order's
+own `status` column doubles as the condition, since transitions are
+one-directional and the field being protected is the same field the
+condition checks.
 changeOrderStatus is not customer-facing: no PATCH/PUT/DELETE route was
 added to /api/orders (verified by an automated test asserting the route
 module exports only POST), and the existing Customer order-history pages
 were left untouched — status remains plain read-only text there.
-findById (repository) is deliberately unscoped by owner, unlike the
-existing findByIdForUser — it exists only for a future internal caller
-(Payments/Admin), and nothing customer-facing calls it in this milestone.
-The lifecycle rule is a plain Record<OrderStatus, OrderStatus[]> lookup,
-matching Catalog's existing isPubliclyVisible(status) precedent for small
-domain policy functions living alongside their entity — no state-machine
-library or generic abstraction was introduced.
+The lifecycle rule remains a plain Record<OrderStatus, OrderStatus[]>
+lookup, matching Catalog's existing isPubliclyVisible(status) precedent —
+no state-machine library or generic abstraction was introduced.
 
 Security
 
@@ -326,31 +358,45 @@ Customers cannot modify Order status — no capability exists at any layer
 customer-facing caller could reach).
 Checkout continues to hardcode status: "PENDING" server-side; a
 client-supplied status field in the checkout request body is ignored
-(verified by an automated test asserting the authoritative application
-function never receives a status field from the transport layer at all).
-Existing IDOR protections (findByIdForUser, findManyByUserId) are
-unchanged — confirmed by full regression of their existing test suite.
+(verified by an automated test).
+Existing IDOR protections (findByIdForUser, findManyByUserId) and the
+composite keyset pagination (createdAt DESC, id DESC) from CR-029 are
+unchanged — confirmed by full regression of their existing test suite and
+by direct diff inspection.
 Auth.js remains outside the Order module; changeOrderStatus takes no
 Identity dependency and no session/user context at all.
 
 Tests / Validation
 
-20 new tests: 8 domain (all six required transition cases plus terminal/
-no-op checks), 7 application (fake-repository, all transition + not-found
-cases), 3 repository integration (real Postgres findById/updateStatus),
-2 route-surface (client-supplied status ignored; route exports only POST).
-Full suite: 173/173 passing (153 pre-existing + 20 new), zero regressions.
-pnpm typecheck, pnpm lint, pnpm build all passing;
-pnpm format:check limited to the two pre-existing, unrelated warnings
+179/179 tests passing (153 before IMP-030, +20 from the initial IMP-030
+implementation, +6 net from the CR-030 fix — some tests were replaced
+rather than purely added, since updateStatus was superseded by
+updateStatusIfCurrent). CR-030-specific coverage: domain policy unchanged
+and re-verified; application-layer ORDER_STATUS_CHANGED case via a fake
+repository with genuine conditional-update semantics; real-database tests
+proving PENDING → PAID and PENDING → CANCELLED persist and are
+independently re-readable; real-database tests proving a conditional
+update correctly refuses to apply when the expected status no longer
+matches (both PAID-expecting-PENDING and CANCELLED-expecting-PENDING
+cases); a genuine parallel-execution (`Promise.all`) concurrency race
+against a real Postgres row, asserting exactly one side wins, the other
+receives a null/no-op result, and the final database state matches the
+winner. pnpm typecheck, pnpm lint, pnpm build all passing; pnpm
+format:check limited to the two pre-existing, unrelated warnings
 (next.config.ts, pnpm-workspace.yaml) already tracked as known issues.
+Manual verification additionally executed the full transition/rejection/
+concurrency/cleanup sequence live through changeOrderStatus() against the
+real database, independently of the automated suite.
 
 Remaining Limitations
 
 changeOrderStatus has no transport layer yet (no API route, no Admin/
-Payments UI) — intentionally out of scope for this milestone; a future
-Payments or Admin milestone will need to wire an authorized caller to it.
-No status-change audit/history is recorded — explicitly out of scope per
-this milestone's own instructions (no OrderStatusHistory/audit table).
+Payments UI) — intentionally out of scope; a future Payments or Admin
+milestone will need to wire an authorized caller to it.
+No status-change audit/history is recorded — explicitly out of scope.
+A caller that receives ORDER_STATUS_CHANGED gets no automatic retry —
+retrying (or not) is left to whichever future caller actually needs the
+behavior; this was a deliberate minimal-scope decision, not an oversight.
 
 Next Milestone
 
@@ -410,19 +456,18 @@ Checkout
 
 The Checkout page and Cart → Checkout navigation exist.
 
-Actual order creation, payment processing, inventory reservation, and server-side checkout validation are not yet implemented.
+Server-side Order creation is implemented: `createOrderFromCheckout()`
+(IMP-026, hardened by IMP-026-FIX) resolves product existence, ACTIVE
+status, price, and currency from Catalog server-side, validates quantity
+and monetary bounds, and persists the Order atomically — a client can
+never author these values. Order ownership (IMP-029) and lifecycle status
+transitions (IMP-030 / CR-030) are also implemented. Payment processing
+and inventory reservation are not yet implemented — every created Order
+starts and generally remains `PENDING` pending a future Payments
+milestone. Client-side Checkout availability must never be treated as
+authorization or pricing authority; this was always the server-side
+boundary's responsibility, and it now genuinely exists.
 
-Client-side Checkout availability must never be treated as authorization or pricing authority.
-
-Future order processing must validate server-side:
-
-product existence;
-ACTIVE status;
-price;
-quantity;
-currency;
-availability;
-business rules.
 E2E Testing
 
 The project currently has unit/integration tests but no dedicated browser E2E testing infrastructure.

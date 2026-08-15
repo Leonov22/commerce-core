@@ -303,17 +303,105 @@ describe("prismaOrderRepository — order lifecycle", () => {
     expect(found).toBeNull();
   });
 
-  it("updateStatus persists the new status and returns the updated order", async () => {
+  it("updateStatusIfCurrent persists PENDING -> PAID and a fresh re-read confirms it", async () => {
     const order = await prismaOrderRepository.create(baseInput());
     lifecycleOrderIds.push(order.id);
     expect(order.status).toBe("PENDING");
 
-    const updated = await prismaOrderRepository.updateStatus(order.id, "PAID");
-    expect(updated.status).toBe("PAID");
+    const updated = await prismaOrderRepository.updateStatusIfCurrent(order.id, "PENDING", "PAID");
+    expect(updated?.status).toBe("PAID");
 
     // Re-fetch independently to prove the write actually reached the database.
     const refetched = await prismaOrderRepository.findById(order.id);
     expect(refetched?.status).toBe("PAID");
+  });
+
+  it("updateStatusIfCurrent persists PENDING -> CANCELLED and a fresh re-read confirms it", async () => {
+    const order = await prismaOrderRepository.create(baseInput());
+    lifecycleOrderIds.push(order.id);
+    expect(order.status).toBe("PENDING");
+
+    const updated = await prismaOrderRepository.updateStatusIfCurrent(
+      order.id,
+      "PENDING",
+      "CANCELLED",
+    );
+    expect(updated?.status).toBe("CANCELLED");
+
+    const refetched = await prismaOrderRepository.findById(order.id);
+    expect(refetched?.status).toBe("CANCELLED");
+  });
+
+  it("CR-030: updateStatusIfCurrent does NOT update when the expected status no longer matches (PAID, expecting PENDING)", async () => {
+    const order = await prismaOrderRepository.create(baseInput());
+    lifecycleOrderIds.push(order.id);
+
+    const toPaid = await prismaOrderRepository.updateStatusIfCurrent(order.id, "PENDING", "PAID");
+    expect(toPaid?.status).toBe("PAID");
+
+    // The order is now PAID — a conditional update still expecting PENDING
+    // must not apply, even though PENDING -> CANCELLED would otherwise be
+    // a domain-legal transition.
+    const rejected = await prismaOrderRepository.updateStatusIfCurrent(
+      order.id,
+      "PENDING",
+      "CANCELLED",
+    );
+    expect(rejected).toBeNull();
+
+    // Independent re-read proves the row was never touched by the rejected call.
+    const refetched = await prismaOrderRepository.findById(order.id);
+    expect(refetched?.status).toBe("PAID");
+  });
+
+  it("CR-030: updateStatusIfCurrent does NOT update when the expected status no longer matches (CANCELLED, expecting PENDING)", async () => {
+    const order = await prismaOrderRepository.create(baseInput());
+    lifecycleOrderIds.push(order.id);
+
+    const toCancelled = await prismaOrderRepository.updateStatusIfCurrent(
+      order.id,
+      "PENDING",
+      "CANCELLED",
+    );
+    expect(toCancelled?.status).toBe("CANCELLED");
+
+    const rejected = await prismaOrderRepository.updateStatusIfCurrent(order.id, "PENDING", "PAID");
+    expect(rejected).toBeNull();
+
+    const refetched = await prismaOrderRepository.findById(order.id);
+    expect(refetched?.status).toBe("CANCELLED");
+  });
+
+  it("CR-030: genuine concurrent PENDING -> PAID and PENDING -> CANCELLED race — exactly one wins, the loser gets a null (no-op) result", async () => {
+    const order = await prismaOrderRepository.create(baseInput());
+    lifecycleOrderIds.push(order.id);
+    expect(order.status).toBe("PENDING");
+
+    // Real parallel execution, not sequential calls relabeled as
+    // "concurrent": both requests are issued together via `Promise.all`
+    // against the same live Postgres connection pool, so Postgres itself
+    // — not this test's control flow — decides which write actually lands
+    // first and which one's WHERE clause then finds zero matching rows.
+    const [toPaid, toCancelled] = await Promise.all([
+      prismaOrderRepository.updateStatusIfCurrent(order.id, "PENDING", "PAID"),
+      prismaOrderRepository.updateStatusIfCurrent(order.id, "PENDING", "CANCELLED"),
+    ]);
+
+    const results = [toPaid, toCancelled];
+    const succeeded = results.filter((result) => result !== null);
+    const failed = results.filter((result) => result === null);
+
+    // Exactly one of the two conditional updates actually applied.
+    expect(succeeded).toHaveLength(1);
+    expect(failed).toHaveLength(1);
+
+    const finalStatus = succeeded[0]!.status;
+    expect(["PAID", "CANCELLED"]).toContain(finalStatus);
+
+    // The database's actual final state matches whichever one "won" —
+    // never a mix, never overwritten by the loser.
+    const refetched = await prismaOrderRepository.findById(order.id);
+    expect(refetched?.status).toBe(finalStatus);
   });
 });
 

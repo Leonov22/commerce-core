@@ -63,5 +63,22 @@ export interface OrderRepository {
    * check `findByIdForUser` already has.
    */
   findById(orderId: string): Promise<Order | null>;
-  updateStatus(orderId: string, status: OrderStatus): Promise<Order>;
+  /**
+   * Atomic conditional status update (CR-030). Only writes when the
+   * database's *current* status still matches `expectedStatus` at the
+   * moment the statement executes — the check and the write happen as one
+   * database operation, so a stale status read earlier by the application
+   * can never overwrite a status another concurrent caller already
+   * changed. Returns the updated `Order` if the write applied, or `null`
+   * if it didn't (the row's status was no longer `expectedStatus`).
+   *
+   * This is the only sanctioned way to persist an Order status change —
+   * there is deliberately no unconditional "just set the status" method,
+   * so a future caller cannot accidentally bypass this guarantee.
+   */
+  updateStatusIfCurrent(
+    orderId: string,
+    expectedStatus: OrderStatus,
+    nextStatus: OrderStatus,
+  ): Promise<Order | null>;
 }
