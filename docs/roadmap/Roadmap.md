@@ -401,7 +401,7 @@ NOT YET APPROVED. Payments, admin tooling, or any transport layer for
 changeOrderStatus require separate Architect-approved requirements before
 implementation begins.
 
-8. IMP-031 — Checkout Submission Idempotency
+8. IMP-031 — Checkout Submission Idempotency (incl. IMP-031-FIX / CR-031 fixes)
 
 Status
 
@@ -409,7 +409,12 @@ COMPLETED
 
 Commit
 
-d122508f9447629c5f5bb0ac1964f58dca6b89c8
+d122508f9447629c5f5bb0ac1964f58dca6b89c8 (initial IMP-031). The
+IMP-031-FIX / CR-031 follow-up below is implemented and validated but not
+yet committed at the time this entry was written — this task's
+instructions explicitly forbid creating a commit. Update this field with
+the IMP-031-FIX commit SHA once it exists; do not leave this note in
+place after that point.
 
 Objective
 
@@ -428,6 +433,68 @@ both passing the check before either insert lands. `POST /api/orders`
 requires a client-supplied `Idempotency-Key` header (never a body field)
 on every request. Every newly created Order remains `PENDING` —
 `changeOrderStatus()` is not wired to this endpoint.
+
+Code Review Findings and Fixes (IMP-031-FIX / CR-031)
+
+Code Review of the initial IMP-031 implementation found two P2 defects,
+both now fixed:
+
+CR-031-01 — locale missing from the idempotency fingerprint. Root cause:
+the fingerprint covered customer, items, deliveryAmountMinor, and userId,
+but not `locale` — yet Checkout resolves localized Catalog product names
+through the effective locale and stores them in the OrderItem snapshot.
+Two requests differing only in locale therefore produced identical
+fingerprints, so the second request would have been replayed as a
+`200 duplicate` returning the first locale's Order instead of correctly
+being rejected as a `409 IDEMPOTENCY_KEY_CONFLICT`. Fix: `locale` (the
+already-normalized, effective locale `createOrderFromCheckout` receives —
+never a raw, un-normalized client field) is now part of the fingerprint,
+in `computeCheckoutSubmissionFingerprint`
+(`src/modules/order/application/idempotency.ts`).
+
+CR-031-02 — a successful idempotent submission could become unreplayable
+if Catalog state changed afterward. Root cause: the original flow always
+resolved Catalog (`getProductsByIds`) before ever consulting idempotency
+state; if the original product later became unavailable, a retry with
+the same key failed at Catalog resolution (`UNRESOLVED_PRODUCTS`, HTTP
+400) instead of replaying the original, already-persisted Order — even
+though the retry was the exact same logical submission. Fix: a new
+repository method, `OrderRepository.findIdempotencyRecord(idempotencyKey)`
+(a plain read of the already-unique `idempotencyKey`/
+`idempotencyRequestHash` columns — no new table, no schema change beyond
+what IMP-031 already added), lets `createOrderFromCheckout` check for an
+existing claim *before* calling Catalog at all. The fingerprint itself
+was deliberately left able to be computed from client-submitted data
+alone (customer, items, deliveryAmountMinor, locale, resolved userId) —
+it never depended on Catalog-resolved data (product name/price) to begin
+with, which is what made this early check possible without weakening
+what the fingerprint identifies: the *logical submission*, not the
+*resolved snapshot*. The persisted Order remains the historical snapshot,
+built once, at original creation time, exactly as before.
+
+Corrected flow in `createOrderFromCheckout`
+(`src/modules/order/application/checkout-order.ts`): after cart-shape and
+quantity validation (unchanged, pure, no I/O) — if an `idempotencyKey` is
+present, compute the fingerprint from client-submitted data and call
+`findIdempotencyRecord`. A match with an equal fingerprint returns the
+existing Order immediately (`200`), Catalog is never touched. A match
+with a different fingerprint returns `409 IDEMPOTENCY_KEY_CONFLICT`
+immediately, also without touching Catalog. No match at all (brand-new
+key, or no key supplied) falls through to the unchanged Catalog
+resolution → snapshot-build → persist path, ending at the same
+`createIdempotent()` atomic INSERT as before. This preserves every
+existing guarantee: two concurrent *first* requests for a brand-new key
+both see no match here and both proceed to `createIdempotent`, which —
+unchanged — resolves the race via Postgres's own unique constraint,
+exactly as validated under IMP-031's original concurrency tests. The
+early lookup is not itself part of the atomicity guarantee; it is a
+correctness fix for when a *known* key should short-circuit Catalog
+entirely, layered on top of an atomicity mechanism that was already
+correct.
+
+No new infrastructure, no new table, no schema change: `findIdempotencyRecord`
+reads the same `idempotencyKey`/`idempotencyRequestHash` columns IMP-031
+already added.
 
 Architecture Decisions
 
@@ -535,9 +602,28 @@ addition (`createIdempotent`) in two unrelated test files, needed only
 because that method is now part of the `OrderRepository` interface
 shape.
 
+IMP-031-FIX / CR-031 adds 9 further tests: 3 fingerprint unit tests
+(same locale → same hash; different locale → different hash; a related
+but distinct locale tag, e.g. `en` vs `en-US`, is never treated as
+equal); 4 fake-repository application-layer tests (same key + same
+locale replays normally; same key + different locale →
+`IDEMPOTENCY_KEY_CONFLICT`; replaying a key after its original product
+becomes unresolvable returns the original Order rather than
+`UNRESOLVED_PRODUCTS`; a *genuinely new* key still correctly fails with
+`UNRESOLVED_PRODUCTS` when its own product is unavailable, proving the
+fix only affects replays of an already-claimed key, not first-time
+validation); 2 real-Postgres repository tests for
+`findIdempotencyRecord` (returns the persisted Order + hash for a known
+key; returns `null` for an unused key). All pre-existing IMP-031
+concurrency tests (the real-Postgres `Promise.all` race, its 10-iteration
+repeat, and the full-pipeline real-Catalog + real-repository race) are
+unmodified and continue to pass — the atomicity mechanism itself
+(`createIdempotent`'s constraint-enforced `INSERT`) was not touched by
+this fix.
+
 Validation Results
 
-`pnpm test`: 224/224 passing (179 pre-existing + 45 new), 21 test files,
+`pnpm test`: 233/233 passing (224 pre-existing + 9 new), 21 test files,
 zero regressions. `pnpm typecheck`: clean. `pnpm lint`: clean. `pnpm
 format:check`: limited to the two pre-existing, unrelated warnings
 (`next.config.ts`, `pnpm-workspace.yaml`). `pnpm build`: succeeded (all
@@ -545,17 +631,39 @@ format:check`: limited to the two pre-existing, unrelated warnings
 
 Runtime Verification
 
-Manually verified against the real Neon database through the actual
-running `POST /api/orders` route (not a test double): a first request
-returns 201 and a new Order; a retry with the same key returns 200 and
-the identical Order id; a same-key-different-payload request returns 409
-`IDEMPOTENCY_KEY_CONFLICT`; a different key returns 201 with an
-independent Order; two genuinely concurrent HTTP requests with the same
-key (fired in parallel against the running dev server) returned exactly
-one 201 and one 200, both referencing the same Order id; a same-key
-request from a second "guest" with different customer data returned 409
-rather than the first guest's Order. All manually-created test Orders
-were deleted afterward and confirmed removed.
+IMP-031 (original): manually verified against the real Neon database
+through the actual running `POST /api/orders` route (not a test double):
+a first request returns 201 and a new Order; a retry with the same key
+returns 200 and the identical Order id; a same-key-different-payload
+request returns 409 `IDEMPOTENCY_KEY_CONFLICT`; a different key returns
+201 with an independent Order; two genuinely concurrent HTTP requests
+with the same key (fired in parallel against the running dev server)
+returned exactly one 201 and one 200, both referencing the same Order
+id; a same-key request from a second "guest" with different customer
+data returned 409 rather than the first guest's Order. All
+manually-created test Orders were deleted afterward and confirmed
+removed.
+
+IMP-031-FIX / CR-031: CR-031-01 could not be exercised through the live
+HTTP route as a genuine locale mismatch, because this deployment's
+`routing.locales` currently supports only `["en"]` — the route normalizes
+any other submitted locale back to the default before
+`createOrderFromCheckout` ever sees it, so two live requests can never
+actually reach it with two different *effective* locales today. This is
+verified by direct inspection of `route.ts`'s normalization and is exactly
+why the fix uses the effective (post-normalization) locale rather than a
+raw client field — the fix is correctly exercised by the automated
+fingerprint and application-layer tests instead, which call
+`createOrderFromCheckout` directly with two different effective locales.
+CR-031-02 was verified live against real data: the real seeded product
+"1" was created via `createOrderFromCheckout` under a fresh idempotency
+key (real Catalog + real repository), then temporarily set to `ARCHIVED`
+directly in the database to simulate it becoming unavailable, then the
+same request was retried with the same key — the retry correctly returned
+the original Order (`created: false`) rather than `UNRESOLVED_PRODUCTS`.
+The product's status was restored to `ACTIVE` immediately afterward and
+confirmed restored; the manually-created test Order was deleted and
+confirmed removed.
 
 Remaining Limitations
 
@@ -565,6 +673,8 @@ limitation described under Security above. No idempotency-key expiry/
 cleanup policy exists — keys and their Orders persist indefinitely,
 consistent with Orders themselves having no retention policy; introducing
 one is a future decision, not required by this milestone's objective.
+No P0/P1/P2/P3 issues remain open after IMP-031-FIX; CR-031-01 and
+CR-031-02 are both fixed and verified.
 
 Next Milestone State
 
@@ -786,7 +896,7 @@ IMP-021-FIX-002 — Remove Build-Time DB Dependency	COMPLETED
 IMP-022 — Cart → Checkout Navigation	COMPLETED
 IMP-023 through IMP-029 (incl. fix follow-ups)	COMPLETED — see Section 6 note; git history authoritative
 IMP-030 — Order Lifecycle & Status Management (incl. CR-030)	COMPLETED
-IMP-031 — Checkout Submission Idempotency	COMPLETED (pending commit — see Section 8)
+IMP-031 — Checkout Submission Idempotency (incl. IMP-031-FIX / CR-031)	COMPLETED (IMP-031-FIX pending commit — see Section 8)
 Next milestone	NOT YET APPROVED
 18. Source of Truth
 

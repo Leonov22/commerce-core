@@ -146,6 +146,44 @@ export async function createOrderFromCheckout(
     }
   }
 
+  // CR-031-02: the fingerprint depends only on what the client submitted
+  // plus the resolved userId/locale — never on Catalog-resolved data — so
+  // it can be computed here, before any Catalog call. This lets a replay of
+  // an already-claimed key be recognized (and answered) without touching
+  // Catalog at all, so a submission that succeeded once keeps replaying
+  // successfully even if the product it originally resolved later becomes
+  // unavailable. Two concurrent *first* requests for a brand-new key both
+  // see no existing record here and both fall through to the normal
+  // Catalog-resolution path below, ending at `createIdempotent`'s atomic
+  // INSERT — unaffected by this early check.
+  if (request.idempotencyKey) {
+    const idempotencyRequestHash = computeCheckoutSubmissionFingerprint({
+      customer: request.customer,
+      items: request.items,
+      deliveryAmountMinor: request.deliveryAmountMinor,
+      locale: request.locale,
+      userId: request.userId ?? null,
+    });
+
+    const existing = await repository.findIdempotencyRecord(request.idempotencyKey);
+    if (existing) {
+      if (existing.idempotencyRequestHash === idempotencyRequestHash) {
+        return { ok: true, order: existing.order, created: false };
+      }
+      return { ok: false, error: "IDEMPOTENCY_KEY_CONFLICT" };
+    }
+
+    return createNewOrder(repository, request, idempotencyRequestHash);
+  }
+
+  return createNewOrder(repository, request);
+}
+
+async function createNewOrder(
+  repository: OrderRepository,
+  request: CheckoutOrderRequest,
+  idempotencyRequestHash?: string,
+): Promise<CreateOrderFromCheckoutResult> {
   const uniqueProductIds = Array.from(new Set(request.items.map((item) => item.productId)));
   const products = await getProductsByIds(uniqueProductIds, request.locale);
   const productsById = new Map(products.map((product) => [product.id, product]));
@@ -210,21 +248,10 @@ export async function createOrderFromCheckout(
     items,
   };
 
-  if (!request.idempotencyKey) {
+  if (!request.idempotencyKey || !idempotencyRequestHash) {
     const order = await repository.create(newOrderInput);
     return { ok: true, order };
   }
-
-  // IMP-031: fingerprint the *client-submitted* request (raw items +
-  // customer + delivery amount + resolved userId), not the Catalog-resolved
-  // `items` built above — a Catalog price change between two retries of the
-  // same cart must never make a genuine retry look like a conflict.
-  const idempotencyRequestHash = computeCheckoutSubmissionFingerprint({
-    customer: request.customer,
-    items: request.items,
-    deliveryAmountMinor: request.deliveryAmountMinor,
-    userId: request.userId ?? null,
-  });
 
   const result = await repository.createIdempotent({
     ...newOrderInput,

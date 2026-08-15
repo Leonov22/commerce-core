@@ -12,11 +12,22 @@ import type {
  * price). Hashing resolved prices would make a legitimate retry falsely
  * look like a "different submission" if a Catalog price changed between
  * attempts — the client's cart didn't change, so the retry must still match.
+ *
+ * CR-031-01: `locale` is included because it materially affects the
+ * persisted Order snapshot — Checkout resolves localized Catalog product
+ * names through it, so the same cart submitted under two different locales
+ * is not the same logical submission and must not be treated as a replay.
+ * This is the *effective* locale `createOrderFromCheckout` actually uses to
+ * resolve Catalog data (already normalized/validated by the API route
+ * before this function ever runs — see `route.ts`'s `routing.locales`
+ * check), not an arbitrary raw client field.
  */
 export interface CheckoutSubmissionFingerprintInput {
   customer: CheckoutOrderCustomer;
   items: CheckoutOrderItemRequest[];
   deliveryAmountMinor: number;
+  /** The effective locale used to resolve Catalog data for this submission. */
+  locale: string;
   /** The server-resolved requester, `null` for guest — never client input. */
   userId: string | null;
 }
@@ -50,6 +61,7 @@ export function computeCheckoutSubmissionFingerprint(
     },
     items: canonicalItems,
     deliveryAmountMinor: input.deliveryAmountMinor,
+    locale: input.locale,
     userId: input.userId,
   });
 

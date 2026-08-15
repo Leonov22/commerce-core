@@ -26,8 +26,15 @@ import { prisma } from "@/modules/order/infrastructure/prisma-client";
  * factory that closed over an un-hoisted `const` would hit it before
  * initialization.
  */
-const { OVERFLOW_PRODUCT_ID } = vi.hoisted(() => ({
+const { OVERFLOW_PRODUCT_ID, unavailableProductIds } = vi.hoisted(() => ({
   OVERFLOW_PRODUCT_ID: "qa-overflow-fixture",
+  // CR-031-02: a mutable set of product ids the mock pretends Catalog can no
+  // longer resolve — lets a test simulate "this product became unavailable
+  // between the original submission and a later retry" without touching
+  // real seeded data. Tests that use this must always remove their id(s)
+  // afterward (a `finally` block), since this set is shared module state
+  // across every test in this file.
+  unavailableProductIds: new Set<string>(),
 }));
 
 /**
@@ -67,7 +74,8 @@ vi.mock("@/modules/catalog", async (importOriginal) => {
       if (ids.length === 1 && ids[0] === "qa-overflow-fixture") {
         return [overflowFixture];
       }
-      return actual.getProductsByIds(ids, locale);
+      const resolved = await actual.getProductsByIds(ids, locale);
+      return resolved.filter((product) => !unavailableProductIds.has(product.id));
     },
   };
 });
@@ -156,6 +164,10 @@ function makeFakeRepository(): {
       const order = buildOrder(input, `fake-order-id-${nextOrderId}`);
       byIdempotencyKey.set(input.idempotencyKey, { order, hash: input.idempotencyRequestHash });
       return { outcome: "created", order };
+    },
+    async findIdempotencyRecord(idempotencyKey: string) {
+      const existing = byIdempotencyKey.get(idempotencyKey);
+      return existing ? { order: existing.order, idempotencyRequestHash: existing.hash } : null;
     },
   };
   return { repository, calls, createIdempotentCalls };
@@ -727,6 +739,112 @@ describe("createOrderFromCheckout — idempotency (IMP-031)", () => {
 
     expect(result).toEqual({ ok: false, error: "EMPTY_CART" });
     expect(createIdempotentCalls).toHaveLength(0);
+  });
+});
+
+/**
+ * CR-031-01 / CR-031-02 regression coverage (Code Review of IMP-031).
+ */
+describe("createOrderFromCheckout — CR-031 fixes", () => {
+  it("CR-031-01: same key, same cart/customer, but a different locale is rejected with IDEMPOTENCY_KEY_CONFLICT (not replayed as a duplicate)", async () => {
+    const { repository } = makeFakeRepository();
+    const key = "key-cr031-01-aaaaaaaaaaaaa";
+
+    const first = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 1 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+      idempotencyKey: key,
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.created).toBe(true);
+
+    const second = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 1 }],
+      deliveryAmountMinor: 800,
+      locale: "fr", // only the locale differs
+      idempotencyKey: key,
+    });
+
+    expect(second).toEqual({ ok: false, error: "IDEMPOTENCY_KEY_CONFLICT" });
+  });
+
+  it("CR-031-01: same key, same cart/customer, same locale replays normally (200-equivalent, created: false)", async () => {
+    const { repository } = makeFakeRepository();
+    const key = "key-cr031-01b-aaaaaaaaaaaa";
+    const submit = () =>
+      createOrderFromCheckout(repository, {
+        customer: validCustomer,
+        items: [{ productId: "1", quantity: 1 }],
+        deliveryAmountMinor: 800,
+        locale: "en",
+        idempotencyKey: key,
+      });
+
+    const first = await submit();
+    const second = await submit();
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+    expect(second.order.id).toBe(first.order.id);
+    expect(second.created).toBe(false);
+  });
+
+  it("CR-031-02: replaying a key after the original product becomes unresolvable returns the original Order, not UNRESOLVED_PRODUCTS", async () => {
+    const { repository } = makeFakeRepository();
+    const key = "key-cr031-02-aaaaaaaaaaaaa";
+
+    const first = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 1 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+      idempotencyKey: key,
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    unavailableProductIds.add("1");
+    try {
+      // If Catalog were consulted at all here, this would fail with
+      // UNRESOLVED_PRODUCTS — the fix must recognize the replay from the
+      // idempotency key alone and never call Catalog for this request.
+      const second = await createOrderFromCheckout(repository, {
+        customer: validCustomer,
+        items: [{ productId: "1", quantity: 1 }],
+        deliveryAmountMinor: 800,
+        locale: "en",
+        idempotencyKey: key,
+      });
+
+      expect(second.ok).toBe(true);
+      if (!second.ok) return;
+      expect(second.order.id).toBe(first.order.id);
+      expect(second.created).toBe(false);
+    } finally {
+      unavailableProductIds.delete("1");
+    }
+  });
+
+  it("CR-031-02: a genuinely new key still fails with UNRESOLVED_PRODUCTS when its product is unavailable — the fix only affects replays of an already-claimed key", async () => {
+    const { repository } = makeFakeRepository();
+    unavailableProductIds.add("1");
+    try {
+      const result = await createOrderFromCheckout(repository, {
+        customer: validCustomer,
+        items: [{ productId: "1", quantity: 1 }],
+        deliveryAmountMinor: 800,
+        locale: "en",
+        idempotencyKey: "key-cr031-02b-aaaaaaaaaaaa",
+      });
+      expect(result).toEqual({ ok: false, error: "UNRESOLVED_PRODUCTS", productIds: ["1"] });
+    } finally {
+      unavailableProductIds.delete("1");
+    }
   });
 });
 

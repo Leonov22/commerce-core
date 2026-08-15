@@ -59,6 +59,12 @@ export type CreateIdempotentOrderResult =
   | { outcome: "duplicate"; order: Order }
   | { outcome: "conflict" };
 
+/** An existing idempotency claim: the Order it produced and the fingerprint it was claimed under. */
+export interface IdempotencyRecord {
+  order: Order;
+  idempotencyRequestHash: string;
+}
+
 /**
  * Read/write abstraction the Order application layer depends on. It never
  * depends on the Prisma implementation directly — only on this interface.
@@ -125,4 +131,25 @@ export interface OrderRepository {
    *   rejected request, never fall back to returning the mismatched Order.
    */
   createIdempotent(input: CreateIdempotentOrderInput): Promise<CreateIdempotentOrderResult>;
+
+  /**
+   * CR-031-02: looks up an existing idempotency claim by key alone — no
+   * Catalog resolution, no monetary calculation, nothing beyond a single
+   * read of already-persisted data. This is what lets `createOrderFromCheckout`
+   * recognize a replay *before* touching Catalog, so a submission that
+   * succeeded once keeps replaying successfully even if the Catalog state
+   * that produced its (historical, snapshot) Order later changes in a way
+   * that would make a *fresh* resolution fail (e.g. the product becomes
+   * unavailable). Returns `null` when no Order has ever been created under
+   * this key — including "brand new key" and "not an idempotent request at
+   * all" — in which case the caller proceeds with the normal creation path.
+   *
+   * This is a plain read, not part of the atomicity guarantee itself — the
+   * guarantee under real concurrency still lives entirely in
+   * `createIdempotent`'s single, constraint-enforced `INSERT`. Two
+   * concurrent *first* requests for a brand-new key both see `null` here
+   * and both proceed to `createIdempotent`, which resolves the race exactly
+   * as before.
+   */
+  findIdempotencyRecord(idempotencyKey: string): Promise<IdempotencyRecord | null>;
 }

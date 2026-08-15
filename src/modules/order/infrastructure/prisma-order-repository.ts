@@ -9,6 +9,7 @@ import type {
   OrderListPage,
   CreateIdempotentOrderInput,
   CreateIdempotentOrderResult,
+  IdempotencyRecord,
 } from "@/modules/order/repositories/order-repository";
 import type { Order, OrderItem, OrderStatus } from "@/modules/order/domain/order";
 
@@ -252,5 +253,21 @@ export const prismaOrderRepository: OrderRepository = {
       }
       return { outcome: "conflict" };
     }
+  },
+
+  async findIdempotencyRecord(idempotencyKey: string): Promise<IdempotencyRecord | null> {
+    // CR-031-02: a plain read against the unique `idempotencyKey` column —
+    // no Catalog call, no monetary recomputation. Lets the application
+    // layer recognize "this exact submission was already claimed" before
+    // doing any work that could fail for reasons unrelated to idempotency
+    // (e.g. a product that resolved fine originally becoming unavailable).
+    const row = await prisma.order.findUnique({
+      where: { idempotencyKey },
+      include: { items: true },
+    });
+    if (!row || row.idempotencyRequestHash === null) {
+      return null;
+    }
+    return { order: toDomainOrder(row), idempotencyRequestHash: row.idempotencyRequestHash };
   },
 };

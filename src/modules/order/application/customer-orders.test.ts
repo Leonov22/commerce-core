@@ -49,6 +49,9 @@ function makeFakeRepository(): {
     async createIdempotent(): Promise<never> {
       throw new Error("not used by these tests");
     },
+    async findIdempotencyRecord(): Promise<never> {
+      throw new Error("not used by these tests");
+    },
   };
 
   return { repository, findManyCalls, findByIdCalls };

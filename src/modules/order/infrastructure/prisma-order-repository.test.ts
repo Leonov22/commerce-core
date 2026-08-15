@@ -587,6 +587,34 @@ describe("prismaOrderRepository — checkout idempotency (IMP-031)", () => {
       expect(matching).toHaveLength(1);
     }
   }, 30000);
+
+  /**
+   * CR-031-02: real-database coverage for the plain read `createOrderFromCheckout`
+   * relies on to recognize a replay before ever calling Catalog.
+   */
+  it("findIdempotencyRecord returns the persisted Order and hash for a known key", async () => {
+    const key = `idem-find-known-${Date.now()}`;
+    const created = await prismaOrderRepository.createIdempotent({
+      ...baseInput(),
+      idempotencyKey: key,
+      idempotencyRequestHash: "hash-find-known",
+    });
+    expect(created.outcome).toBe("created");
+    if (created.outcome !== "created") return;
+    idempotencyOrderIds.push(created.order.id);
+
+    const found = await prismaOrderRepository.findIdempotencyRecord(key);
+    expect(found).not.toBeNull();
+    expect(found?.order.id).toBe(created.order.id);
+    expect(found?.idempotencyRequestHash).toBe("hash-find-known");
+  });
+
+  it("findIdempotencyRecord returns null for a key that was never used", async () => {
+    const found = await prismaOrderRepository.findIdempotencyRecord(
+      `idem-find-unknown-${Date.now()}`,
+    );
+    expect(found).toBeNull();
+  });
 });
 
 /**
