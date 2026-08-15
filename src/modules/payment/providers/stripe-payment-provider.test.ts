@@ -49,6 +49,10 @@ function makeFakeStripeClient(): {
   seedSearchResults: (results: FakePaymentIntent[], options?: { hasMore?: boolean }) => void;
   forgetIdempotencyKey: (idempotencyKey: string) => void;
   cancelPaymentIntent: (id: string) => void;
+  mutatePaymentIntent: (
+    id: string,
+    changes: Partial<Pick<FakePaymentIntent, "amount" | "currency">>,
+  ) => void;
   setCreateThrows: (error: Stripe.errors.StripeError | undefined) => void;
   setSearchThrows: (error: Stripe.errors.StripeError | undefined) => void;
   setRetrieveThrows: (error: Stripe.errors.StripeError | undefined) => void;
@@ -80,7 +84,12 @@ function makeFakeStripeClient(): {
         if (retrieveThrows) throw retrieveThrows;
         const paymentIntent = paymentIntentsById.get(id);
         if (!paymentIntent) throw new Stripe.errors.StripeInvalidRequestError();
-        return { id: paymentIntent.id, status: paymentIntent.status };
+        return {
+          id: paymentIntent.id,
+          amount: paymentIntent.amount,
+          currency: paymentIntent.currency,
+          status: paymentIntent.status,
+        };
       },
       async create(params, requestOptions) {
         createCalls.push({ params, idempotencyKey: requestOptions.idempotencyKey });
@@ -122,6 +131,10 @@ function makeFakeStripeClient(): {
     cancelPaymentIntent: (id) => {
       const paymentIntent = paymentIntentsById.get(id);
       if (paymentIntent) paymentIntent.status = "canceled";
+    },
+    mutatePaymentIntent: (id, changes) => {
+      const paymentIntent = paymentIntentsById.get(id);
+      if (paymentIntent) Object.assign(paymentIntent, changes);
     },
     setCreateThrows: (error) => {
       createThrows = error;
@@ -526,6 +539,102 @@ describe("Stripe PaymentProvider adapter — canceled PaymentIntent semantics (C
     const second = await provider.startPayment(freshInput());
 
     expect(second).toEqual({ ok: false, error: "PROVIDER_ERROR" });
+  });
+});
+
+/**
+ * CR-035-FIX-03 — the direct-create + retrieve path must apply the exact
+ * same PaymentIntent integrity rule the Search path already did: status
+ * AND amount AND currency, not status alone. `toValidatedResult` is the
+ * one shared function both paths call (see its own doc comment in
+ * stripe-payment-provider.ts).
+ */
+describe("Stripe PaymentProvider adapter — PaymentIntent integrity, create/retrieve matches Search validation (CR-035-FIX-03)", () => {
+  it("Test 1: direct create + retrieve with matching amount/currency and a live status succeeds", async () => {
+    const { client } = makeFakeStripeClient();
+    const provider = createStripePaymentProvider(client);
+
+    const result = await provider.startPayment(freshInput({ amountMinor: 24800, currency: "USD" }));
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.providerReference).toMatch(/^pi_fake_/);
+  });
+
+  it("Test 2: direct create + retrieve whose CURRENT amount no longer matches the authoritative Payment fails safely, and does NOT return success", async () => {
+    const { client, mutatePaymentIntent } = makeFakeStripeClient();
+    const provider = createStripePaymentProvider(client);
+
+    const first = await provider.startPayment(freshInput());
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    // Simulates the PaymentIntent's amount having diverged from the
+    // authoritative Payment by the time of a later retrieve (e.g.
+    // modified externally, or an idempotent replay resolving to data that
+    // no longer matches) — proves the direct-create path does not blindly
+    // trust `create`'s own response, but re-validates against what
+    // `retrieve` reports as CURRENT.
+    mutatePaymentIntent(first.providerReference, { amount: 10_000 });
+
+    const retry = await provider.startPayment(freshInput());
+
+    expect(retry).toEqual({ ok: false, error: "PROVIDER_ERROR" });
+  });
+
+  it("Test 3: direct create + retrieve whose CURRENT currency no longer matches the authoritative Payment fails safely, and does NOT return success", async () => {
+    const { client, mutatePaymentIntent } = makeFakeStripeClient();
+    const provider = createStripePaymentProvider(client);
+
+    const first = await provider.startPayment(freshInput());
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    mutatePaymentIntent(first.providerReference, { currency: "eur" });
+
+    const retry = await provider.startPayment(freshInput());
+
+    expect(retry).toEqual({ ok: false, error: "PROVIDER_ERROR" });
+  });
+
+  it("Test 4 (preserved): direct create + retrieve whose CURRENT status is canceled still fails safely", async () => {
+    const { client, cancelPaymentIntent } = makeFakeStripeClient();
+    const provider = createStripePaymentProvider(client);
+
+    const first = await provider.startPayment(freshInput());
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    cancelPaymentIntent(first.providerReference);
+
+    const retry = await provider.startPayment(freshInput());
+
+    expect(retry).toEqual({ ok: false, error: "PROVIDER_ERROR" });
+  });
+
+  it("Test 5 (regression guard): the Search path's amount/currency/status validation is unaffected by this fix", async () => {
+    const { client, createCalls, seedSearchResults } = makeFakeStripeClient();
+    seedSearchResults([
+      { id: "pi_search_match", amount: 24800, currency: "usd", status: "requires_payment_method" },
+    ]);
+    const provider = createStripePaymentProvider(client);
+
+    const matching = await provider.startPayment(
+      staleInput({ amountMinor: 24800, currency: "USD" }),
+    );
+    expect(matching).toEqual({ ok: true, providerReference: "pi_search_match" });
+
+    const amountMismatch = await provider.startPayment(
+      staleInput({ amountMinor: 999, currency: "USD" }),
+    );
+    expect(amountMismatch).toEqual({ ok: false, error: "PROVIDER_ERROR" });
+
+    const currencyMismatch = await provider.startPayment(
+      staleInput({ amountMinor: 24800, currency: "EUR" }),
+    );
+    expect(currencyMismatch).toEqual({ ok: false, error: "PROVIDER_ERROR" });
+
+    expect(createCalls).toHaveLength(0);
   });
 });
 

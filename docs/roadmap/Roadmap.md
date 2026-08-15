@@ -1311,7 +1311,7 @@ honors idempotency by a caller-supplied key (e.g. Stripe's
 `PROVIDER_REFERENCE_ALREADY_SET` conflation (documented above) remains
 deliberately unresolved pending a real status-changing caller.
 
-12. IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01, IMP-035-FIX-2 / CR-035-FIX-01, CR-035-FIX-02)
+12. IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01, IMP-035-FIX-2 / CR-035-FIX-01, CR-035-FIX-02, IMP-035-FIX-3 / CR-035-FIX-03)
 
 Status
 
@@ -1321,11 +1321,12 @@ Commit
 
 8c798915111f96b1fb4244015375df095a04b265 (initial IMP-035)
 ca14ca42804203958e86ed7fa43691656e63f32b (IMP-035-FIX / CR-035-01)
-IMP-035-FIX-2 pending — implementation and validation are complete but
+b5c994e879d8b6cbdd8c5491891ad67a65649b4d (IMP-035-FIX-2 / CR-035-FIX-01, CR-035-FIX-02)
+IMP-035-FIX-3 pending — implementation and validation are complete but
 not yet committed at the time this entry was written. Record the actual
 commit SHA through the normal follow-up documentation process once the
 commit exists; do not treat any SHA embedded in this entry before that
-point as authoritative for IMP-035-FIX-2.
+point as authoritative for IMP-035-FIX-3.
 
 Objective
 
@@ -1540,6 +1541,58 @@ No `PaymentAttempt`, no Stripe-specific field on `Payment` (no
 locks) — `providerStartAttemptedAt` is the one minimal, provider-neutral
 addition; everything Stripe-specific (the 20-hour threshold, `search`,
 `retrieve`, `metadata`) remains entirely inside `stripe-payment-provider.ts`.
+
+Code Review Findings and Fixes (IMP-035-FIX-3 / CR-035-FIX-03)
+
+Code Review found one further P2 integrity-hardening defect — explicitly
+NOT a reopening of the P1 duplicate-payment/idempotency issue CR-035-01/
+CR-035-FIX-01 closed:
+
+CR-035-FIX-03 — the two paths that can resolve a `providerReference`
+applied DIFFERENT validation rules. The Search-based reconciliation path
+(`reconcileExistingPaymentIntent` → the "found" branch) already checked
+status, amount, AND currency against the authoritative Payment before
+reuse. The direct-`create` + `retrieve` path (IMP-035-FIX-2, added to
+catch a canceled idempotent replay) checked only status — never amount or
+currency. A PaymentIntent whose amount/currency had diverged from the
+authoritative Payment by the time of `retrieve` (e.g. modified externally,
+or an idempotent replay resolving to data that no longer matches) could
+therefore be returned as a valid `providerReference` through the
+create/retrieve path alone, while the exact same scenario would already
+have been caught on the Search path.
+
+Root cause: the two validation rules were implemented as two separate,
+independently-maintained inline checks rather than one shared definition
+of "valid PaymentIntent" — exactly the kind of drift two subtly different
+copies of the same logic tend to produce over successive fixes.
+
+Fix: extracted `toValidatedResult(paymentIntent, authoritative)` — the
+ONE function both paths now call, checking status (not `canceled`),
+amount (`=== input.amountMinor`), and currency (`=== input.currency`,
+already normalized) identically. The Search path passes it the match
+`reconcileExistingPaymentIntent` already found (no additional Stripe call
+— Search's returned fields are already current, per CR-035-FIX-02's own
+reasoning). The direct-`create` path now always `retrieve`s the resulting
+PaymentIntent's CURRENT amount/currency/status (not just status, as
+before) and passes THAT — never the `create` response itself, which can
+be a stale idempotent replay — to the same function. `StripePaymentIntentsClient.retrieve`'s
+return type was widened to carry `amount`/`currency` (already present on
+every real Stripe PaymentIntent) to make this possible.
+
+As a side effect of this refactor, the previous `return reuseIfLive(...)`
+helper (and the `await` it specifically required to route a `retrieve`
+rejection through the surrounding `catch`, documented in IMP-035-FIX-2's
+own write-up) no longer exists in that shape — `toValidatedResult` is a
+synchronous function operating on already-`await`ed data, so the
+async/await pitfall that motivated that comment cannot recur here by
+construction, not merely by continued care.
+
+No architecture, contract, or schema change: `PaymentProvider`,
+`StartPaymentInput`, `StartPaymentResult`, `processPayment`,
+`PaymentRepository`, the Payment domain, and the Prisma schema are
+byte-for-byte unchanged. The fix is confined to
+`stripe-payment-provider.ts` (and its tests) — a genuinely small,
+targeted hardening change, as the Code Review ticket itself required.
 
 Provider Choice
 
@@ -1777,6 +1830,15 @@ a fresh `create`; a canceled match alongside a genuine live one is still
 excluded without manufacturing a false ambiguous result; an idempotent
 `create` replay whose PaymentIntent was canceled out-of-band between calls
 is caught by the new `retrieve`-based live-status check and refused.
+PaymentIntent-integrity tests (CR-035-FIX-03, new describe block, 5
+tests): direct create/retrieve with matching amount/currency and a live
+status succeeds; direct create/retrieve whose CURRENT amount no longer
+matches the authoritative Payment (simulated via a new
+`mutatePaymentIntent` test helper mutating the fake's independent "live"
+store after creation) fails safely with zero success; the same for
+currency; the pre-existing canceled-status test is explicitly preserved;
+a regression guard proves the Search path's amount/currency/status
+validation is unaffected by the refactor extracting `toValidatedResult`.
 Real Stripe test-mode tests (3, gated by `STRIPE_SECRET_KEY` via
 `describe.skipIf`) updated only to supply the new required
 `providerStartAttemptedAt` field.
@@ -1807,41 +1869,41 @@ unmodified.
 Runtime Verification
 
 No `STRIPE_SECRET_KEY` was available in this implementation environment,
-across all of IMP-035, IMP-035-FIX, and IMP-035-FIX-2. The 3 real-Stripe
-test-mode tests remain implemented and gated correctly
+across all of IMP-035, IMP-035-FIX, IMP-035-FIX-2, and IMP-035-FIX-3. The
+3 real-Stripe test-mode tests remain implemented and gated correctly
 (`describe.skipIf(!process.env.STRIPE_SECRET_KEY)`) but were **skipped**,
 not run and not fabricated as passing. `pnpm test` reports these 3 tests
 as explicitly skipped. Real Stripe test-mode verification of the
-safety-over-liveness branching and the `retrieve`-based cancellation check
-against Stripe's actual API remains genuinely pending until someone runs
-the suite with a real Stripe test-mode secret key configured.
+safety-over-liveness branching and the `retrieve`-based amount/currency/
+status integrity check against Stripe's actual API remains genuinely
+pending until someone runs the suite with a real Stripe test-mode secret
+key configured.
 
 Validation Results
 
 Initial IMP-035: `pnpm test` 309 passing + 3 skipped. IMP-035-FIX: 323
-passing + 3 skipped (326 total). IMP-035-FIX-2: `pnpm test`: **328 passing
-+ 3 skipped** (331 total), 27 test files, zero regressions in the
-pre-existing 323. `pnpm typecheck`: clean — including confirming the
-narrowed `StripePaymentIntentsClient` interface (now including `retrieve`)
-is structurally satisfied by a real `Stripe` instance, and that every
-existing `StartPaymentInput`/`Payment` fixture across the whole Payment
-module compiles against the new required fields. `pnpm lint`: clean.
-`pnpm format:check`: limited to the same two pre-existing, unrelated
-warnings already noted for prior milestones (`next.config.ts`,
-`pnpm-workspace.yaml`). `pnpm build`: succeeded, all 15 routes
-compiled/prerendered, with no `STRIPE_SECRET_KEY` set — the lazy-wiring
-design still does not force a Stripe credential requirement onto the
-build; `prisma generate` picked up the new migration cleanly.
+passing + 3 skipped (326 total). IMP-035-FIX-2: 328 passing + 3 skipped
+(331 total). IMP-035-FIX-3: `pnpm test`: **333 passing + 3 skipped** (336
+total), 27 test files, zero regressions in the pre-existing 328 (5 net
+new tests, all in `stripe-payment-provider.test.ts`). `pnpm typecheck`:
+clean — including confirming the widened `StripePaymentIntentsClient.retrieve`
+return type (now including `amount`/`currency`) is structurally satisfied
+by a real `Stripe` instance. `pnpm lint`: clean. `pnpm format:check`:
+limited to the same two pre-existing, unrelated warnings already noted
+for prior milestones (`next.config.ts`, `pnpm-workspace.yaml`). `pnpm
+build`: succeeded, all 15 routes compiled/prerendered, with no
+`STRIPE_SECRET_KEY` set.
 
-One real defect was found and fixed during this milestone's own
+One real defect was found and fixed during IMP-035-FIX-2's own
 validation, not by Code Review: an early implementation returned a
 `retrieve`-derived promise directly from inside the adapter's `try` block
 without `await`, which let a rejected `retrieve` call bypass the
 surrounding `catch` (a classic async/await subtlety — `return promise`
 inside `try` does not route a later rejection through that block's
-`catch`, only `return await promise` does). Caught immediately by the
-test written specifically to exercise a `retrieve` failure; fixed before
-proceeding.
+`catch`, only `return await promise` does). IMP-035-FIX-3's refactor into
+`toValidatedResult` — a synchronous function operating on already-`await`ed
+data — removes the class of bug that comment was guarding against by
+construction, not merely by continued vigilance.
 
 What Is Deliberately Deferred
 
@@ -1855,8 +1917,8 @@ while the Payment stays `PENDING`, exactly as IMP-034/IMP-034-FIX left it.
 architecture decision process concluded was genuinely necessary, not
 scope creep.) Real Stripe test-mode verification (above) is implemented
 but unexecuted pending real credentials — this now includes verifying the
-20-hour safety threshold and the `retrieve`-based cancellation check
-against Stripe's actual API, not just `create`/`search`. The residual risk
+20-hour safety threshold and the `retrieve`-based amount/currency/status
+integrity check against Stripe's actual API, not just `create`/`search`. The residual risk
 of a Stripe-side outage delaying `search` indexing for longer than the
 idempotency key's own retention window is documented as a known,
 unavoidable limitation (see the adapter's own doc comment) rather than
@@ -2105,7 +2167,7 @@ IMP-031 — Checkout Submission Idempotency (incl. IMP-031-FIX / CR-031)	COMPLET
 IMP-032 — Payment Foundation	COMPLETED
 IMP-033 — Payment Provider Port	COMPLETED
 IMP-034 — Payment Processing Application Flow (incl. IMP-034-FIX / CR-034)	COMPLETED
-IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01, IMP-035-FIX-2 / CR-035-FIX-01, CR-035-FIX-02)	COMPLETED — real Stripe test-mode verification pending (see Section 12)
+IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01, IMP-035-FIX-2 / CR-035-FIX-01, CR-035-FIX-02, IMP-035-FIX-3 / CR-035-FIX-03)	COMPLETED — real Stripe test-mode verification pending (see Section 12)
 Next milestone	NOT YET APPROVED
 22. Source of Truth
 

@@ -19,8 +19,12 @@ import type {
  * `retrieve` — a plain by-ID lookup, NOT part of Stripe's eventually
  * consistent Search API (Stripe's own docs group direct retrieval with
  * `list` as strongly, immediately consistent) — used to confirm a
- * PaymentIntent's CURRENT live status after an idempotent `create` replay,
+ * PaymentIntent's CURRENT live state after an idempotent `create` replay,
  * whose response body can otherwise reflect stale, original-request data.
+ * CR-035-FIX-03: `retrieve`'s return type now also carries `amount`/
+ * `currency` (already present on every real Stripe PaymentIntent, exactly
+ * like `search`'s results) so the create/retrieve path can apply the same
+ * integrity check `search` already did.
  */
 export interface StripePaymentIntentsClient {
   paymentIntents: {
@@ -28,7 +32,7 @@ export interface StripePaymentIntentsClient {
       params: { amount: number; currency: string; metadata: Record<string, string> },
       options: { idempotencyKey: string },
     ): Promise<{ id: string }>;
-    retrieve(id: string): Promise<{ id: string; status: string }>;
+    retrieve(id: string): Promise<{ id: string; amount: number; currency: string; status: string }>;
     search(params: { query: string }): Promise<{
       data: { id: string; amount: number; currency: string; status: string }[];
       has_more: boolean;
@@ -121,7 +125,10 @@ async function reconcileExistingPaymentIntent(
   paymentId: string,
 ): Promise<
   | { outcome: "none" }
-  | { outcome: "found"; paymentIntent: { id: string; amount: number; currency: string } }
+  | {
+      outcome: "found";
+      paymentIntent: { id: string; amount: number; currency: string; status: string };
+    }
   | { outcome: "ambiguous" }
 > {
   const query = `metadata["paymentId"]:"${escapeStripeSearchValue(paymentId)}"`;
@@ -135,6 +142,47 @@ async function reconcileExistingPaymentIntent(
     return { outcome: "found", paymentIntent: liveMatches[0]! };
   }
   return { outcome: "none" };
+}
+
+/**
+ * CR-035-FIX-03: the ONE definition of "this Stripe PaymentIntent may be
+ * safely treated as this Payment's provider start" — used identically
+ * whether the PaymentIntent was found via `reconcileExistingPaymentIntent`
+ * (Search) or via a direct `create` + `retrieve`. Before this fix, the two
+ * paths applied different rules: Search validated status AND amount AND
+ * currency, while create/retrieve validated status only — an integrity
+ * inconsistency that could let a PaymentIntent whose amount/currency had
+ * since diverged from the authoritative Payment (e.g. modified externally,
+ * or an idempotent replay resolving to an unrelated stale object) be
+ * silently returned as valid via the create/retrieve path alone.
+ *
+ * `amountMinor`/`currency` come from the persisted `Payment` (via
+ * `StartPaymentInput`), never recalculated or trusted from Stripe's own
+ * response — Stripe's numbers are only ever compared against, never
+ * substituted in.
+ */
+function toValidatedResult(
+  paymentIntent: { id: string; amount: number; currency: string; status: string },
+  authoritative: { amountMinor: number; currency: string },
+): StartPaymentResult {
+  if (paymentIntent.status === "canceled") {
+    console.error(
+      "[payment/stripe-payment-provider] resolved Stripe PaymentIntent is canceled; refusing to treat it as a valid provider start",
+      { paymentIntentId: paymentIntent.id },
+    );
+    return { ok: false, error: "PROVIDER_ERROR" };
+  }
+  if (
+    paymentIntent.amount !== authoritative.amountMinor ||
+    paymentIntent.currency !== authoritative.currency
+  ) {
+    console.error(
+      "[payment/stripe-payment-provider] resolved Stripe PaymentIntent amount/currency does not match the authoritative Payment; refusing to treat it as a valid provider start",
+      { paymentIntentId: paymentIntent.id },
+    );
+    return { ok: false, error: "PROVIDER_ERROR" };
+  }
+  return { ok: true, providerReference: paymentIntent.id };
 }
 
 /**
@@ -197,21 +245,34 @@ async function reconcileExistingPaymentIntent(
  * before this fix.
  *
  * ═══════════════════════════════════════════════════════════════════════
- * CANCELED PAYMENTINTENT SEMANTICS (CR-035-FIX-02)
+ * PAYMENTINTENT INTEGRITY — ONE VALIDATION RULE, BOTH PATHS (CR-035-FIX-02, CR-035-FIX-03)
  * ═══════════════════════════════════════════════════════════════════════
- * A canceled PaymentIntent must never be silently treated as either (a) a
- * valid reusable reference, or (b) proof that no live PaymentIntent
- * exists, authorizing a fresh `create`. Both branches above now handle
- * this: `reconcileExistingPaymentIntent` excludes canceled matches before
- * counting, so a canceled-only Search result becomes `{ outcome: "none" }`
- * — in the reconciliation-required branch, that is refused exactly like
- * any other empty result, never treated as "safe, nothing exists, create
- * one". In the direct-`create` branch, an idempotent Stripe response can
- * be a REPLAY of an earlier request's body (Stripe's idempotency cache
- * stores the ORIGINAL response, not the object's current live state) —
- * this adapter therefore always `retrieve`s the resulting PaymentIntent's
- * CURRENT status (a strongly consistent, non-Search call) before returning
- * it, and refuses (`PROVIDER_ERROR`) if it is `canceled`.
+ * A PaymentIntent must never be silently treated as valid unless it is
+ * genuinely live (not `canceled`) AND its amount/currency still match the
+ * authoritative Payment — regardless of which path resolved it. Before
+ * CR-035-FIX-03, the two paths applied DIFFERENT rules: the Search path
+ * validated status AND amount AND currency, while the direct-`create`
+ * path validated only status — an idempotent `create` response can be a
+ * REPLAY of an earlier request's body (Stripe's idempotency cache stores
+ * the ORIGINAL response, not the object's current live state), so a
+ * PaymentIntent modified externally (or whose amount/currency had
+ * otherwise diverged) could have been returned as valid through that path
+ * alone. `toValidatedResult` is now the ONE definition of "valid" both
+ * paths call:
+ *
+ *   - `reconcileExistingPaymentIntent` (Search): a canceled-only result
+ *     becomes `{ outcome: "none" }` before `toValidatedResult` is ever
+ *     reached — in the reconciliation-required branch, that is refused
+ *     exactly like any other empty result, never treated as "safe,
+ *     nothing exists, create one" (CR-035-FIX-02). A found match's fields
+ *     are passed to `toValidatedResult` as-is — Search's own returned
+ *     data already reflects Stripe's latest values (see
+ *     `reconcileExistingPaymentIntent`'s own doc comment), so no extra
+ *     `retrieve` call is needed here.
+ *   - The direct-`create` path always `retrieve`s the resulting
+ *     PaymentIntent's CURRENT live state (a strongly consistent, non-
+ *     Search call) and passes THAT to `toValidatedResult` — never the
+ *     (potentially stale-replay) `create` response itself.
  *
  * Takes an already-constructed Stripe client (or a fake implementing the
  * same narrow `StripePaymentIntentsClient` shape) rather than constructing
@@ -229,22 +290,11 @@ async function reconcileExistingPaymentIntent(
 export function createStripePaymentProvider(
   stripeClient: StripePaymentIntentsClient,
 ): PaymentProvider {
-  async function reuseIfLive(paymentIntentId: string): Promise<StartPaymentResult> {
-    const live = await stripeClient.paymentIntents.retrieve(paymentIntentId);
-    if (live.status === "canceled") {
-      console.error(
-        "[payment/stripe-payment-provider] resolved Stripe PaymentIntent is canceled; refusing to treat it as a valid provider start",
-        { paymentIntentId },
-      );
-      return { ok: false, error: "PROVIDER_ERROR" };
-    }
-    return { ok: true, providerReference: paymentIntentId };
-  }
-
   return {
     async startPayment(input: StartPaymentInput): Promise<StartPaymentResult> {
       try {
         const currency = input.currency.toLowerCase();
+        const authoritative = { amountMinor: input.amountMinor, currency };
 
         if (isReconciliationRequired(input.providerStartAttemptedAt)) {
           const reconciled = await reconcileExistingPaymentIntent(stripeClient, input.paymentId);
@@ -269,29 +319,16 @@ export function createStripePaymentProvider(
             return { ok: false, error: "PROVIDER_ERROR" };
           }
 
-          // reconciled.outcome === "found"
-          const existing = reconciled.paymentIntent;
-          // Never blindly trust a metadata match — verify the found
-          // PaymentIntent actually represents the same payable
-          // amount/currency as the authoritative Payment before reusing
-          // it. A mismatch here would only happen if Stripe metadata were
-          // ever reused incorrectly; failing safely is strictly better
-          // than silently attaching the wrong external reference.
-          if (existing.amount !== input.amountMinor || existing.currency !== currency) {
-            console.error(
-              "[payment/stripe-payment-provider] existing Stripe PaymentIntent amount/currency does not match the authoritative Payment; refusing to reuse it",
-              { paymentId: input.paymentId },
-            );
-            return { ok: false, error: "PROVIDER_ERROR" };
-          }
-          // No extra `retrieve` needed here (unlike the direct-`create`
-          // path below): `existing.status` already reflects Stripe's
-          // LATEST value, not a cached one — Search's query MATCHING can
-          // lag, but the fields it returns for a match do not (see
-          // `reconcileExistingPaymentIntent`'s own doc comment) — and
-          // `reconcileExistingPaymentIntent` has already excluded
-          // `canceled` matches before this point is ever reached.
-          return { ok: true, providerReference: existing.id };
+          // reconciled.outcome === "found" — no extra `retrieve` needed
+          // here (unlike the direct-`create` path below): `paymentIntent`'s
+          // fields already reflect Stripe's LATEST value, not a cached one
+          // — Search's query MATCHING can lag, but the fields it returns
+          // for a match do not (see `reconcileExistingPaymentIntent`'s own
+          // doc comment). `toValidatedResult` — the SAME check the
+          // create/retrieve path below uses — still verifies
+          // amount/currency/status before this is ever reused: never
+          // blindly trust a metadata match.
+          return toValidatedResult(reconciled.paymentIntent, authoritative);
         }
 
         // Still within the native idempotency retention window — safe to
@@ -307,13 +344,14 @@ export function createStripePaymentProvider(
           },
           { idempotencyKey: toStripeIdempotencyKey(input.paymentId) },
         );
-        // `await` (not a bare `return`) is required here: a rejected
-        // promise returned bare from inside this `try` block would bypass
-        // the `catch` below entirely (a well-known async/await subtlety),
-        // which would defeat the whole point of `reuseIfLive`'s own
-        // `retrieve` call being allowed to fail like any other Stripe
-        // call.
-        return await reuseIfLive(paymentIntent.id);
+        // CR-035-FIX-03: an idempotent `create` response can be a REPLAY
+        // of an earlier request's body, so `retrieve` the PaymentIntent's
+        // CURRENT live state (amount/currency/status) before trusting it
+        // — the same `toValidatedResult` check the Search path above
+        // uses, applied to freshly `retrieve`d data instead of Search's
+        // own returned fields.
+        const live = await stripeClient.paymentIntents.retrieve(paymentIntent.id);
+        return toValidatedResult(live, authoritative);
       } catch (error) {
         // `PaymentProvider.startPayment` must never throw (see the "never
         // throwing" contract test in payment-provider.test.ts) — every
