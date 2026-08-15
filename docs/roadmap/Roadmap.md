@@ -686,11 +686,7 @@ COMPLETED
 
 Commit
 
-Not yet committed at the time this entry was written — implementation and
-validation are complete, pending Code Review before a commit is created.
-Update this field with the real commit SHA once the IMP-032 commit is
-created; do not leave this placeholder in a completed entry after that
-point.
+b2b3090c3c6a18b8c655fa65c043518ba953ba8c
 
 Objective
 
@@ -1131,7 +1127,7 @@ IMP-022 — Cart → Checkout Navigation	COMPLETED
 IMP-023 through IMP-029 (incl. fix follow-ups)	COMPLETED — see Section 6 note; git history authoritative
 IMP-030 — Order Lifecycle & Status Management (incl. CR-030)	COMPLETED
 IMP-031 — Checkout Submission Idempotency (incl. IMP-031-FIX / CR-031)	COMPLETED
-IMP-032 — Payment Foundation	COMPLETED (pending commit — see Section 9)
+IMP-032 — Payment Foundation	COMPLETED
 Next milestone	NOT YET APPROVED
 19. Source of Truth
 
