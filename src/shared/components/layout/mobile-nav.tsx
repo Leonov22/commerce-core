@@ -1,15 +1,26 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { Menu, X } from "lucide-react";
 import { useTranslations } from "next-intl";
 import { Link } from "@/core/i18n/navigation";
-import { navItems } from "@/shared/components/layout/nav-items";
+import {
+  navItems,
+  guestAccountNavItems,
+  authenticatedAccountNavItems,
+} from "@/shared/components/layout/nav-items";
 
-export function MobileNav() {
+interface MobileNavProps {
+  /** Same meaning as `SiteHeader`'s prop of the same name — see its doc comment. */
+  isAuthenticated: boolean;
+  accountSlot: ReactNode;
+}
+
+export function MobileNav({ isAuthenticated, accountSlot }: MobileNavProps) {
   const [open, setOpen] = useState(false);
   const tHeader = useTranslations("Header");
   const tNav = useTranslations("Nav");
+  const accountNavItems = isAuthenticated ? authenticatedAccountNavItems : guestAccountNavItems;
 
   return (
     <div className="md:hidden">
@@ -46,6 +57,23 @@ export function MobileNav() {
                 </Link>
               </li>
             ))}
+          </ul>
+
+          <hr className="my-3 border-border" />
+
+          <ul className="flex flex-col gap-1" aria-label={tHeader("accountNav")}>
+            {accountNavItems.map((item) => (
+              <li key={item.href}>
+                <Link
+                  href={item.href}
+                  onClick={() => setOpen(false)}
+                  className="block rounded-md px-3 py-3 text-base font-medium text-foreground hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                >
+                  {tNav(item.labelKey)}
+                </Link>
+              </li>
+            ))}
+            {accountSlot ? <li className="px-3 pt-2">{accountSlot}</li> : null}
           </ul>
         </nav>
       ) : null}

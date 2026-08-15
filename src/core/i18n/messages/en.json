@@ -8,7 +8,11 @@
   "Nav": {
     "shop": "Shop",
     "about": "About",
-    "contact": "Contact"
+    "contact": "Contact",
+    "login": "Log in",
+    "register": "Register",
+    "account": "Account",
+    "orders": "My Orders"
   },
   "Header": {
     "brand": "Commerce Core",
@@ -16,7 +20,8 @@
     "closeMenu": "Close menu",
     "cart": "Cart",
     "cartWithCount": "Cart, {count, plural, one {# item} other {# items}}",
-    "language": "Language"
+    "language": "Language",
+    "accountNav": "Account"
   },
   "Hero": {
     "eyebrow": "Commerce Core",

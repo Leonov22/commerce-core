@@ -47,6 +47,15 @@ export function CheckoutForm() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState(false);
   const [createdOrder, setCreatedOrder] = useState<CreatedOrder | null>(null);
+  // IMP-036: discovered during Cart → Checkout flow verification —
+  // `POST /api/orders` has required an `Idempotency-Key` header since
+  // IMP-031, but this form never sent one, so every submission
+  // unconditionally failed with 400 `IDEMPOTENCY_KEY_REQUIRED` and
+  // surfaced as `errors.orderFailed`. Generated once per mounted form
+  // instance (not per submit attempt) so a retry after a failed request
+  // reuses the SAME key — exactly IMP-031's intended semantics — while a
+  // fresh checkout page load naturally gets a fresh one.
+  const [idempotencyKey] = useState(() => crypto.randomUUID());
 
   // A just-created Order clears the Cart, which would otherwise fall
   // through to the empty-cart branch below and hide the confirmation the
@@ -121,7 +130,7 @@ export function CheckoutForm() {
     try {
       const response = await fetch("/api/orders", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
         body: JSON.stringify({
           customer: values.contact,
           items: items.map((item) => ({ productId: item.productId, quantity: item.quantity })),

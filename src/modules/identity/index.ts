@@ -42,6 +42,13 @@ export {
 export { AccountRegisterView } from "@/modules/identity/presentation/account-register-view";
 export { AccountLoginView } from "@/modules/identity/presentation/account-login-view";
 export { AccountDashboardView } from "@/modules/identity/presentation/account-dashboard-view";
+/**
+ * The logout action, exported at widget granularity (IMP-036) the same
+ * way `@/modules/cart` exports `CartNavLink` — so the app-level layout can
+ * compose it into the site header/mobile nav without `shared/` ever
+ * importing this module directly.
+ */
+export { AccountLogoutButton } from "@/modules/identity/components/account-logout-button";
 
 export function registerUser(input: RegisterUserInput) {
   return registerUserCommand.registerUser(prismaUserRepository, input);
