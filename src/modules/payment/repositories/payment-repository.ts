@@ -107,4 +107,33 @@ export interface PaymentRepository {
     paymentId: string,
     providerReference: string,
   ): Promise<Payment | null>;
+
+  /**
+   * Atomically durably marks that a provider-start attempt is being made
+   * for this Payment (IMP-035-FIX-2), if none has been marked yet —
+   * `WHERE id = ? AND status = 'PENDING' AND providerStartAttemptedAt IS NULL`,
+   * the same database-conditional-write principle already established for
+   * `create`/`updateStatusIfCurrent`/`setProviderReferenceIfPending`. This
+   * is the atomic "first-start claim" primitive `processPayment` calls
+   * BEFORE ever contacting a `PaymentProvider`, so that even a process
+   * crash between this write and the provider call still leaves a durable
+   * record that an attempt may have happened.
+   *
+   * Unlike the other conditional-write methods above, this ALWAYS returns
+   * the current row (never `null` because the condition didn't match) —
+   * the caller needs `providerStartAttemptedAt`'s authoritative value
+   * regardless of whether THIS call is the one that set it or an earlier
+   * call already did, since a `PaymentProvider` implementation decides its
+   * own safe-retry behavior based on that timestamp's age, not on who set
+   * it. Only returns `null` if the Payment doesn't exist, or has moved
+   * away from `PENDING` since the caller's own read (mirroring
+   * `updateStatusIfCurrent`'s null-for-no-longer-matching convention).
+   *
+   * Two concurrent calls for the same Payment both reach this statement;
+   * Postgres allows exactly one to actually write the timestamp, and both
+   * calls then observe the SAME resulting value — there is never a
+   * scenario where two different `providerStartAttemptedAt` values exist
+   * for one Payment.
+   */
+  claimProviderStartAttempt(paymentId: string): Promise<Payment | null>;
 }

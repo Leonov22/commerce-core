@@ -22,6 +22,7 @@ function toDomainPayment(row: NonNullable<PaymentRow>): Payment {
     amountMinor: row.amountMinor,
     currency: row.currency,
     providerReference: row.providerReference,
+    providerStartAttemptedAt: row.providerStartAttemptedAt,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -142,5 +143,25 @@ export const prismaPaymentRepository: PaymentRepository = {
 
     const row = await findPaymentRecord(paymentId);
     return row ? toDomainPayment(row) : null;
+  },
+
+  async claimProviderStartAttempt(paymentId: string): Promise<Payment | null> {
+    // IMP-035-FIX-2: attempt the atomic claim — a no-op if
+    // `providerStartAttemptedAt` is already set (by this Payment's own
+    // earlier attempt) or if the Payment isn't `PENDING`. Unlike
+    // `setProviderReferenceIfPending`, this method doesn't branch on
+    // whether THIS call's write applied: either way, the row read
+    // immediately after is the authoritative current state a
+    // `PaymentProvider` needs to reason about.
+    await prisma.payment.updateMany({
+      where: { id: paymentId, status: "PENDING", providerStartAttemptedAt: null },
+      data: { providerStartAttemptedAt: new Date() },
+    });
+
+    const row = await findPaymentRecord(paymentId);
+    if (!row || row.status !== "PENDING") {
+      return null;
+    }
+    return toDomainPayment(row);
   },
 };

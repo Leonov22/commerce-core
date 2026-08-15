@@ -98,6 +98,32 @@ export type ProcessPaymentResult =
  * succeeds on that later attempt. No provider-specific retry/recovery API
  * is introduced here; this is a property the contract requires of every
  * future adapter, not something this function orchestrates itself.
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * DURABLE FIRST-START CLAIM (IMP-035-FIX-2)
+ * ═══════════════════════════════════════════════════════════════════════
+ * CR-034-02's recovery invariant above depends entirely on a compliant
+ * provider being ABLE to recognize "this paymentId was already attempted"
+ * — but a real provider's own native idempotency mechanism is not
+ * permanent (e.g. Stripe's `Idempotency-Key` retention is finite), and
+ * `providerReference` alone cannot durably distinguish "never attempted"
+ * from "attempted, but the reference was lost" (both leave it `null`).
+ * Before ever calling `paymentProvider.startPayment(...)`, this function
+ * therefore atomically claims `PaymentRepository.claimProviderStartAttempt`
+ * — a durable, database-persisted timestamp recording that a start is
+ * being attempted, set BEFORE the provider is ever contacted, so it
+ * survives a crash between this write and the provider call, between the
+ * provider call and `setProviderReferenceIfPending`, or across an
+ * application restart. The claimed timestamp (whether set by THIS call or
+ * an earlier one) is passed to the provider as
+ * `StartPaymentInput.providerStartAttemptedAt`, so a compliant
+ * implementation can decide — using its OWN provider-specific retention
+ * knowledge — whether it may still trust its native idempotency mechanism,
+ * or whether it must instead positively reconcile against the provider's
+ * own records before creating anything, per the port's "SAFETY OVER
+ * LIVENESS" invariant. This function itself stays completely
+ * provider-neutral: it has no opinion on what "too long ago" means for any
+ * particular provider.
  */
 export async function processPayment(
   paymentRepository: PaymentRepository,
@@ -116,15 +142,31 @@ export async function processPayment(
     return { ok: false, error: "PAYMENT_NOT_PENDING" };
   }
 
+  // IMP-035-FIX-2: durably claim the first-start attempt BEFORE ever
+  // contacting the provider — see "DURABLE FIRST-START CLAIM" above.
+  // `claimed` is only `null` if the Payment vanished or left `PENDING`
+  // between the read above and this call (Payments are never deleted and
+  // nothing changes status away from `PENDING` today, so this is
+  // unreachable in practice — handled the same defensive way the
+  // `PROVIDER_REFERENCE_ALREADY_SET` path below never trusts a stale read
+  // as authority for what happens next).
+  const claimed = await paymentRepository.claimProviderStartAttempt(payment.id);
+  if (!claimed) {
+    return { ok: false, error: "PAYMENT_NOT_PENDING" };
+  }
+
   // The provider receives exclusively the persisted Payment's own
   // authoritative values — this function accepts no amount/currency/
   // status/providerReference/user-data parameter at all, so there is no
   // input a caller could even attempt to override them with, and no
   // Order recalculation, Catalog, or Checkout involvement of any kind.
   const input: StartPaymentInput = {
-    paymentId: payment.id,
-    amountMinor: payment.amountMinor,
-    currency: payment.currency,
+    paymentId: claimed.id,
+    amountMinor: claimed.amountMinor,
+    currency: claimed.currency,
+    // Guaranteed non-null: `claimProviderStartAttempt` always sets it if
+    // it wasn't already set.
+    providerStartAttemptedAt: claimed.providerStartAttemptedAt!,
   };
 
   const result = await paymentProvider.startPayment(input);

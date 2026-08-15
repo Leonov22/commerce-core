@@ -268,6 +268,20 @@ model Payment {
   // which provider, only an id string. Unused (always null) until then.
   providerReference String?
 
+  // IMP-035-FIX-2 (CR-035-FIX-01): durably records WHEN a provider-start
+  // was first attempted for this Payment — null means "definitely never
+  // attempted", set means "an external start may already have happened",
+  // regardless of whether providerReference ever got persisted. This is
+  // the only way the system can safely tell those two cases apart after a
+  // crash: providerReference alone is ambiguous, since it stays null both
+  // before any attempt AND after a successful provider call whose local
+  // persistence failed. Deliberately provider-neutral (no Stripe concept
+  // here) — see `PaymentRepository.claimProviderStartAttempt` for the
+  // atomic write, and `stripe-payment-provider.ts` for how a concrete
+  // provider interprets this timestamp's age against its own idempotency
+  // guarantees. Once set, never reset back to null.
+  providerStartAttemptedAt DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

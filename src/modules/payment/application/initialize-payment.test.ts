@@ -99,6 +99,7 @@ function makeFakePaymentRepository(): {
         amountMinor: input.amountMinor,
         currency: input.currency,
         providerReference: null,
+        providerStartAttemptedAt: null,
         createdAt: now,
         updatedAt: now,
       };
@@ -115,6 +116,9 @@ function makeFakePaymentRepository(): {
       throw new Error("not used by these tests");
     },
     async setProviderReferenceIfPending() {
+      throw new Error("not used by these tests");
+    },
+    async claimProviderStartAttempt() {
       throw new Error("not used by these tests");
     },
   };

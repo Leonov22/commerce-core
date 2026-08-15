@@ -35,18 +35,28 @@ function makePayment(overrides: Partial<Payment> = {}): Payment {
     amountMinor: 24800,
     currency: "USD",
     providerReference: null,
+    providerStartAttemptedAt: null,
     createdAt: now,
     updatedAt: now,
     ...overrides,
   };
 }
 
-function makeFakePaymentRepository(initial: Payment | null): {
+function makeFakePaymentRepository(
+  initial: Payment | null,
+  options: {
+    /** IMP-035-FIX-2 Test 14: simulate the durable claim itself being unavailable (e.g. a database outage). */
+    claimProviderStartAttemptThrows?: boolean;
+    setProviderReferenceIfPendingThrows?: boolean;
+  } = {},
+): {
   repository: PaymentRepository;
   setProviderReferenceCalls: { paymentId: string; providerReference: string }[];
+  claimProviderStartAttemptCalls: string[];
 } {
   let current: Payment | null = initial;
   const setProviderReferenceCalls: { paymentId: string; providerReference: string }[] = [];
+  const claimProviderStartAttemptCalls: string[] = [];
 
   const repository: PaymentRepository = {
     async create() {
@@ -65,6 +75,9 @@ function makeFakePaymentRepository(initial: Payment | null): {
       paymentId: string,
       providerReference: string,
     ): Promise<Payment | null> {
+      if (options.setProviderReferenceIfPendingThrows) {
+        throw new Error("simulated local persistence failure");
+      }
       setProviderReferenceCalls.push({ paymentId, providerReference });
       // Mirrors the real repository's
       // `WHERE id = ? AND status = 'PENDING' AND providerReference IS NULL`
@@ -74,9 +87,27 @@ function makeFakePaymentRepository(initial: Payment | null): {
       current = { ...current, providerReference, updatedAt: new Date() };
       return current;
     },
+    async claimProviderStartAttempt(paymentId: string): Promise<Payment | null> {
+      claimProviderStartAttemptCalls.push(paymentId);
+      if (options.claimProviderStartAttemptThrows) {
+        throw new Error("simulated database unavailable");
+      }
+      // Mirrors the real repository's
+      // `WHERE id = ? AND status = 'PENDING' AND providerStartAttemptedAt IS NULL`
+      // condition, followed by an unconditional re-read — see
+      // `PaymentRepository.claimProviderStartAttempt`'s own doc comment
+      // for why this always returns the current row rather than `null` on
+      // a non-match.
+      if (!current || current.id !== paymentId) return null;
+      if (current.status !== "PENDING") return null;
+      if (current.providerStartAttemptedAt === null) {
+        current = { ...current, providerStartAttemptedAt: new Date(), updatedAt: new Date() };
+      }
+      return current;
+    },
   };
 
-  return { repository, setProviderReferenceCalls };
+  return { repository, setProviderReferenceCalls, claimProviderStartAttemptCalls };
 }
 
 function makeFakePaymentProvider(
@@ -158,14 +189,80 @@ describe("processPayment", () => {
     expect(calls).toHaveLength(1);
   });
 
-  it("the provider receives exactly paymentId, amountMinor, and currency — nothing else", async () => {
+  it("the provider receives exactly paymentId, amountMinor, currency, and providerStartAttemptedAt — nothing else", async () => {
     const payment = makePayment({ id: "payment-42", amountMinor: 24800, currency: "USD" });
     const { repository } = makeFakePaymentRepository(payment);
     const { provider, calls } = makeFakePaymentProvider();
 
     await processPayment(repository, provider, payment.id);
 
-    expect(calls).toEqual([{ paymentId: "payment-42", amountMinor: 24800, currency: "USD" }]);
+    expect(calls).toHaveLength(1);
+    expect(Object.keys(calls[0]!).sort()).toEqual([
+      "amountMinor",
+      "currency",
+      "paymentId",
+      "providerStartAttemptedAt",
+    ]);
+    expect(calls[0]).toMatchObject({
+      paymentId: "payment-42",
+      amountMinor: 24800,
+      currency: "USD",
+    });
+    expect(calls[0]?.providerStartAttemptedAt).toBeInstanceOf(Date);
+  });
+
+  it("IMP-035-FIX-2: processPayment durably claims a provider-start attempt BEFORE ever calling the provider, and passes it through as providerStartAttemptedAt", async () => {
+    const payment = makePayment();
+    const { repository, claimProviderStartAttemptCalls } = makeFakePaymentRepository(payment);
+    const { provider, calls } = makeFakePaymentProvider();
+
+    await processPayment(repository, provider, payment.id);
+
+    expect(claimProviderStartAttemptCalls).toEqual([payment.id]);
+    expect(calls[0]?.providerStartAttemptedAt).toBeInstanceOf(Date);
+  });
+
+  it("IMP-035-FIX-2 (Test 14): if the durable first-start claim cannot be established, the provider is never contacted", async () => {
+    const payment = makePayment();
+    const { repository } = makeFakePaymentRepository(payment, {
+      claimProviderStartAttemptThrows: true,
+    });
+    const { provider, calls } = makeFakePaymentProvider();
+
+    await expect(processPayment(repository, provider, payment.id)).rejects.toThrow(
+      "simulated database unavailable",
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it("IMP-035-FIX-2 (Tests 4/5/13): a retry after a simulated persistence failure reuses the SAME already-claimed providerStartAttemptedAt, rather than re-claiming a fresh one", async () => {
+    const payment = makePayment();
+    const { repository } = makeFakePaymentRepository(payment, {
+      setProviderReferenceIfPendingThrows: true,
+    });
+    const { provider, calls } = makeFakeCompliantPaymentProvider();
+
+    // First attempt: the provider succeeds, but local persistence throws
+    // (simulating a crash/DB failure between provider success and
+    // `setProviderReferenceIfPending`) — `processPayment` itself
+    // propagates that failure rather than swallowing it.
+    await expect(processPayment(repository, provider, payment.id)).rejects.toThrow(
+      "simulated local persistence failure",
+    );
+    expect(calls).toHaveLength(1);
+    const firstAttemptTimestamp = calls[0]?.providerStartAttemptedAt;
+    expect(firstAttemptTimestamp).toBeInstanceOf(Date);
+
+    // Retry (simulating the application having restarted): the durable
+    // claim from the first attempt is still there and must be reused
+    // as-is, not reset/re-claimed with a new timestamp — this is exactly
+    // the signal a real provider adapter (see stripe-payment-provider.ts)
+    // needs to decide whether it may still trust native idempotency alone.
+    await expect(processPayment(repository, provider, payment.id)).rejects.toThrow(
+      "simulated local persistence failure",
+    );
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.providerStartAttemptedAt).toEqual(firstAttemptTimestamp);
   });
 
   it("the provider receives the Payment's own authoritative amount/currency, not a hardcoded value", async () => {
@@ -422,7 +519,7 @@ describe("processPayment — real repository + real concurrency (IMP-034)", () =
     expect(calls).toHaveLength(2);
     // Both invocations carried the exact same idempotency identity —
     // this is what makes it safe for both to have reached the provider.
-    expect(calls[0]).toEqual({
+    expect(calls[0]).toMatchObject({
       paymentId: payment.id,
       amountMinor: payment.amountMinor,
       currency: payment.currency,
@@ -448,5 +545,48 @@ describe("processPayment — real repository + real concurrency (IMP-034)", () =
     const refetched = await prismaPaymentRepository.findById(payment.id);
     expect(refetched?.providerReference).toBe(winnerReference);
     expect(refetched?.status).toBe("PENDING");
+  });
+
+  it("IMP-035-FIX-2 (Tests 3/16): two genuinely concurrent processPayment calls for a brand-new Payment converge on the SAME durably-claimed providerStartAttemptedAt against the real repository", async () => {
+    const payment = await createTestPayment();
+    expect(payment.providerStartAttemptedAt).toBeNull();
+
+    // Barrier-gated fake provider (same technique as the CR-034 P3 fix):
+    // neither call can produce a result until BOTH have arrived at
+    // `startPayment`, so the two `processPayment` calls below are
+    // structurally guaranteed to have their `claimProviderStartAttempt`
+    // calls against the REAL repository genuinely overlap in time too —
+    // if they ran sequentially, the second `startPayment` would never be
+    // reached and this `Promise.all` would hang instead of resolving.
+    const calls: StartPaymentInput[] = [];
+    let arrived = 0;
+    let releaseLatch: () => void;
+    const latch = new Promise<void>((resolve) => {
+      releaseLatch = resolve;
+    });
+    const provider: PaymentProvider = {
+      async startPayment(input) {
+        calls.push(input);
+        arrived += 1;
+        if (arrived >= 2) releaseLatch();
+        await latch;
+        return { ok: true, providerReference: `race-claim-ref-${calls.length}` };
+      },
+    };
+
+    await Promise.all([
+      processPayment(prismaPaymentRepository, provider, payment.id),
+      processPayment(prismaPaymentRepository, provider, payment.id),
+    ]);
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.providerStartAttemptedAt).toBeInstanceOf(Date);
+    // The atomic claim in `claimProviderStartAttempt` guarantees exactly
+    // one timestamp is ever written for this Payment — both calls must
+    // have observed that SAME value, never two different ones.
+    expect(calls[1]?.providerStartAttemptedAt).toEqual(calls[0]?.providerStartAttemptedAt);
+
+    const refetched = await prismaPaymentRepository.findById(payment.id);
+    expect(refetched?.providerStartAttemptedAt).toEqual(calls[0]?.providerStartAttemptedAt);
   });
 });

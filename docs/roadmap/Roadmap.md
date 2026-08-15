@@ -1311,7 +1311,7 @@ honors idempotency by a caller-supplied key (e.g. Stripe's
 `PROVIDER_REFERENCE_ALREADY_SET` conflation (documented above) remains
 deliberately unresolved pending a real status-changing caller.
 
-12. IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01)
+12. IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01, IMP-035-FIX-2 / CR-035-FIX-01, CR-035-FIX-02)
 
 Status
 
@@ -1320,11 +1320,12 @@ COMPLETED
 Commit
 
 8c798915111f96b1fb4244015375df095a04b265 (initial IMP-035)
-IMP-035-FIX pending — implementation and validation are complete but not
-yet committed at the time this entry was written. Record the actual
+ca14ca42804203958e86ed7fa43691656e63f32b (IMP-035-FIX / CR-035-01)
+IMP-035-FIX-2 pending — implementation and validation are complete but
+not yet committed at the time this entry was written. Record the actual
 commit SHA through the normal follow-up documentation process once the
 commit exists; do not treat any SHA embedded in this entry before that
-point as authoritative for IMP-035-FIX.
+point as authoritative for IMP-035-FIX-2.
 
 Objective
 
@@ -1415,9 +1416,130 @@ safely, exactly as before this fix.
 
 No `PaymentAttempt`, no new database table or column, no schema
 migration, no new `PaymentStatus`, no infrastructure (Redis/queues/locks)
-— the entire fix is contained inside `stripe-payment-provider.ts`. The
-`PaymentProvider` public contract, `processPayment`, `PaymentRepository`,
-and the Payment domain are byte-for-byte unchanged.
+— the entire CR-035-01 fix was contained inside `stripe-payment-provider.ts`.
+The `PaymentProvider` public contract, `processPayment`, `PaymentRepository`,
+and the Payment domain were byte-for-byte unchanged by CR-035-01 (this
+changed with IMP-035-FIX-2 below, for reasons explained there).
+
+Code Review Findings and Fixes (IMP-035-FIX-2 / CR-035-FIX-01, CR-035-FIX-02)
+
+Code Review rejected the IMP-035-FIX / CR-035-01 reconciliation fix as
+still insufficient, finding one further P1 defect and one P2 defect, both
+resolved:
+
+CR-035-FIX-01 (P1) — `search` reconciliation alone cannot prove a
+negative. Stripe's own documentation states Search is eventually
+consistent ("unsafe for read-after-write... searchable in under a minute
+under normal conditions", with no stronger guarantee during an outage).
+The exact dangerous sequence: `create` succeeds, local
+`providerReference` persistence fails, the process crashes, more than 24
+hours pass (the native idempotency key may now be pruned), a retry's
+`search` call happens to return zero results (either because nothing was
+ever created, or because Search genuinely has not caught up) — the
+CR-035-01 adapter would then fall through to `create` and produce a
+second, genuinely duplicate PaymentIntent. An empty Search result was
+being treated as proof of absence, which it never is.
+
+Root cause: nothing in the system durably recorded, independent of
+`providerReference`, WHETHER a provider-start had ever been attempted.
+`providerReference == null` is inherently ambiguous between "never
+attempted" and "attempted, but the reference was lost" — the CR-035-01
+fix had no way to distinguish a genuinely fresh Payment (safe to trust
+`create`'s native idempotency alone) from a Payment whose start history is
+unknown (unsafe to trust an empty Search result).
+
+Architecture decision process (per the four options considered):
+Option A (reuse existing fields alone) was rejected — `providerReference`/
+`status` cannot represent the needed distinction, by construction. Option
+C (`PaymentAttempt`) and Option D (Redis/queues/distributed locks) were
+rejected as disproportionate — the problem is a missing DURABLE MARKER,
+not a missing entity or missing infrastructure; PostgreSQL's own
+conditional-write primitive (already used four times elsewhere in this
+repository) is sufficient. Option B — one minimal, provider-neutral
+field — was selected.
+
+Fix — a new nullable `Payment.providerStartAttemptedAt` column (migration
+`20260815173412_add_payment_provider_start_attempted_at`, a single
+`ALTER TABLE ... ADD COLUMN`, no data loss, no existing column touched)
+durably records WHEN a provider-start was first attempted, set via a new
+atomic conditional-write repository method,
+`PaymentRepository.claimProviderStartAttempt` — the same
+`WHERE ... IS NULL` pattern `create`/`updateStatusIfCurrent`/
+`setProviderReferenceIfPending` already established, no new primitive
+invented. `processPayment` calls this BEFORE ever contacting the provider
+(IMP-034-FIX/CR-034-02's recovery invariant now has something durable to
+depend on even if the process crashes between the claim and the provider
+call), and passes the resulting timestamp through as the port's new
+`StartPaymentInput.providerStartAttemptedAt` field.
+
+This is the one place `PaymentProvider`'s contract and `processPayment`
+change: `providerStartAttemptedAt` is a provider-neutral FACT (a
+timestamp — deliberately not a Stripe-specific concept), documented on
+the port as the caller's answer to "when, if ever, was a start first
+durably attempted for this Payment" — see `payment-provider.ts`'s new
+"SAFETY OVER LIVENESS" invariant. Each concrete provider adapter
+interprets its age using ITS OWN retention knowledge; the port itself has
+no opinion on what "too long ago" means for any given provider.
+
+The Stripe adapter interprets it via a private, adapter-local constant
+(20 hours — a deliberate margin under Stripe's documented "at least 24
+hours" to absorb clock skew and request latency):
+
+- Age below the threshold: still safe to trust `create`'s native
+  idempotency key alone — `search` is skipped entirely (no unnecessary
+  API call, and no exposure to Search's own consistency lag, since a
+  brand-new Payment's `providerStartAttemptedAt` is always this fresh by
+  construction).
+- Age at or above the threshold: native idempotency can no longer be
+  trusted. `search` is attempted, but — the core of this fix — a result
+  of ZERO matches is now treated as INCONCLUSIVE, not as permission to
+  create. `startPayment` returns `PROVIDER_ERROR` rather than ever
+  calling `create` in this state. A genuinely fresh Payment can never
+  reach this branch (its claim is always fresh), so this never blocks an
+  actual first-ever payment attempt.
+
+This closes CR-035-FIX-01: the dangerous sequence from Section 26 of the
+Code Review ticket now ends in a safe, controlled `PROVIDER_ERROR` — the
+Payment remains `PENDING`, requiring a future reconciliation/recovery
+attempt — never a second `create` call. Consistent with the ticket's
+explicit governing principle: NO DUPLICATE EXTERNAL PAYMENT over FAST
+RECOVERY; a false negative (refusing a payment that could theoretically
+have been started safely) is accepted, a false positive (creating a
+genuine duplicate) is not. Concurrency (IMP-034-FIX/CR-034-01) is
+unaffected: two genuinely concurrent calls for a brand-new Payment both
+observe the SAME freshly-claimed timestamp (the atomic claim guarantees
+this), so both take the direct-`create` branch and converge via Stripe's
+own idempotency-key handling, exactly as before.
+
+CR-035-FIX-02 (P2) — a canceled PaymentIntent's reconciliation semantics
+were unsafe in both directions. Previously, a canceled-only Search match
+was excluded and treated as "nothing exists, safe to create a fresh
+one" — silently authorizing a second external operation while the
+internal Payment stayed `PENDING`. Separately, `create`'s idempotent
+replay response reflects the ORIGINAL request's response body (Stripe
+does not re-derive it from current live state), so a PaymentIntent
+canceled out-of-band (e.g. via the Stripe dashboard) sometime after
+creation could still be returned as if it were a valid, live reference.
+
+Fix: a canceled-only Search result now resolves to the SAME
+"inconclusive, refuse" outcome as zero results (never "safe to create").
+For the direct-`create` path, the adapter now always `retrieve`s the
+resulting PaymentIntent's CURRENT status (a strongly consistent, non-
+Search call — Stripe groups direct-by-ID retrieval with `list`, not with
+the eventually-consistent Search API) before returning it, and refuses
+(`PROVIDER_ERROR`) if that status is `canceled`. A live (non-canceled)
+match found via Search does NOT need this extra check — Search's own
+returned fields reflect Stripe's latest data even though the underlying
+query match itself can lag (per Stripe's documented "Data mismatches"
+behavior), and `reconcileExistingPaymentIntent` already excludes
+`canceled` matches before any match is ever returned as "found".
+
+No `PaymentAttempt`, no Stripe-specific field on `Payment` (no
+`stripePaymentIntentId`/`stripeIdempotencyKey`/`stripeStatus`), no new
+`PaymentStatus` value, no infrastructure (Redis/queues/distributed
+locks) — `providerStartAttemptedAt` is the one minimal, provider-neutral
+addition; everything Stripe-specific (the 20-hour threshold, `search`,
+`retrieve`, `metadata`) remains entirely inside `stripe-payment-provider.ts`.
 
 Provider Choice
 
@@ -1480,37 +1602,57 @@ derivation to diverge from — it cannot vary independently of `paymentId`.
 IMP-035-FIX (CR-035-01): this key is no longer the ONLY idempotency
 mechanism — see "Code Review Findings and Fixes" above for the durable
 `metadata`-based reconciliation layered underneath it, and "Durable
-Reconciliation" below for its own dedicated write-up.
+Reconciliation" below for its own dedicated write-up. IMP-035-FIX-2
+(CR-035-FIX-01): this key is now trusted ONLY while
+`StartPaymentInput.providerStartAttemptedAt` is recent enough (< 20 hours
+old, a margin under Stripe's own "at least 24 hours" guarantee) — see
+"Safety Over Liveness" below.
 
-Durable Reconciliation (IMP-035-FIX / CR-035-01)
+Durable Reconciliation (IMP-035-FIX / CR-035-01, tightened by
+IMP-035-FIX-2 / CR-035-FIX-01, CR-035-FIX-02)
 
 Every PaymentIntent `startPayment` creates carries `metadata: { paymentId }`
-— the same stable value used to derive the idempotency key. Before ever
-calling `create`, `startPayment` searches
-(`stripe.paymentIntents.search`) for an existing PaymentIntent carrying
-that `paymentId`, using the query `` metadata["paymentId"]:"<paymentId>" ``
+— the same stable value used to derive the idempotency key. `startPayment`
+first computes whether native idempotency alone can still be trusted (see
+"Safety Over Liveness" below); only if it cannot does it call
+`stripe.paymentIntents.search` for an existing PaymentIntent carrying that
+`paymentId`, using the query `` metadata["paymentId"]:"<paymentId>" ``
 (Stripe's Search Query Language, verified against Stripe's official
-documentation). Outcomes:
+documentation). Outcomes, IMP-035-FIX-2 (CR-035-FIX-01, CR-035-FIX-02):
 
-- No match → proceed to `create` (protected by the idempotency key).
+- No match → `PROVIDER_ERROR`. This is the change from CR-035-01: an
+  empty Search result is no longer treated as permission to `create` — it
+  is inconclusive, and reconciliation is only ever reached once native
+  idempotency can no longer be trusted, so falling through to `create`
+  here could produce a genuine duplicate.
 - Exactly one non-canceled match, amount/currency verified against the
-  authoritative Payment → reuse its `id` as `providerReference`, `create`
-  is never called.
+  authoritative Payment → reuse its `id` as `providerReference` directly
+  (no extra live-status check needed — Search's returned fields already
+  reflect Stripe's latest data). `create` is never called.
 - More than one non-canceled match, or more results than fit on one page
   → `PROVIDER_ERROR`; reconciliation refuses to guess.
 - Amount/currency mismatch on the one match found → `PROVIDER_ERROR`;
   the found PaymentIntent is not reused, and the Payment's own
   amount/currency are never altered by this check.
 - A `canceled` match is excluded before any of the above counting —
-  neither reused nor allowed to manufacture a false "ambiguous" result.
+  neither reused nor (CR-035-FIX-02) allowed to authorize a fresh
+  `create` by making the result look like "no match".
 
-This makes `Payment.providerReference` (once persisted locally) the
-actual durable source of truth for "does this Payment already have an
-external operation", with Stripe-side `search` as the mechanism that lets
-the adapter itself answer the same question when the local write hasn't
-happened yet or was lost — exactly the "conceptual mapping" the Architect
-approved: native idempotency for the short/medium term, durable
-`providerReference`/metadata-based reconciliation for the rest.
+Safety Over Liveness (IMP-035-FIX-2 / CR-035-FIX-01)
+
+`StartPaymentInput.providerStartAttemptedAt` (see "Code Review Findings
+and Fixes" above) tells `startPayment` how long ago a provider-start was
+first durably attempted for this Payment. Below a 20-hour threshold
+(private to this adapter, not part of the provider-neutral port): `create`
+is called directly, without searching — safe because native idempotency
+is still guaranteed, and a genuinely new Payment's timestamp is always
+this fresh. At or above the threshold: reconciliation is mandatory, and
+(per the point above) an inconclusive result refuses rather than creates.
+This is what makes `Payment.providerStartAttemptedAt` — not
+`Payment.providerReference`, and not Stripe's own idempotency key — the
+actual permanent source of truth for "might this Payment already have an
+external operation": `providerReference` alone was always ambiguous
+(`null` before AND after a lost reference), and Stripe's key is finite.
 
 Authoritative Payment Values
 
@@ -1536,17 +1678,25 @@ Error Mapping
 contract test for `PaymentProvider`): every error that is an instance of
 `Stripe.errors.StripeError` (covering card declines, invalid requests, API
 errors, rate limits, connection errors — Stripe's entire REST-API error
-hierarchy) from EITHER `search` or `create` is caught and mapped to the
-single `{ ok: false, error: "PROVIDER_ERROR" }` result the port already
-defines, after logging the error server-side (`console.error`, matching
-the existing `[api/orders]`-style convention used at other boundaries in
-this codebase). A non-Stripe error (a bug in this adapter itself) is
-deliberately NOT caught — it propagates, so a genuine defect surfaces
-rather than being silently absorbed into the provider-failure code path.
-A reconciliation ambiguity (multiple matches) or a validation mismatch
-(amount/currency) also resolves to `PROVIDER_ERROR` — no new
-provider-neutral error code was introduced for either, per the existing
-boundary already being sufficient.
+hierarchy) from `search`, `create`, OR (IMP-035-FIX-2) `retrieve` is
+caught and mapped to the single `{ ok: false, error: "PROVIDER_ERROR" }`
+result the port already defines, after logging the error server-side
+(`console.error`, matching the existing `[api/orders]`-style convention
+used at other boundaries in this codebase). A non-Stripe error (a bug in
+this adapter itself) is deliberately NOT caught — it propagates, so a
+genuine defect surfaces rather than being silently absorbed into the
+provider-failure code path. A reconciliation ambiguity (multiple matches,
+or — IMP-035-FIX-2 — an inconclusive empty result once native idempotency
+can no longer be trusted), a validation mismatch (amount/currency), or a
+canceled PaymentIntent all resolve to `PROVIDER_ERROR` — no new
+provider-neutral error code was introduced for any of these, per the
+existing boundary already being sufficient. (One implementation
+correction made during this fix, not a design decision: an early draft
+returned `reuseIfLive(...)`'s promise directly from inside the adapter's
+`try` block without `await`, which would have let a `retrieve` rejection
+bypass the `catch` entirely — a classic async/await pitfall, fixed before
+the tests that specifically exercise a `retrieve` failure were made to
+pass.)
 
 Application Wiring
 
@@ -1563,101 +1713,170 @@ this milestone; wiring a concrete transport is explicitly out of scope.
 Security
 
 `stripe-payment-provider.ts` starts with `import "server-only"`, so it
-cannot be imported into a client bundle. `STRIPE_SECRET_KEY` is read once,
-server-side, from `process.env`; a placeholder-only entry was added to
-`.env.example` (`.env*` is already gitignored except `.env.example`
-itself). No API key, secret, or provider payload is ever logged or
-returned to a caller. `paymentId`, `amountMinor`, and `currency` all
-originate from the already-persisted, already-authorized `Payment` row —
-this adapter introduces no new place for a client to influence them.
+cannot be imported into a client bundle (verified by an automated test —
+source inspection of the file's first line — not just code review). No
+API key, secret, or provider payload is ever logged or returned to a
+caller. `paymentId`, `amountMinor`, `currency`, and (IMP-035-FIX-2)
+`providerStartAttemptedAt` all originate from the already-persisted,
+already-authorized `Payment` row — this adapter introduces no new place
+for a client to influence them. `providerStartAttemptedAt` itself carries
+no sensitive data (a timestamp only) and is provider-neutral by
+construction — it is not Stripe-specific and reveals nothing about
+Stripe internals if ever logged. `.env.example`'s `STRIPE_SECRET_KEY`
+placeholder entry is unchanged by this fix (`.env*` is already gitignored
+except `.env.example` itself).
+
+Database (IMP-035-FIX-2)
+
+Migration `20260815173412_add_payment_provider_start_attempted_at`: a
+single `ALTER TABLE "payments" ADD COLUMN "providerStartAttemptedAt" TIMESTAMP(3);`
+— nullable, no default, no data migration, no existing column touched, no
+new index (the existing `@@index([status])` is not affected; this column
+is always looked up by `id`, already the primary key). Applied directly
+to the project's Neon PostgreSQL instance via `prisma migrate dev`.
+`PaymentRepository` gains one new method,
+`claimProviderStartAttempt(paymentId)`, implemented with the exact same
+`updateMany`-conditional-write concurrency pattern already used by
+`create`/`updateStatusIfCurrent`/`setProviderReferenceIfPending` — no new
+atomicity primitive was invented. Concurrent-claim safety is proven
+against the REAL database (not a fake), using a barrier-gated fake
+provider to force genuine overlap in `processPayment`'s call into the
+provider while the claim itself races against real Postgres.
 
 Tests
 
-Initial IMP-035: 16 tests (see prior revision of this section; superseded
-by the rewritten file below, which retains full equivalent coverage plus
-CR-035-01's reconciliation scenarios). IMP-035-FIX:
-`stripe-payment-provider.test.ts` now has 30 tests (27 passing + 3 gated
-real-Stripe tests). Contract tests: amount/currency (lowercased) sent to
-Stripe, `paymentId` mapped into the idempotency key, `PaymentIntent.id`
-returned as `providerReference`, a Stripe error on `create` AND on
-`search` each mapped to `PROVIDER_ERROR`, five Stripe error subclasses
-(`StripeCardError`, `StripeInvalidRequestError`, `StripeAPIError`,
-`StripeRateLimitError`, `StripeConnectionError`) collapsing to the same
-result, a non-Stripe error propagating, the successful result carrying no
-field beyond `ok`/`providerReference`, `getStripePaymentProvider()`'s
-missing-key behavior, and the module's `server-only` boundary (source
-inspection). Idempotency-key-stability tests: same `paymentId` → same key
-on retry; different `paymentId` → different key. Durable-reconciliation
-tests (CR-035-01, the core of this fix): (A) normal creation with no
-existing match, the exact search query shape, and the exact metadata
-written; (B) native idempotency still converges a same-request retry; (C)
-an existing PaymentIntent found via search is reused with zero new
-`create` calls; (D/E) recovery after a simulated local persistence failure
-combined with a simulated expired idempotency key — reconciliation finds
-the original PaymentIntent and `create` is never called a second time; (F)
-amount mismatch on a found PaymentIntent fails safely; (G) currency
-mismatch fails safely; (H) multiple matches, and a search page reporting
-`has_more`, both fail safely rather than guessing; a `canceled` match is
-excluded from ambiguity counting and does not block reuse of a genuine
-live match, and a canceled-only match is treated as no match (a fresh
-PaymentIntent is created); (I) two genuinely concurrent `startPayment`
-calls, proven via an explicit barrier gating the fake's `create` (the same
-technique as the CR-034 P3 test fix) rather than trusting `Promise.all`
-alone, converge on one `providerReference` via native idempotency; (J)
-different Payments produce independent references. Real Stripe test-mode
-tests (3, gated by `STRIPE_SECRET_KEY` via `describe.skipIf` — not
-fabricated, see "Runtime Verification" below) are unchanged from initial
-IMP-035. Full pre-existing suite (Order, Checkout, Catalog, Identity,
+`stripe-payment-provider.test.ts`: 26 tests (23 passing + 3 gated
+real-Stripe tests) — rewritten around a `freshInput`/`staleInput` fixture
+pair to directly express "within the safe window" vs "beyond it"
+scenarios, plus a fake Stripe client that now also models `retrieve` (a
+separate, independently mutable "live status" store from what `create`
+returns, via a new `cancelPaymentIntent` test helper) so out-of-band
+cancellation can be simulated without waiting for anything. Contract
+tests: amount/currency/metadata sent on creation, `paymentId` → idempotency
+key, `PaymentIntent.id` → `providerReference`, a Stripe error on `create`,
+`retrieve`, AND `search` each independently mapped to `PROVIDER_ERROR`,
+five Stripe error subclasses collapsing to the same result, a non-Stripe
+error propagating, the result's exact key shape, `getStripePaymentProvider()`'s
+missing-key behavior, and the `server-only` boundary. Idempotency-key-
+stability: same `paymentId` → same key; different → different (using
+`freshInput`, since `staleInput` never reaches `create` at all under the
+new design). Safety-over-liveness tests (CR-035-FIX-01, the core of this
+fix): within-window calls create directly without ever searching;
+same-request retry and genuine concurrent overlap (barrier-gated, same
+technique as the CR-034 P3 fix) both still converge via native idempotency;
+beyond-window with an existing live match reuses it without calling
+`create`; **the primary acceptance criterion (Code Review ticket §26)** —
+beyond-window with Search finding NOTHING now asserts `PROVIDER_ERROR`
+with zero `create` calls, replacing the old (CR-035-01-era, since proven
+insufficient) behavior that fell through to `create`; multiple matches and
+a `has_more` page both still fail safely; amount/currency mismatches both
+still fail safely; different Payments still produce independent
+references. Canceled-PaymentIntent tests (CR-035-FIX-02, new describe
+block): a canceled-only Search match now refuses rather than authorizing
+a fresh `create`; a canceled match alongside a genuine live one is still
+excluded without manufacturing a false ambiguous result; an idempotent
+`create` replay whose PaymentIntent was canceled out-of-band between calls
+is caught by the new `retrieve`-based live-status check and refused.
+Real Stripe test-mode tests (3, gated by `STRIPE_SECRET_KEY` via
+`describe.skipIf`) updated only to supply the new required
+`providerStartAttemptedAt` field.
+
+`process-payment.test.ts`: 4 new tests. `processPayment` durably claims
+via `claimProviderStartAttempt` BEFORE ever calling the provider, and
+passes the claimed timestamp through; if the claim itself cannot be
+established (a fake repository configured to throw, modeling a database
+outage), the provider is never contacted at all (Test 14 from the Code
+Review ticket's matrix); a retry after a simulated local persistence
+failure reuses the SAME already-claimed timestamp rather than re-claiming
+a fresh one (Tests 4/5/13); and — against the REAL repository, with a
+barrier-gated fake provider forcing genuine overlap (Tests 3/16) — two
+concurrent `processPayment` calls for a brand-new Payment converge on the
+identical durably-claimed `providerStartAttemptedAt`, proving the atomic
+claim's Postgres-level concurrency guarantee directly, not just through
+the adapter's own behavior.
+
+`payment-provider.ts`/`payment-repository.ts`/`initialize-payment.test.ts`:
+fixture and structural-proof updates only (the new
+`providerStartAttemptedAt` field/method), no behavioral test changes —
+these files' own logic is otherwise untouched by this fix.
+
+Full pre-existing suite (Order, Checkout, Catalog, Identity,
 CR-029/030/031, IMP-032/033/034/034-FIX) re-run and confirmed passing
 unmodified.
 
 Runtime Verification
 
 No `STRIPE_SECRET_KEY` was available in this implementation environment,
-for either the initial IMP-035 work or this fix. The 3 real-Stripe
+across all of IMP-035, IMP-035-FIX, and IMP-035-FIX-2. The 3 real-Stripe
 test-mode tests remain implemented and gated correctly
 (`describe.skipIf(!process.env.STRIPE_SECRET_KEY)`) but were **skipped**,
 not run and not fabricated as passing. `pnpm test` reports these 3 tests
-as explicitly skipped. Real Stripe test-mode verification of both the
-original adapter behavior and the new reconciliation logic against
-Stripe's actual API remains genuinely pending until someone runs the
-suite with a real Stripe test-mode secret key configured.
+as explicitly skipped. Real Stripe test-mode verification of the
+safety-over-liveness branching and the `retrieve`-based cancellation check
+against Stripe's actual API remains genuinely pending until someone runs
+the suite with a real Stripe test-mode secret key configured.
 
 Validation Results
 
-Initial IMP-035: `pnpm test` 309 passing + 3 skipped, 27 test files.
-IMP-035-FIX: `pnpm test`: **323 passing + 3 skipped** (326 total), 27 test
-files, zero regressions in the pre-existing 309 (14 net new passing tests
-in `stripe-payment-provider.test.ts`, replacing the prior 13). `pnpm
-typecheck`: clean — including confirming the narrowed
-`StripePaymentIntentsClient` interface (now including `search`) is
-structurally satisfied by a real `Stripe` instance. `pnpm lint`: clean.
+Initial IMP-035: `pnpm test` 309 passing + 3 skipped. IMP-035-FIX: 323
+passing + 3 skipped (326 total). IMP-035-FIX-2: `pnpm test`: **328 passing
++ 3 skipped** (331 total), 27 test files, zero regressions in the
+pre-existing 323. `pnpm typecheck`: clean — including confirming the
+narrowed `StripePaymentIntentsClient` interface (now including `retrieve`)
+is structurally satisfied by a real `Stripe` instance, and that every
+existing `StartPaymentInput`/`Payment` fixture across the whole Payment
+module compiles against the new required fields. `pnpm lint`: clean.
 `pnpm format:check`: limited to the same two pre-existing, unrelated
 warnings already noted for prior milestones (`next.config.ts`,
 `pnpm-workspace.yaml`). `pnpm build`: succeeded, all 15 routes
 compiled/prerendered, with no `STRIPE_SECRET_KEY` set — the lazy-wiring
 design still does not force a Stripe credential requirement onto the
-build.
+build; `prisma generate` picked up the new migration cleanly.
+
+One real defect was found and fixed during this milestone's own
+validation, not by Code Review: an early implementation returned a
+`retrieve`-derived promise directly from inside the adapter's `try` block
+without `await`, which let a rejected `retrieve` call bypass the
+surrounding `catch` (a classic async/await subtlety — `return promise`
+inside `try` does not route a later rejection through that block's
+`catch`, only `return await promise` does). Caught immediately by the
+test written specifically to exercise a `retrieve` failure; fixed before
+proceeding.
 
 What Is Deliberately Deferred
 
 No webhook, no route, no UI, no `confirmPayment`/refund/cancellation, no
 second provider, no customer payment-method management, no
-`PaymentAttempt`, no retry/queue framework, no schema migration
-(`Payment.providerReference` is reused as-is, no new column/table), no new
-`PaymentStatus` value or transition — `processPayment` still only attaches
-`providerReference` while the Payment stays `PENDING`, exactly as
-IMP-034/IMP-034-FIX left it. Real Stripe test-mode verification (above) is
-implemented but unexecuted pending real credentials — this now includes
-verifying the reconciliation `search` path against Stripe's actual API,
-not just the original `create` path. The residual risk of a Stripe-side
-outage delaying `search` indexing for longer than the idempotency key's
-own retention window is documented as a known, unavoidable limitation
-(see the adapter's own doc comment) rather than assumed away. A future
-milestone decides how `getStripePaymentProvider()`/`processPayment`
-actually get called from a transport, and is responsible for turning
-Stripe's eventual confirmation (most likely a webhook) into a real status
-transition.
+`PaymentAttempt`, no retry/queue framework, no new `PaymentStatus` value
+or transition — `processPayment` still only attaches `providerReference`
+while the Payment stays `PENDING`, exactly as IMP-034/IMP-034-FIX left it.
+(The one schema change this milestone DID make — `providerStartAttemptedAt`
+— is documented under "Database" above; it is the durable marker the
+architecture decision process concluded was genuinely necessary, not
+scope creep.) Real Stripe test-mode verification (above) is implemented
+but unexecuted pending real credentials — this now includes verifying the
+20-hour safety threshold and the `retrieve`-based cancellation check
+against Stripe's actual API, not just `create`/`search`. The residual risk
+of a Stripe-side outage delaying `search` indexing for longer than the
+idempotency key's own retention window is documented as a known,
+unavoidable limitation (see the adapter's own doc comment) rather than
+assumed away — CR-035-FIX-01 closes the "empty Search result treated as
+proof" gap, but cannot make Stripe's own eventual-consistency guarantee
+stronger than Stripe itself offers. A Payment that hits a provider issue
+after its first-start claim is set (e.g. a clean `create` failure, or an
+inconclusive reconciliation) has no automatic "un-claim" path in this
+milestone — deliberately: distinguishing which failures are safe to
+un-claim from which are not was judged out of scope and a potential
+safety hazard in its own right (see the adapter's own doc comment); such
+a Payment durably requires a FUTURE reconciliation/recovery mechanism
+(administrative tooling, or a later milestone) to ever retry, consistent
+with this milestone's governing principle (Code Review ticket): NO
+DUPLICATE EXTERNAL PAYMENT over FAST RECOVERY. A future milestone decides
+how `getStripePaymentProvider()`/`processPayment` actually get called
+from a transport, and is responsible both for turning Stripe's eventual
+confirmation (most likely a webhook) into a real status transition, and
+for whatever recovery/reconciliation tooling a permanently-claimed,
+never-started Payment eventually needs.
 
 13. Current Production State
 
@@ -1886,7 +2105,7 @@ IMP-031 — Checkout Submission Idempotency (incl. IMP-031-FIX / CR-031)	COMPLET
 IMP-032 — Payment Foundation	COMPLETED
 IMP-033 — Payment Provider Port	COMPLETED
 IMP-034 — Payment Processing Application Flow (incl. IMP-034-FIX / CR-034)	COMPLETED
-IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01)	COMPLETED — real Stripe test-mode verification pending (see Section 12)
+IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01, IMP-035-FIX-2 / CR-035-FIX-01, CR-035-FIX-02)	COMPLETED — real Stripe test-mode verification pending (see Section 12)
 Next milestone	NOT YET APPROVED
 22. Source of Truth
 

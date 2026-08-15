@@ -53,6 +53,16 @@ export interface Payment {
   currency: string;
   /** Opaque future-provider reference; always `null` until a provider integration exists. */
   providerReference: string | null;
+  /**
+   * When a provider-start was first durably attempted for this Payment
+   * (IMP-035-FIX-2) — `null` means definitely never attempted; once set,
+   * it is never reset, regardless of whether `providerReference` ever
+   * ends up persisted. This is what lets the system tell "never started"
+   * apart from "may have started, but we lost the reference" after a
+   * crash — `providerReference` alone cannot, since it stays `null` in
+   * both cases. See `PaymentRepository.claimProviderStartAttempt`.
+   */
+  providerStartAttemptedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }

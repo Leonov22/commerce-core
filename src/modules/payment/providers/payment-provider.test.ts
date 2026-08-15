@@ -136,6 +136,7 @@ const validInput: StartPaymentInput = {
   paymentId: "payment-1",
   amountMinor: 24800,
   currency: "USD",
+  providerStartAttemptedAt: new Date(),
 };
 
 describe("PaymentProvider contract", () => {
@@ -158,12 +159,12 @@ describe("PaymentProvider contract", () => {
     expect(result).toEqual({ ok: false, error: "PROVIDER_ERROR" });
   });
 
-  it("receives exactly the provider-neutral fields — paymentId, amountMinor, currency — and nothing else required", async () => {
+  it("receives exactly the provider-neutral fields — paymentId, amountMinor, currency, providerStartAttemptedAt — and nothing else required", async () => {
     const { provider, calls } = makeFakePaymentProvider();
 
     await provider.startPayment(validInput);
 
-    expect(calls).toEqual([{ paymentId: "payment-1", amountMinor: 24800, currency: "USD" }]);
+    expect(calls).toEqual([validInput]);
   });
 
   it("is callable through the port type alone, without any reference to a concrete implementation", async () => {
@@ -206,11 +207,24 @@ describe("PaymentProvider contract", () => {
  */
 describe("PaymentProvider contract — provider-side idempotency (IMP-034-FIX)", () => {
   it("the same paymentId always produces the same StartPaymentInput shape — there is no field a caller could vary between retries", () => {
-    // Structural proof: `StartPaymentInput` has exactly three fields, all
-    // derived from the persisted Payment, and no separate idempotency-key
-    // field exists for a caller to accidentally vary.
-    const input: StartPaymentInput = { paymentId: "payment-1", amountMinor: 100, currency: "USD" };
-    expect(Object.keys(input).sort()).toEqual(["amountMinor", "currency", "paymentId"]);
+    // Structural proof: `StartPaymentInput` has exactly four fields, all
+    // derived from the persisted Payment (IMP-035-FIX-2 adds
+    // `providerStartAttemptedAt`, also derived — via
+    // `claimProviderStartAttempt` — never caller-supplied), and no
+    // separate idempotency-key field exists for a caller to accidentally
+    // vary.
+    const input: StartPaymentInput = {
+      paymentId: "payment-1",
+      amountMinor: 100,
+      currency: "USD",
+      providerStartAttemptedAt: new Date(),
+    };
+    expect(Object.keys(input).sort()).toEqual([
+      "amountMinor",
+      "currency",
+      "paymentId",
+      "providerStartAttemptedAt",
+    ]);
   });
 
   it("a compliant provider returns the SAME providerReference for repeated calls sharing the same paymentId (simulates a retry after local persistence failure — CR-034-02)", async () => {
@@ -219,6 +233,7 @@ describe("PaymentProvider contract — provider-side idempotency (IMP-034-FIX)",
       paymentId: "payment-1",
       amountMinor: 24800,
       currency: "USD",
+      providerStartAttemptedAt: new Date(),
     };
 
     const first = await provider.startPayment(input);
@@ -246,6 +261,7 @@ describe("PaymentProvider contract — provider-side idempotency (IMP-034-FIX)",
       paymentId: "payment-1",
       amountMinor: 24800,
       currency: "USD",
+      providerStartAttemptedAt: new Date(),
     };
 
     const [a, b] = await Promise.all([provider.startPayment(input), provider.startPayment(input)]);

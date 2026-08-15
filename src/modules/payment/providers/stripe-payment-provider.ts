@@ -14,11 +14,13 @@ import type {
  * tests can inject a fake client without constructing a real `Stripe`
  * instance (which requires a syntactically valid secret key).
  *
- * IMP-035-FIX (CR-035-01) adds `search`, verified against the real SDK's
- * `PaymentIntentSearchParams`/`ApiSearchResult` shapes — `search` resolves
- * to `{ data: PaymentIntent[], has_more: boolean }`, and each result's
- * `status`/`amount`/`currency` fields are used for the reconciliation
- * safety checks below.
+ * IMP-035-FIX (CR-035-01) added `search`, verified against the real SDK's
+ * `PaymentIntentSearchParams`/`ApiSearchResult` shapes. IMP-035-FIX-2 adds
+ * `retrieve` — a plain by-ID lookup, NOT part of Stripe's eventually
+ * consistent Search API (Stripe's own docs group direct retrieval with
+ * `list` as strongly, immediately consistent) — used to confirm a
+ * PaymentIntent's CURRENT live status after an idempotent `create` replay,
+ * whose response body can otherwise reflect stale, original-request data.
  */
 export interface StripePaymentIntentsClient {
   paymentIntents: {
@@ -26,6 +28,7 @@ export interface StripePaymentIntentsClient {
       params: { amount: number; currency: string; metadata: Record<string, string> },
       options: { idempotencyKey: string },
     ): Promise<{ id: string }>;
+    retrieve(id: string): Promise<{ id: string; status: string }>;
     search(params: { query: string }): Promise<{
       data: { id: string; amount: number; currency: string; status: string }[];
       has_more: boolean;
@@ -43,13 +46,36 @@ export interface StripePaymentIntentsClient {
  * per-account idempotency-key space (which is shared across every POST
  * endpoint on the account) — it is derived from `paymentId` alone, so it
  * is exactly as stable as `paymentId` itself.
- *
- * IMP-035-FIX (CR-035-01): this key remains the FIRST line of defense
- * against duplicate external operations (see the module-level doc comment
- * below for why it is not sufficient BY ITSELF).
  */
 function toStripeIdempotencyKey(paymentId: string): string {
   return `payment_${paymentId}`;
+}
+
+/**
+ * Stripe documents its `Idempotency-Key` as honored for "at least 24
+ * hours", with no guarantee beyond that — a key MAY be pruned after this
+ * point, silently (a `create` reusing a pruned key does not error, it just
+ * creates a genuinely new PaymentIntent). This adapter trusts native
+ * idempotency alone only while comfortably inside that window; a
+ * deliberately conservative margin (4 hours) is subtracted so that clock
+ * skew, request latency, or Stripe pruning slightly earlier than its own
+ * stated minimum can never push a call across the boundary in the unsafe
+ * direction.
+ */
+const NATIVE_IDEMPOTENCY_SAFE_WINDOW_MS = 20 * 60 * 60 * 1000;
+
+/**
+ * IMP-035-FIX-2: whether `startPayment` may trust Stripe's native
+ * idempotency key alone, or must instead positively reconcile against
+ * Stripe's own records before ever calling `create`. This is the
+ * Stripe-specific interpretation of the provider-neutral
+ * `StartPaymentInput.providerStartAttemptedAt` timestamp the port
+ * documents — see `payment-provider.ts`'s "SAFETY OVER LIVENESS"
+ * invariant. A DIFFERENT provider adapter would apply its own retention
+ * assumption here; this constant is deliberately private to this file.
+ */
+function isReconciliationRequired(providerStartAttemptedAt: Date): boolean {
+  return Date.now() - providerStartAttemptedAt.getTime() >= NATIVE_IDEMPOTENCY_SAFE_WINDOW_MS;
 }
 
 /**
@@ -64,26 +90,31 @@ function escapeStripeSearchValue(value: string): string {
 }
 
 /**
- * IMP-035-FIX (CR-035-01): looks up any existing Stripe PaymentIntent
- * already associated with `paymentId` via Stripe's metadata search, using
- * the stable identity `startPayment` also writes into every PaymentIntent
- * it creates (see `startPayment` below). Returns:
+ * IMP-035-FIX (CR-035-01), tightened by IMP-035-FIX-2 (CR-035-FIX-01):
+ * looks up any existing Stripe PaymentIntent already associated with
+ * `paymentId` via Stripe's metadata search, using the stable identity
+ * `startPayment` writes into every PaymentIntent it creates. Returns:
  *
- * - `{ outcome: "none" }` — no existing PaymentIntent; safe to create one.
- * - `{ outcome: "found", paymentIntent }` — exactly one non-canceled match;
- *   the caller must still validate its amount/currency before reusing it
- *   (see `startPayment`).
- * - `{ outcome: "ambiguous" }` — more than one non-canceled match (or more
- *   matches than fit on a single page, which would itself be abnormal).
- *   Reconciliation cannot safely guess which one is authoritative; the
- *   caller must fail rather than pick one, per the architecture's explicit
- *   requirement not to silently hide a possible duplicate external
- *   payment.
+ * - `{ outcome: "found", paymentIntent }` — exactly one non-canceled
+ *   match; the caller must still validate its amount/currency before
+ *   reusing it (see `startPayment`).
+ * - `{ outcome: "ambiguous" }` — more than one non-canceled match, or more
+ *   matches than fit on a single page (abnormal). Reconciliation cannot
+ *   safely guess which one is authoritative.
+ * - `{ outcome: "none" }` — no non-canceled match found. IMP-035-FIX-2:
+ *   this NO LONGER means "safe to create" — see `startPayment`, which
+ *   only calls this function when it cannot otherwise prove safety, and
+ *   therefore must treat an empty result as inconclusive, not as a
+ *   negative proof.
  *
- * `canceled` PaymentIntents are excluded before counting matches: a
- * canceled operation is unambiguously dead and must never be reused as a
- * live reference, and its presence alongside a genuine live match must not
- * manufacture a false "ambiguous" result.
+ * `canceled` PaymentIntents are excluded before counting matches (CR-035-
+ * FIX-02): a canceled operation must never be silently reused as if it
+ * were live, but its mere presence must also not manufacture a false
+ * "ambiguous" result alongside a genuine live match. Search's own returned
+ * `status` field reflects Stripe's LATEST value even though the query
+ * itself matches against a cached index (per Stripe's documented "Data
+ * mismatches" behavior), so this filter is not itself subject to
+ * eventual-consistency staleness.
  */
 async function reconcileExistingPaymentIntent(
   stripeClient: StripePaymentIntentsClient,
@@ -111,62 +142,76 @@ async function reconcileExistingPaymentIntent(
  * (IMP-035) — the first concrete adapter for the port.
  *
  * ═══════════════════════════════════════════════════════════════════════
- * DURABLE RECONCILIATION BEYOND NATIVE IDEMPOTENCY (IMP-035-FIX / CR-035-01)
+ * SAFETY OVER LIVENESS BEYOND NATIVE RETENTION (IMP-035-FIX-2 / CR-035-FIX-01)
  * ═══════════════════════════════════════════════════════════════════════
- * Stripe's `Idempotency-Key` (used below via `toStripeIdempotencyKey`) is
- * only guaranteed to be honored for "at least 24 hours" — Stripe may prune
- * it after that, silently: a `create` call reusing a pruned key does not
- * error, it simply creates a genuinely new PaymentIntent. A caller-supplied
- * `paymentId` retried long after the original attempt (e.g. a Payment
- * whose local `providerReference` write failed and was only retried much
- * later) could therefore create a second external operation, exactly the
- * bug IMP-034-FIX closed for the SHORT/concurrent-call window.
+ * IMP-035-FIX (CR-035-01) added Stripe Search reconciliation, but Code
+ * Review correctly rejected it as insufficient on its own: Search is
+ * eventually consistent (Stripe's own docs: "unsafe for read-after-write",
+ * typically caught up in under a minute, but with NO guarantee during an
+ * outage), so "Search found nothing" can never be trusted as PROOF that no
+ * PaymentIntent exists — only as a hint. A retry occurring long after the
+ * original attempt (once the idempotency key may have been pruned) that
+ * relied on an empty Search result to justify `create` could still produce
+ * a second, genuinely duplicate PaymentIntent.
  *
- * `startPayment` closes the remaining gap by treating `Payment.providerReference`
- * (once persisted) as the actual durable source of truth for "does this
- * Payment already have an external operation", and — for the window before
- * that local write happens or when it's lost — reconciling against Stripe
- * itself via `paymentIntents.search`, keyed on a stable `paymentId` value
- * this adapter writes into every PaymentIntent's `metadata` at creation
- * time. This is checked FIRST, before ever calling `create`:
+ * This function now applies the port's "SAFETY OVER LIVENESS" invariant
+ * (see `payment-provider.ts`) explicitly:
  *
- *   1. Search for a PaymentIntent whose `metadata.paymentId` matches.
- *   2. Exactly one non-canceled match, amount/currency verified: reuse it.
- *   3. No match: fall through to `create` (protected by the idempotency
- *      key exactly as before).
- *   4. More than one match: refuse to guess — `PROVIDER_ERROR`.
+ *   `input.providerStartAttemptedAt` (IMP-035-FIX-2) records, durably and
+ *   locally, WHEN a start was first attempted for this Payment — it is
+ *   ALWAYS set by the time this adapter sees it (`processPayment` claims
+ *   it before ever calling this port), so `startPayment` can always
+ *   determine one of exactly two states:
  *
- * Why this is safe despite Stripe's own documented warning that "Search"
- * is eventually consistent and unsafe for read-after-write flows (typically
- * caught up in under a minute, per Stripe's docs): the two mechanisms'
- * dangerous windows do not overlap.
+ *   1. STILL WITHIN Stripe's native idempotency retention window
+ *      (`isReconciliationRequired` returns `false`) — trusting `create`'s
+ *      own idempotency-key handling alone is safe, exactly as IMP-035
+ *      originally did. `create` is called directly, WITHOUT searching
+ *      first (an unnecessary Search call would add latency without
+ *      improving safety here).
  *
- *   - A retry within roughly the first minute after the original `create`
- *     is exactly the window where the idempotency key is guaranteed fresh
- *     (valid for at least 24 hours) — even if `search` hasn't indexed the
- *     PaymentIntent yet and reports no match, the retry falls through to
- *     `create`, which itself returns Stripe's cached result for that key.
- *     No duplicate is created either way.
- *   - A retry long enough after the original attempt for the idempotency
- *     key to plausibly have been pruned (on the order of a day or more) is
- *     also long enough that `search`'s eventual-consistency lag (under a
- *     minute under normal conditions) has certainly resolved.
+ *   2. POSSIBLY BEYOND that window (`isReconciliationRequired` returns
+ *      `true`) — `create`'s own idempotency key can no longer be trusted
+ *      alone. Reconciliation via `search` is attempted, but an EMPTY
+ *      result is now treated as INCONCLUSIVE, not as permission to
+ *      create: `startPayment` returns `PROVIDER_ERROR` rather than ever
+ *      calling `create` in this state. A genuinely fresh Payment can only
+ *      ever reach this branch after already having a
+ *      `providerStartAttemptedAt` old enough to be suspect, so refusing
+ *      here never blocks an actual first-ever payment attempt — see
+ *      `processPayment`'s "DURABLE FIRST-START CLAIM" for why state 1
+ *      above is reachable for every genuinely new Payment.
  *
- * Concurrency (IMP-034-FIX / CR-034-01) is unaffected: two genuinely
- * concurrent `startPayment` calls for a brand-new `paymentId` both search
- * and (most likely) both find nothing yet, then both call `create` with
- * the identical idempotency key — Stripe's synchronous, immediately-
- * consistent idempotency-key handling (not `search`) is what makes that
- * safe, exactly as it did before this fix. `search` never has to be the
- * thing that prevents a concurrent duplicate; it only has to prevent a
- * DELAYED one, and by the time it matters for that, it has had time to
- * catch up.
+ * This closes CR-035-FIX-01: the dangerous sequence (provider succeeds,
+ * local persistence fails, key expires, Search temporarily returns zero,
+ * retry) now ends in a safe, controlled `PROVIDER_ERROR` — never a second
+ * `create` call — because reconciliation being required and inconclusive
+ * is a terminal, non-create outcome, not a fallback to native idempotency.
  *
- * A residual, unavoidable risk remains only in the pathological case where
- * a Stripe-side outage delays `search` indexing for longer than the
- * idempotency key's own retention window — Stripe does not offer a
- * stronger read-after-write guarantee for this exact scenario. This is
- * documented as a known limitation, not silently assumed away.
+ * Concurrency (IMP-034-FIX / CR-034-01) is preserved: two genuinely
+ * concurrent `startPayment` calls for a brand-new Payment both observe the
+ * SAME (freshly claimed) `providerStartAttemptedAt` — `processPayment`'s
+ * atomic claim guarantees this — so both compute `isReconciliationRequired
+ * === false` and both call `create` with the identical idempotency key;
+ * Stripe's synchronous idempotency-key handling converges them, exactly as
+ * before this fix.
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * CANCELED PAYMENTINTENT SEMANTICS (CR-035-FIX-02)
+ * ═══════════════════════════════════════════════════════════════════════
+ * A canceled PaymentIntent must never be silently treated as either (a) a
+ * valid reusable reference, or (b) proof that no live PaymentIntent
+ * exists, authorizing a fresh `create`. Both branches above now handle
+ * this: `reconcileExistingPaymentIntent` excludes canceled matches before
+ * counting, so a canceled-only Search result becomes `{ outcome: "none" }`
+ * — in the reconciliation-required branch, that is refused exactly like
+ * any other empty result, never treated as "safe, nothing exists, create
+ * one". In the direct-`create` branch, an idempotent Stripe response can
+ * be a REPLAY of an earlier request's body (Stripe's idempotency cache
+ * stores the ORIGINAL response, not the object's current live state) —
+ * this adapter therefore always `retrieve`s the resulting PaymentIntent's
+ * CURRENT status (a strongly consistent, non-Search call) before returning
+ * it, and refuses (`PROVIDER_ERROR`) if it is `canceled`.
  *
  * Takes an already-constructed Stripe client (or a fake implementing the
  * same narrow `StripePaymentIntentsClient` shape) rather than constructing
@@ -184,24 +229,50 @@ async function reconcileExistingPaymentIntent(
 export function createStripePaymentProvider(
   stripeClient: StripePaymentIntentsClient,
 ): PaymentProvider {
+  async function reuseIfLive(paymentIntentId: string): Promise<StartPaymentResult> {
+    const live = await stripeClient.paymentIntents.retrieve(paymentIntentId);
+    if (live.status === "canceled") {
+      console.error(
+        "[payment/stripe-payment-provider] resolved Stripe PaymentIntent is canceled; refusing to treat it as a valid provider start",
+        { paymentIntentId },
+      );
+      return { ok: false, error: "PROVIDER_ERROR" };
+    }
+    return { ok: true, providerReference: paymentIntentId };
+  }
+
   return {
     async startPayment(input: StartPaymentInput): Promise<StartPaymentResult> {
       try {
         const currency = input.currency.toLowerCase();
-        const reconciled = await reconcileExistingPaymentIntent(stripeClient, input.paymentId);
 
-        if (reconciled.outcome === "ambiguous") {
-          console.error(
-            "[payment/stripe-payment-provider] multiple Stripe PaymentIntents found for paymentId; refusing to guess which one is authoritative",
-            { paymentId: input.paymentId },
-          );
-          return { ok: false, error: "PROVIDER_ERROR" };
-        }
+        if (isReconciliationRequired(input.providerStartAttemptedAt)) {
+          const reconciled = await reconcileExistingPaymentIntent(stripeClient, input.paymentId);
 
-        if (reconciled.outcome === "found") {
+          if (reconciled.outcome === "ambiguous") {
+            console.error(
+              "[payment/stripe-payment-provider] multiple Stripe PaymentIntents found for paymentId; refusing to guess which one is authoritative",
+              { paymentId: input.paymentId },
+            );
+            return { ok: false, error: "PROVIDER_ERROR" };
+          }
+
+          if (reconciled.outcome === "none") {
+            // IMP-035-FIX-2 / CR-035-FIX-01: native idempotency can no
+            // longer be trusted, and reconciliation found nothing —
+            // SAFETY OVER LIVENESS: an empty Search result never proves a
+            // negative, so this does NOT fall through to `create`.
+            console.error(
+              "[payment/stripe-payment-provider] cannot safely determine whether a Stripe PaymentIntent already exists for this paymentId (native idempotency window elapsed, reconciliation inconclusive); refusing to create a new one",
+              { paymentId: input.paymentId },
+            );
+            return { ok: false, error: "PROVIDER_ERROR" };
+          }
+
+          // reconciled.outcome === "found"
           const existing = reconciled.paymentIntent;
-          // IMP-035-FIX §11: never blindly trust a metadata match — verify
-          // the found PaymentIntent actually represents the same payable
+          // Never blindly trust a metadata match — verify the found
+          // PaymentIntent actually represents the same payable
           // amount/currency as the authoritative Payment before reusing
           // it. A mismatch here would only happen if Stripe metadata were
           // ever reused incorrectly; failing safely is strictly better
@@ -213,16 +284,21 @@ export function createStripePaymentProvider(
             );
             return { ok: false, error: "PROVIDER_ERROR" };
           }
+          // No extra `retrieve` needed here (unlike the direct-`create`
+          // path below): `existing.status` already reflects Stripe's
+          // LATEST value, not a cached one — Search's query MATCHING can
+          // lag, but the fields it returns for a match do not (see
+          // `reconcileExistingPaymentIntent`'s own doc comment) — and
+          // `reconcileExistingPaymentIntent` has already excluded
+          // `canceled` matches before this point is ever reached.
           return { ok: true, providerReference: existing.id };
         }
 
-        // reconciled.outcome === "none": no existing PaymentIntent found —
-        // create one. `metadata.paymentId` is what a later reconciliation
-        // search (by this Payment or a concurrent/retried call) matches
-        // against; the idempotency key is what protects THIS specific
-        // call against being duplicated by a concurrent or near-term
-        // retry call before either has had a chance to persist locally or
-        // become searchable.
+        // Still within the native idempotency retention window — safe to
+        // rely on `create`'s own idempotency-key handling directly,
+        // without searching first. `metadata.paymentId` is still written,
+        // so a LATER call (once outside this window) can reconcile
+        // against it.
         const paymentIntent = await stripeClient.paymentIntents.create(
           {
             amount: input.amountMinor,
@@ -231,13 +307,19 @@ export function createStripePaymentProvider(
           },
           { idempotencyKey: toStripeIdempotencyKey(input.paymentId) },
         );
-        return { ok: true, providerReference: paymentIntent.id };
+        // `await` (not a bare `return`) is required here: a rejected
+        // promise returned bare from inside this `try` block would bypass
+        // the `catch` below entirely (a well-known async/await subtlety),
+        // which would defeat the whole point of `reuseIfLive`'s own
+        // `retrieve` call being allowed to fail like any other Stripe
+        // call.
+        return await reuseIfLive(paymentIntent.id);
       } catch (error) {
         // `PaymentProvider.startPayment` must never throw (see the "never
         // throwing" contract test in payment-provider.test.ts) — every
         // Stripe-originated failure (a declined card, an invalid request,
-        // a network error, a rate limit, a search failure) is a normal,
-        // expected outcome for this port, collapsed to the single
+        // a network error, a rate limit, a search/retrieve failure) is a
+        // normal, expected outcome for this port, collapsed to the single
         // PROVIDER_ERROR code the contract already defines. Only a
         // genuinely unexpected, non-Stripe error (a bug in this adapter
         // itself) is allowed to propagate.

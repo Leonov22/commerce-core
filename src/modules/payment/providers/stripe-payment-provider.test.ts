@@ -12,21 +12,31 @@ import type { StartPaymentInput } from "@/modules/payment/providers/payment-prov
 
 type FakePaymentIntent = { id: string; amount: number; currency: string; status: string };
 
+const ONE_HOUR_MS = 60 * 60 * 1000;
+/** Comfortably inside the adapter's native-idempotency safe window. */
+const FRESH_ATTEMPT = new Date();
+/** Comfortably beyond it — simulates a retry after Stripe may have pruned the idempotency key. */
+const STALE_ATTEMPT = new Date(Date.now() - 25 * ONE_HOUR_MS);
+
 /**
  * A fake `StripePaymentIntentsClient` that models Stripe's REAL behavior
- * closely enough to prove the adapter's reconciliation logic, not just its
- * happy path:
+ * closely enough to prove the adapter's safety logic, not just its happy
+ * path:
  *
  * - `create` honors native idempotency the way Stripe actually does: a
- *   repeated call with the SAME `idempotencyKey` returns the cached
- *   PaymentIntent rather than creating a new one — UNLESS that key has
- *   been "forgotten" via `forgetIdempotencyKey` below, which models a
- *   pruned/expired key (IMP-035-FIX §7/§9) without waiting 24+ hours.
+ *   repeated call with the SAME `idempotencyKey` returns a REPLAY of the
+ *   ORIGINAL response (just `{ id }`, nothing else — real Stripe does not
+ *   re-derive the response from current live state) — unless that key has
+ *   been "forgotten" via `forgetIdempotencyKey`, modeling a pruned/expired
+ *   key without waiting 24+ hours.
+ * - `retrieve` is a SEPARATE, always-live lookup by id — independent of
+ *   what `create` last returned — so `cancelPaymentIntent` can simulate a
+ *   PaymentIntent being canceled out-of-band (e.g. via the Stripe
+ *   dashboard) sometime after creation, exactly the scenario CR-035-FIX-02
+ *   exists to handle.
  * - `search` is a separate, independently seedable data source
  *   (`seedSearchResults`) — exactly like real Stripe, where `search`'s
- *   results are NOT automatically kept in sync with what `create` has
- *   produced (its own eventual-consistency lag is what IMP-035-FIX's
- *   design has to be safe against).
+ *   results are NOT automatically kept in sync with `create`/`retrieve`.
  */
 function makeFakeStripeClient(): {
   client: StripePaymentIntentsClient;
@@ -35,22 +45,28 @@ function makeFakeStripeClient(): {
     idempotencyKey: string;
   }[];
   searchCalls: { query: string }[];
+  retrieveCalls: string[];
   seedSearchResults: (results: FakePaymentIntent[], options?: { hasMore?: boolean }) => void;
   forgetIdempotencyKey: (idempotencyKey: string) => void;
+  cancelPaymentIntent: (id: string) => void;
   setCreateThrows: (error: Stripe.errors.StripeError | undefined) => void;
   setSearchThrows: (error: Stripe.errors.StripeError | undefined) => void;
+  setRetrieveThrows: (error: Stripe.errors.StripeError | undefined) => void;
 } {
   const createCalls: {
     params: { amount: number; currency: string; metadata: Record<string, string> };
     idempotencyKey: string;
   }[] = [];
   const searchCalls: { query: string }[] = [];
-  const paymentIntentsByIdempotencyKey = new Map<string, FakePaymentIntent>();
+  const retrieveCalls: string[] = [];
+  const paymentIntentIdByIdempotencyKey = new Map<string, string>();
+  const paymentIntentsById = new Map<string, FakePaymentIntent>();
   let nextId = 0;
   let searchResults: FakePaymentIntent[] = [];
   let searchHasMore = false;
   let createThrows: Stripe.errors.StripeError | undefined;
   let searchThrows: Stripe.errors.StripeError | undefined;
+  let retrieveThrows: Stripe.errors.StripeError | undefined;
 
   const client: StripePaymentIntentsClient = {
     paymentIntents: {
@@ -59,15 +75,23 @@ function makeFakeStripeClient(): {
         if (searchThrows) throw searchThrows;
         return { data: searchResults, has_more: searchHasMore };
       },
+      async retrieve(id) {
+        retrieveCalls.push(id);
+        if (retrieveThrows) throw retrieveThrows;
+        const paymentIntent = paymentIntentsById.get(id);
+        if (!paymentIntent) throw new Stripe.errors.StripeInvalidRequestError();
+        return { id: paymentIntent.id, status: paymentIntent.status };
+      },
       async create(params, requestOptions) {
         createCalls.push({ params, idempotencyKey: requestOptions.idempotencyKey });
         if (createThrows) throw createThrows;
-        const existing = paymentIntentsByIdempotencyKey.get(requestOptions.idempotencyKey);
-        if (existing) {
+        const existingId = paymentIntentIdByIdempotencyKey.get(requestOptions.idempotencyKey);
+        if (existingId) {
           // Real Stripe behavior: a repeated call with a still-remembered
-          // idempotency key returns the ORIGINAL response, ignoring these
-          // params entirely.
-          return { id: existing.id };
+          // idempotency key replays the ORIGINAL response body verbatim —
+          // it does not reflect anything that has happened to the object
+          // since (e.g. a later cancellation).
+          return { id: existingId };
         }
         nextId += 1;
         const created: FakePaymentIntent = {
@@ -76,7 +100,8 @@ function makeFakeStripeClient(): {
           currency: params.currency,
           status: "requires_payment_method",
         };
-        paymentIntentsByIdempotencyKey.set(requestOptions.idempotencyKey, created);
+        paymentIntentIdByIdempotencyKey.set(requestOptions.idempotencyKey, created.id);
+        paymentIntentsById.set(created.id, created);
         return { id: created.id };
       },
     },
@@ -86,12 +111,17 @@ function makeFakeStripeClient(): {
     client,
     createCalls,
     searchCalls,
+    retrieveCalls,
     seedSearchResults: (results, options) => {
       searchResults = results;
       searchHasMore = options?.hasMore ?? false;
     },
     forgetIdempotencyKey: (idempotencyKey) => {
-      paymentIntentsByIdempotencyKey.delete(idempotencyKey);
+      paymentIntentIdByIdempotencyKey.delete(idempotencyKey);
+    },
+    cancelPaymentIntent: (id) => {
+      const paymentIntent = paymentIntentsById.get(id);
+      if (paymentIntent) paymentIntent.status = "canceled";
     },
     setCreateThrows: (error) => {
       createThrows = error;
@@ -99,21 +129,38 @@ function makeFakeStripeClient(): {
     setSearchThrows: (error) => {
       searchThrows = error;
     },
+    setRetrieveThrows: (error) => {
+      retrieveThrows = error;
+    },
   };
 }
 
-const validInput: StartPaymentInput = {
-  paymentId: "payment-1",
-  amountMinor: 24800,
-  currency: "USD",
-};
+function freshInput(overrides: Partial<StartPaymentInput> = {}): StartPaymentInput {
+  return {
+    paymentId: "payment-1",
+    amountMinor: 24800,
+    currency: "USD",
+    providerStartAttemptedAt: FRESH_ATTEMPT,
+    ...overrides,
+  };
+}
+
+function staleInput(overrides: Partial<StartPaymentInput> = {}): StartPaymentInput {
+  return {
+    paymentId: "payment-1",
+    amountMinor: 24800,
+    currency: "USD",
+    providerStartAttemptedAt: STALE_ATTEMPT,
+    ...overrides,
+  };
+}
 
 describe("Stripe PaymentProvider adapter — contract (IMP-035)", () => {
   it("sends the Payment's authoritative amount to Stripe on creation", async () => {
     const { client, createCalls } = makeFakeStripeClient();
     const provider = createStripePaymentProvider(client);
 
-    await provider.startPayment({ ...validInput, amountMinor: 733_319 });
+    await provider.startPayment(freshInput({ amountMinor: 733_319 }));
 
     expect(createCalls[0]?.params.amount).toBe(733_319);
   });
@@ -122,7 +169,7 @@ describe("Stripe PaymentProvider adapter — contract (IMP-035)", () => {
     const { client, createCalls } = makeFakeStripeClient();
     const provider = createStripePaymentProvider(client);
 
-    await provider.startPayment({ ...validInput, currency: "EUR" });
+    await provider.startPayment(freshInput({ currency: "EUR" }));
 
     expect(createCalls[0]?.params.currency).toBe("eur");
   });
@@ -131,16 +178,25 @@ describe("Stripe PaymentProvider adapter — contract (IMP-035)", () => {
     const { client, createCalls } = makeFakeStripeClient();
     const provider = createStripePaymentProvider(client);
 
-    await provider.startPayment({ ...validInput, paymentId: "payment-42" });
+    await provider.startPayment(freshInput({ paymentId: "payment-42" }));
 
     expect(createCalls[0]?.idempotencyKey).toContain("payment-42");
+  });
+
+  it("writes the Payment's stable identity into metadata, and nothing else", async () => {
+    const { client, createCalls } = makeFakeStripeClient();
+    const provider = createStripePaymentProvider(client);
+
+    await provider.startPayment(freshInput());
+
+    expect(createCalls[0]?.params.metadata).toEqual({ paymentId: "payment-1" });
   });
 
   it("returns Stripe's PaymentIntent id as the opaque providerReference", async () => {
     const { client } = makeFakeStripeClient();
     const provider = createStripePaymentProvider(client);
 
-    const result = await provider.startPayment(validInput);
+    const result = await provider.startPayment(freshInput());
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -152,17 +208,27 @@ describe("Stripe PaymentProvider adapter — contract (IMP-035)", () => {
     setCreateThrows(new Stripe.errors.StripeCardError());
     const provider = createStripePaymentProvider(client);
 
-    const result = await provider.startPayment(validInput);
+    const result = await provider.startPayment(freshInput());
 
     expect(result).toEqual({ ok: false, error: "PROVIDER_ERROR" });
   });
 
-  it("a Stripe error on search also maps to a controlled PROVIDER_ERROR", async () => {
+  it("a Stripe error on retrieve (after create) also maps to a controlled PROVIDER_ERROR", async () => {
+    const { client, setRetrieveThrows } = makeFakeStripeClient();
+    setRetrieveThrows(new Stripe.errors.StripeConnectionError());
+    const provider = createStripePaymentProvider(client);
+
+    const result = await provider.startPayment(freshInput());
+
+    expect(result).toEqual({ ok: false, error: "PROVIDER_ERROR" });
+  });
+
+  it("a Stripe error on search (when reconciliation is required) also maps to a controlled PROVIDER_ERROR", async () => {
     const { client, setSearchThrows } = makeFakeStripeClient();
     setSearchThrows(new Stripe.errors.StripeConnectionError());
     const provider = createStripePaymentProvider(client);
 
-    const result = await provider.startPayment(validInput);
+    const result = await provider.startPayment(staleInput());
 
     expect(result).toEqual({ ok: false, error: "PROVIDER_ERROR" });
   });
@@ -181,7 +247,7 @@ describe("Stripe PaymentProvider adapter — contract (IMP-035)", () => {
       setCreateThrows(throwError);
       const provider = createStripePaymentProvider(client);
 
-      const result = await provider.startPayment(validInput);
+      const result = await provider.startPayment(freshInput());
 
       expect(result).toEqual({ ok: false, error: "PROVIDER_ERROR" });
     }
@@ -189,12 +255,12 @@ describe("Stripe PaymentProvider adapter — contract (IMP-035)", () => {
 
   it("a non-Stripe error (an unexpected bug, not a provider failure) propagates rather than being silently collapsed to PROVIDER_ERROR", async () => {
     const { client } = makeFakeStripeClient();
-    (client.paymentIntents as unknown as { search: () => Promise<never> }).search = async () => {
+    (client.paymentIntents as unknown as { create: () => Promise<never> }).create = async () => {
       throw new TypeError("something unrelated to Stripe broke");
     };
     const provider = createStripePaymentProvider(client);
 
-    await expect(provider.startPayment(validInput)).rejects.toThrow(
+    await expect(provider.startPayment(freshInput())).rejects.toThrow(
       "something unrelated to Stripe broke",
     );
   });
@@ -203,7 +269,7 @@ describe("Stripe PaymentProvider adapter — contract (IMP-035)", () => {
     const { client } = makeFakeStripeClient();
     const provider = createStripePaymentProvider(client);
 
-    const result = await provider.startPayment(validInput);
+    const result = await provider.startPayment(freshInput());
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -217,24 +283,20 @@ describe("Stripe PaymentProvider adapter — contract (IMP-035)", () => {
     expect(() => getStripePaymentProvider()).toThrow("STRIPE_SECRET_KEY is not configured.");
   });
 
-  it('IMP-035 §18/§15: the adapter module starts with `import "server-only"`, so it cannot be imported into a client bundle', () => {
+  it('the adapter module starts with `import "server-only"`, so it cannot be imported into a client bundle', () => {
     const adapterPath = fileURLToPath(new URL("./stripe-payment-provider.ts", import.meta.url));
     const source = readFileSync(adapterPath, "utf-8");
     expect(source.trimStart().startsWith('import "server-only";')).toBe(true);
   });
 });
 
-/**
- * IMP-035 §14 — proves `paymentId` maps to a STABLE Stripe idempotency key,
- * never a randomly generated one.
- */
 describe("Stripe PaymentProvider adapter — idempotency key stability (IMP-035 §14)", () => {
   it("the same paymentId produces the same idempotency key on a second, independent call", async () => {
     const { client, createCalls } = makeFakeStripeClient();
     const provider = createStripePaymentProvider(client);
 
-    await provider.startPayment({ ...validInput, paymentId: "payment-P123" });
-    await provider.startPayment({ ...validInput, paymentId: "payment-P123" });
+    await provider.startPayment(freshInput({ paymentId: "payment-P123" }));
+    await provider.startPayment(freshInput({ paymentId: "payment-P123" }));
 
     expect(createCalls).toHaveLength(2);
     expect(createCalls[0]?.idempotencyKey).toBe(createCalls[1]?.idempotencyKey);
@@ -244,233 +306,49 @@ describe("Stripe PaymentProvider adapter — idempotency key stability (IMP-035 
     const { client, createCalls } = makeFakeStripeClient();
     const provider = createStripePaymentProvider(client);
 
-    await provider.startPayment({ ...validInput, paymentId: "payment-P123" });
-    await provider.startPayment({ ...validInput, paymentId: "payment-P456" });
+    await provider.startPayment(freshInput({ paymentId: "payment-P123" }));
+    await provider.startPayment(freshInput({ paymentId: "payment-P456" }));
 
     expect(createCalls[0]?.idempotencyKey).not.toBe(createCalls[1]?.idempotencyKey);
   });
 });
 
 /**
- * IMP-035-FIX (CR-035-01) §17 — durable reconciliation beyond native
- * idempotency-key retention. These are the tests this fix exists for.
+ * IMP-035-FIX-2 (CR-035-FIX-01 / CR-035-FIX-02) — SAFETY OVER LIVENESS.
+ * `providerStartAttemptedAt` decides whether native idempotency alone can
+ * be trusted (`freshInput`) or whether the adapter must positively
+ * reconcile against Stripe and refuse rather than guess (`staleInput`).
  */
-describe("Stripe PaymentProvider adapter — durable reconciliation (IMP-035-FIX / CR-035-01)", () => {
-  it("A. normal creation: no existing PaymentIntent creates exactly one", async () => {
+describe("Stripe PaymentProvider adapter — safety over liveness (IMP-035-FIX-2)", () => {
+  it("within the native-idempotency window: creates directly, without ever calling search", async () => {
     const { client, createCalls, searchCalls } = makeFakeStripeClient();
     const provider = createStripePaymentProvider(client);
 
-    const result = await provider.startPayment(validInput);
+    const result = await provider.startPayment(freshInput());
 
     expect(result.ok).toBe(true);
-    expect(searchCalls).toHaveLength(1);
     expect(createCalls).toHaveLength(1);
+    expect(searchCalls).toHaveLength(0);
   });
 
-  it("A. the search query targets metadata.paymentId for this specific Payment", async () => {
-    const { client, searchCalls } = makeFakeStripeClient();
-    const provider = createStripePaymentProvider(client);
-
-    await provider.startPayment({ ...validInput, paymentId: "payment-abc123" });
-
-    expect(searchCalls[0]?.query).toBe('metadata["paymentId"]:"payment-abc123"');
-  });
-
-  it("A. a newly created PaymentIntent carries the Payment's stable identity in metadata, and nothing else", async () => {
+  it("repeating the exact same fresh call resolves to the same reference via Stripe's own idempotency-key handling", async () => {
     const { client, createCalls } = makeFakeStripeClient();
     const provider = createStripePaymentProvider(client);
 
-    await provider.startPayment(validInput);
-
-    expect(createCalls[0]?.params.metadata).toEqual({ paymentId: "payment-1" });
-  });
-
-  it("B. native idempotency: repeating the exact same call resolves to the same reference via Stripe's own idempotency-key handling", async () => {
-    const { client, createCalls } = makeFakeStripeClient();
-    const provider = createStripePaymentProvider(client);
-
-    const first = await provider.startPayment(validInput);
-    const second = await provider.startPayment(validInput);
+    const first = await provider.startPayment(freshInput());
+    const second = await provider.startPayment(freshInput());
 
     expect(first.ok).toBe(true);
     expect(second.ok).toBe(true);
     if (!first.ok || !second.ok) return;
     expect(second.providerReference).toBe(first.providerReference);
-    // Both calls reached `create` (search found nothing yet, in this fake,
-    // since it isn't auto-synced with `create`'s results) but Stripe's own
-    // idempotency-key handling is what converged them, not reconciliation.
     expect(createCalls).toHaveLength(2);
   });
 
-  it("C. an existing providerReference: reconciliation finds it via search, and no new PaymentIntent is created", async () => {
-    const { client, createCalls, seedSearchResults } = makeFakeStripeClient();
-    seedSearchResults([
-      {
-        id: "pi_existing_1",
-        amount: validInput.amountMinor,
-        currency: "usd",
-        status: "requires_payment_method",
-      },
-    ]);
-    const provider = createStripePaymentProvider(client);
-
-    const result = await provider.startPayment(validInput);
-
-    expect(result).toEqual({ ok: true, providerReference: "pi_existing_1" });
-    expect(createCalls).toHaveLength(0);
-  });
-
-  it("D/E. recovery after local persistence failure, simulating an expired idempotency key: reconciliation finds the original PaymentIntent instead of creating a second one", async () => {
-    const { client, createCalls, seedSearchResults, forgetIdempotencyKey } = makeFakeStripeClient();
-    const provider = createStripePaymentProvider(client);
-
-    // First attempt: Stripe creates a PaymentIntent (simulating: succeeds,
-    // but the subsequent local `setProviderReferenceIfPending` write is
-    // never actually reached in this test — we only care about Stripe's
-    // side here).
-    const first = await provider.startPayment(validInput);
-    expect(first.ok).toBe(true);
-    if (!first.ok) return;
-    expect(createCalls).toHaveLength(1);
-
-    // Simulates the idempotency key having been pruned by Stripe (>= 24h
-    // later) — a repeated `create` with the same key would NOT return the
-    // cached PaymentIntent anymore. Also simulates that reconciliation
-    // search has since caught up (which, by definition, has had far more
-    // than its usual under-a-minute lag to do so by this point).
-    forgetIdempotencyKey(`payment_${validInput.paymentId}`);
-    seedSearchResults([
-      {
-        id: first.providerReference,
-        amount: validInput.amountMinor,
-        currency: "usd",
-        status: "requires_payment_method",
-      },
-    ]);
-
-    const retry = await provider.startPayment(validInput);
-
-    expect(retry).toEqual({ ok: true, providerReference: first.providerReference });
-    // create() was never called a second time — reconciliation short-
-    // circuited it entirely.
-    expect(createCalls).toHaveLength(1);
-  });
-
-  it("F. amount mismatch on an existing PaymentIntent fails safely rather than reusing it", async () => {
-    const { client, createCalls, seedSearchResults } = makeFakeStripeClient();
-    seedSearchResults([
-      { id: "pi_wrong_amount", amount: 999, currency: "usd", status: "requires_payment_method" },
-    ]);
-    const provider = createStripePaymentProvider(client);
-
-    const result = await provider.startPayment(validInput);
-
-    expect(result).toEqual({ ok: false, error: "PROVIDER_ERROR" });
-    expect(createCalls).toHaveLength(0);
-  });
-
-  it("G. currency mismatch on an existing PaymentIntent fails safely rather than reusing it", async () => {
-    const { client, createCalls, seedSearchResults } = makeFakeStripeClient();
-    seedSearchResults([
-      {
-        id: "pi_wrong_currency",
-        amount: validInput.amountMinor,
-        currency: "eur",
-        status: "requires_payment_method",
-      },
-    ]);
-    const provider = createStripePaymentProvider(client);
-
-    const result = await provider.startPayment(validInput);
-
-    expect(result).toEqual({ ok: false, error: "PROVIDER_ERROR" });
-    expect(createCalls).toHaveLength(0);
-  });
-
-  it("H. multiple matching PaymentIntents fail safely rather than arbitrarily picking one", async () => {
-    const { client, createCalls, seedSearchResults } = makeFakeStripeClient();
-    seedSearchResults([
-      {
-        id: "pi_dup_1",
-        amount: validInput.amountMinor,
-        currency: "usd",
-        status: "requires_payment_method",
-      },
-      {
-        id: "pi_dup_2",
-        amount: validInput.amountMinor,
-        currency: "usd",
-        status: "requires_payment_method",
-      },
-    ]);
-    const provider = createStripePaymentProvider(client);
-
-    const result = await provider.startPayment(validInput);
-
-    expect(result).toEqual({ ok: false, error: "PROVIDER_ERROR" });
-    expect(createCalls).toHaveLength(0);
-  });
-
-  it("H. a search page reporting has_more is also treated as ambiguous rather than trusting only the first page", async () => {
-    const { client, createCalls, seedSearchResults } = makeFakeStripeClient();
-    seedSearchResults(
-      [
-        {
-          id: "pi_dup_1",
-          amount: validInput.amountMinor,
-          currency: "usd",
-          status: "requires_payment_method",
-        },
-      ],
-      { hasMore: true },
-    );
-    const provider = createStripePaymentProvider(client);
-
-    const result = await provider.startPayment(validInput);
-
-    expect(result).toEqual({ ok: false, error: "PROVIDER_ERROR" });
-    expect(createCalls).toHaveLength(0);
-  });
-
-  it("a canceled PaymentIntent among the matches is excluded and does not manufacture a false ambiguous result", async () => {
-    const { client, createCalls, seedSearchResults } = makeFakeStripeClient();
-    seedSearchResults([
-      { id: "pi_dead", amount: validInput.amountMinor, currency: "usd", status: "canceled" },
-      {
-        id: "pi_live",
-        amount: validInput.amountMinor,
-        currency: "usd",
-        status: "requires_payment_method",
-      },
-    ]);
-    const provider = createStripePaymentProvider(client);
-
-    const result = await provider.startPayment(validInput);
-
-    expect(result).toEqual({ ok: true, providerReference: "pi_live" });
-    expect(createCalls).toHaveLength(0);
-  });
-
-  it("a canceled-only match is treated as no existing PaymentIntent, and a fresh one is created", async () => {
-    const { client, createCalls, seedSearchResults } = makeFakeStripeClient();
-    seedSearchResults([
-      { id: "pi_dead", amount: validInput.amountMinor, currency: "usd", status: "canceled" },
-    ]);
-    const provider = createStripePaymentProvider(client);
-
-    const result = await provider.startPayment(validInput);
-
-    expect(result.ok).toBe(true);
-    expect(createCalls).toHaveLength(1);
-  });
-
-  it("I. genuine concurrency: two overlapping startPayment calls for the same paymentId converge on one PaymentIntent via native idempotency", async () => {
+  it("genuine concurrency within the safe window: two overlapping calls converge on one PaymentIntent via native idempotency", async () => {
     const { client, createCalls } = makeFakeStripeClient();
-    // A barrier-gated variant of `create`, proving genuine overlap the
-    // same way payment-provider.test.ts's CR-034 P3 fix does: neither call
-    // can produce a result until BOTH have arrived at `create`, so this
-    // test can only pass if the two `startPayment` calls were truly
-    // in-flight simultaneously.
+    // Barrier-gated `create`, proving genuine overlap the same way
+    // payment-provider.test.ts's CR-034 P3 fix does.
     const originalCreate = client.paymentIntents.create.bind(client.paymentIntents);
     let arrived = 0;
     let releaseLatch: () => void;
@@ -486,8 +364,8 @@ describe("Stripe PaymentProvider adapter — durable reconciliation (IMP-035-FIX
     const provider = createStripePaymentProvider(client);
 
     const [a, b] = await Promise.all([
-      provider.startPayment(validInput),
-      provider.startPayment(validInput),
+      provider.startPayment(freshInput()),
+      provider.startPayment(freshInput()),
     ]);
 
     expect(a.ok).toBe(true);
@@ -498,17 +376,156 @@ describe("Stripe PaymentProvider adapter — durable reconciliation (IMP-035-FIX
     expect(createCalls[0]?.idempotencyKey).toBe(createCalls[1]?.idempotencyKey);
   });
 
-  it("J. different Payments produce independent Stripe operations", async () => {
+  it("beyond the native-idempotency window with an existing live match: reuses it, and never calls create", async () => {
+    const { client, createCalls, seedSearchResults } = makeFakeStripeClient();
+    seedSearchResults([
+      { id: "pi_existing_1", amount: 24800, currency: "usd", status: "requires_payment_method" },
+    ]);
+    const provider = createStripePaymentProvider(client);
+
+    const result = await provider.startPayment(staleInput());
+
+    expect(result).toEqual({ ok: true, providerReference: "pi_existing_1" });
+    expect(createCalls).toHaveLength(0);
+  });
+
+  it("MANDATORY (§26 primary acceptance criterion): beyond the native-idempotency window with search finding NOTHING, the adapter refuses rather than creating a second PaymentIntent", async () => {
+    // This is the exact CR-035-FIX-01 sequence: a PaymentIntent may or may
+    // not already exist in Stripe (a prior local persistence failure lost
+    // the reference), the idempotency key can no longer be trusted, and
+    // Search reports zero results (either genuinely nothing exists, or —
+    // the dangerous case — Search simply hasn't caught up / an outage is
+    // in progress). Both possibilities MUST resolve to refusal, never to
+    // `create`.
+    const { client, createCalls, searchCalls } = makeFakeStripeClient();
+    const provider = createStripePaymentProvider(client);
+
+    const result = await provider.startPayment(staleInput());
+
+    expect(result).toEqual({ ok: false, error: "PROVIDER_ERROR" });
+    expect(searchCalls).toHaveLength(1);
+    expect(createCalls).toHaveLength(0);
+  });
+
+  it("beyond the window, multiple matching PaymentIntents fail safely rather than arbitrarily picking one", async () => {
+    const { client, createCalls, seedSearchResults } = makeFakeStripeClient();
+    seedSearchResults([
+      { id: "pi_dup_1", amount: 24800, currency: "usd", status: "requires_payment_method" },
+      { id: "pi_dup_2", amount: 24800, currency: "usd", status: "requires_payment_method" },
+    ]);
+    const provider = createStripePaymentProvider(client);
+
+    const result = await provider.startPayment(staleInput());
+
+    expect(result).toEqual({ ok: false, error: "PROVIDER_ERROR" });
+    expect(createCalls).toHaveLength(0);
+  });
+
+  it("beyond the window, a search page reporting has_more is also treated as ambiguous rather than trusting only the first page", async () => {
+    const { client, createCalls, seedSearchResults } = makeFakeStripeClient();
+    seedSearchResults(
+      [{ id: "pi_dup_1", amount: 24800, currency: "usd", status: "requires_payment_method" }],
+      { hasMore: true },
+    );
+    const provider = createStripePaymentProvider(client);
+
+    const result = await provider.startPayment(staleInput());
+
+    expect(result).toEqual({ ok: false, error: "PROVIDER_ERROR" });
+    expect(createCalls).toHaveLength(0);
+  });
+
+  it("beyond the window, an amount mismatch on the found PaymentIntent fails safely rather than reusing it", async () => {
+    const { client, createCalls, seedSearchResults } = makeFakeStripeClient();
+    seedSearchResults([
+      { id: "pi_wrong_amount", amount: 999, currency: "usd", status: "requires_payment_method" },
+    ]);
+    const provider = createStripePaymentProvider(client);
+
+    const result = await provider.startPayment(staleInput());
+
+    expect(result).toEqual({ ok: false, error: "PROVIDER_ERROR" });
+    expect(createCalls).toHaveLength(0);
+  });
+
+  it("beyond the window, a currency mismatch on the found PaymentIntent fails safely rather than reusing it", async () => {
+    const { client, createCalls, seedSearchResults } = makeFakeStripeClient();
+    seedSearchResults([
+      {
+        id: "pi_wrong_currency",
+        amount: 24800,
+        currency: "eur",
+        status: "requires_payment_method",
+      },
+    ]);
+    const provider = createStripePaymentProvider(client);
+
+    const result = await provider.startPayment(staleInput());
+
+    expect(result).toEqual({ ok: false, error: "PROVIDER_ERROR" });
+    expect(createCalls).toHaveLength(0);
+  });
+
+  it("different Payments produce independent Stripe operations", async () => {
     const { client } = makeFakeStripeClient();
     const provider = createStripePaymentProvider(client);
 
-    const a = await provider.startPayment({ ...validInput, paymentId: "payment-A" });
-    const b = await provider.startPayment({ ...validInput, paymentId: "payment-B" });
+    const a = await provider.startPayment(freshInput({ paymentId: "payment-A" }));
+    const b = await provider.startPayment(freshInput({ paymentId: "payment-B" }));
 
     expect(a.ok).toBe(true);
     expect(b.ok).toBe(true);
     if (!a.ok || !b.ok) return;
     expect(a.providerReference).not.toBe(b.providerReference);
+  });
+});
+
+/**
+ * CR-035-FIX-02 — a canceled PaymentIntent must never be silently reused
+ * as a valid reference, and must never be silently treated as proof that
+ * "nothing exists, safe to create a fresh one" either.
+ */
+describe("Stripe PaymentProvider adapter — canceled PaymentIntent semantics (CR-035-FIX-02)", () => {
+  it("beyond the window, a canceled-only match is treated as unresolved and refuses — it does NOT authorize creating a fresh PaymentIntent", async () => {
+    const { client, createCalls, seedSearchResults } = makeFakeStripeClient();
+    seedSearchResults([{ id: "pi_dead", amount: 24800, currency: "usd", status: "canceled" }]);
+    const provider = createStripePaymentProvider(client);
+
+    const result = await provider.startPayment(staleInput());
+
+    expect(result).toEqual({ ok: false, error: "PROVIDER_ERROR" });
+    expect(createCalls).toHaveLength(0);
+  });
+
+  it("beyond the window, a canceled match alongside a genuine live match is excluded and does not manufacture a false ambiguous result", async () => {
+    const { client, createCalls, seedSearchResults } = makeFakeStripeClient();
+    seedSearchResults([
+      { id: "pi_dead", amount: 24800, currency: "usd", status: "canceled" },
+      { id: "pi_live", amount: 24800, currency: "usd", status: "requires_payment_method" },
+    ]);
+    const provider = createStripePaymentProvider(client);
+
+    const result = await provider.startPayment(staleInput());
+
+    expect(result).toEqual({ ok: true, providerReference: "pi_live" });
+    expect(createCalls).toHaveLength(0);
+  });
+
+  it("within the window, an idempotent create() replay whose PaymentIntent has since been canceled out-of-band refuses rather than returning it as valid", async () => {
+    const { client, cancelPaymentIntent } = makeFakeStripeClient();
+    const provider = createStripePaymentProvider(client);
+
+    const first = await provider.startPayment(freshInput());
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    // Simulates the PaymentIntent being canceled through some other means
+    // (e.g. the Stripe dashboard) between the first and second call.
+    cancelPaymentIntent(first.providerReference);
+
+    const second = await provider.startPayment(freshInput());
+
+    expect(second).toEqual({ ok: false, error: "PROVIDER_ERROR" });
   });
 });
 
@@ -540,7 +557,12 @@ describe.skipIf(!process.env.STRIPE_SECRET_KEY)(
 
     it("creates a real Stripe PaymentIntent for a fresh paymentId", async () => {
       const paymentId = `imp-035-verify-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      const result = await provider.startPayment({ paymentId, amountMinor: 500, currency: "USD" });
+      const result = await provider.startPayment({
+        paymentId,
+        amountMinor: 500,
+        currency: "USD",
+        providerStartAttemptedAt: new Date(),
+      });
 
       expect(result.ok).toBe(true);
       if (!result.ok) return;
@@ -550,13 +572,24 @@ describe.skipIf(!process.env.STRIPE_SECRET_KEY)(
 
     it("the same paymentId resolves to the SAME Stripe operation on a second call", async () => {
       const paymentId = `imp-035-verify-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const providerStartAttemptedAt = new Date();
 
-      const first = await provider.startPayment({ paymentId, amountMinor: 500, currency: "USD" });
+      const first = await provider.startPayment({
+        paymentId,
+        amountMinor: 500,
+        currency: "USD",
+        providerStartAttemptedAt,
+      });
       expect(first.ok).toBe(true);
       if (!first.ok) return;
       createdPaymentIntentIds.push(first.providerReference);
 
-      const second = await provider.startPayment({ paymentId, amountMinor: 500, currency: "USD" });
+      const second = await provider.startPayment({
+        paymentId,
+        amountMinor: 500,
+        currency: "USD",
+        providerStartAttemptedAt,
+      });
       expect(second.ok).toBe(true);
       if (!second.ok) return;
 
@@ -571,11 +604,13 @@ describe.skipIf(!process.env.STRIPE_SECRET_KEY)(
         paymentId: paymentIdA,
         amountMinor: 500,
         currency: "USD",
+        providerStartAttemptedAt: new Date(),
       });
       const b = await provider.startPayment({
         paymentId: paymentIdB,
         amountMinor: 500,
         currency: "USD",
+        providerStartAttemptedAt: new Date(),
       });
 
       expect(a.ok).toBe(true);

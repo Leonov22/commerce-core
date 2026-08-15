@@ -49,6 +49,31 @@
  * The two guarantees together — provider-side idempotency by `paymentId`,
  * local uniqueness by database constraint — are what make it safe for two
  * concurrent `processPayment()` calls to both reach this port.
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * SAFETY OVER LIVENESS BEYOND NATIVE RETENTION (IMP-035-FIX-2)
+ * ═══════════════════════════════════════════════════════════════════════
+ * A REAL provider's own native idempotency mechanism (e.g. Stripe's
+ * `Idempotency-Key`) is not permanent — it may stop being honored after
+ * some provider-specific retention window, after which a naive retry
+ * could create a genuinely second external operation. `StartPaymentInput.providerStartAttemptedAt`
+ * exists so an implementation can tell how long ago a start was FIRST
+ * durably attempted for this `paymentId`, and decide for itself — using
+ * ITS OWN provider's specific retention guarantee, which this
+ * provider-neutral port has no opinion on — whether it may still trust its
+ * native idempotency mechanism alone, or whether it must instead positively
+ * RECONCILE against the provider's own records before creating anything.
+ *
+ * The overriding rule for every implementation: if it cannot PROVE that
+ * starting a new external operation is safe, it MUST NOT start one — a
+ * caller receiving `{ ok: false, error: "PROVIDER_ERROR" }` because the
+ * implementation couldn't safely determine whether an operation already
+ * exists is the CORRECT, intended outcome, not a bug to route around.
+ * Silently creating a second external operation because a reconciliation
+ * check merely came back empty is never acceptable — reconciliation
+ * mechanisms are frequently eventually consistent (a real provider's own
+ * search/list API may not yet reflect a very recent write), and an empty
+ * result does not prove a negative.
  */
 
 /**
@@ -71,6 +96,17 @@ export interface StartPaymentInput {
   paymentId: string;
   amountMinor: number;
   currency: string;
+  /**
+   * When a provider-start was first durably attempted for this Payment
+   * (IMP-035-FIX-2) — always a real, already-persisted timestamp by the
+   * time a `PaymentProvider` sees it, since `processPayment` always claims
+   * it (`PaymentRepository.claimProviderStartAttempt`) before ever calling
+   * this port. Provider-neutral: carries no opinion about any specific
+   * provider's own retention guarantees. See the "SAFETY OVER LIVENESS"
+   * invariant documented above for how an implementation is expected to
+   * use it.
+   */
+  providerStartAttemptedAt: Date;
 }
 
 /**
@@ -100,8 +136,11 @@ export type StartPaymentResult =
   { ok: true; providerReference: string } | { ok: false; error: "PROVIDER_ERROR" };
 
 /**
- * A single capability: start a payment, idempotently by `paymentId` (see
- * the invariant documented above `StartPaymentInput`). No `confirmPayment`,
+ * A single capability: start a payment, idempotently by `paymentId`, and
+ * safely (never creating a duplicate external operation even when its own
+ * native idempotency mechanism can no longer be trusted — see "SAFETY OVER
+ * LIVENESS" above) (see the invariants documented above `StartPaymentInput`).
+ * No `confirmPayment`,
  * `refund`, `cancelPayment`, or webhook-handling method — each of those
  * depends on details (synchronous vs. asynchronous confirmation, whether
  * refunds are even supported, how a webhook payload is shaped) that
