@@ -409,12 +409,8 @@ COMPLETED
 
 Commit
 
-d122508f9447629c5f5bb0ac1964f58dca6b89c8 (initial IMP-031). The
-IMP-031-FIX / CR-031 follow-up below is implemented and validated but not
-yet committed at the time this entry was written — this task's
-instructions explicitly forbid creating a commit. Update this field with
-the IMP-031-FIX commit SHA once it exists; do not leave this note in
-place after that point.
+d122508f9447629c5f5bb0ac1964f58dca6b89c8 (initial IMP-031)
+0fc9079f31c9ccce3a9d82736705b93b3ae13bf8 (IMP-031-FIX / CR-031)
 
 Objective
 
@@ -896,7 +892,7 @@ IMP-021-FIX-002 — Remove Build-Time DB Dependency	COMPLETED
 IMP-022 — Cart → Checkout Navigation	COMPLETED
 IMP-023 through IMP-029 (incl. fix follow-ups)	COMPLETED — see Section 6 note; git history authoritative
 IMP-030 — Order Lifecycle & Status Management (incl. CR-030)	COMPLETED
-IMP-031 — Checkout Submission Idempotency (incl. IMP-031-FIX / CR-031)	COMPLETED (IMP-031-FIX pending commit — see Section 8)
+IMP-031 — Checkout Submission Idempotency (incl. IMP-031-FIX / CR-031)	COMPLETED
 Next milestone	NOT YET APPROVED
 18. Source of Truth
 
