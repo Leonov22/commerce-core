@@ -33,6 +33,12 @@ The project follows these principles:
 8. Fix commits are treated as follow-up work for the milestone that introduced the issue.
 9. Significant architectural decisions must be explicitly documented.
 10. Avoid scope creep and unnecessary infrastructure.
+11. Prefer vertical-slice delivery for customer-facing functionality — pair
+    backend work with frontend integration, deployment, and manual
+    testability — over accumulating backend-only milestones; infrastructure-
+    only milestones with no meaningful customer-facing behavior may remain
+    backend-only (see Section 15, "Development Strategy — Backend + Frontend
+    Vertical Slices").
 
 ---
 
@@ -676,7 +682,7 @@ Next Milestone State
 
 NOT YET APPROVED — unchanged. This milestone does not approve Payments,
 Inventory, Admin tooling, a transport layer for changeOrderStatus, or any
-other future subsystem; see Section 11 (Next Milestone) below.
+other future subsystem; see Section 16 (Next Milestone) below.
 
 9. IMP-032 — Payment Foundation
 
@@ -2014,14 +2020,164 @@ The project currently has unit/integration tests but no dedicated browser E2E te
 
 Browser-level testing should be introduced when justified by upcoming user-critical flows.
 
-15. Next Milestone
+15. Development Strategy — Backend + Frontend Vertical Slices
+
+Why the strategy is changing
+
+IMP-021 through IMP-035 built a deep backend foundation: Catalog
+persistence, Order lifecycle and status management (CR-030), Checkout
+submission idempotency (IMP-031), the Payment domain (IMP-032), the
+provider-neutral `PaymentProvider` port (IMP-033), the `processPayment`
+application flow (IMP-034/CR-034), and a Stripe adapter hardened through
+three follow-up fixes (IMP-035-FIX / CR-035-01, IMP-035-FIX-2 /
+CR-035-FIX-01/02, IMP-035-FIX-3 / CR-035-FIX-03) covering idempotency,
+Search reconciliation, fail-closed behavior, and PaymentIntent integrity
+validation. This backend foundation is now significantly ahead of the
+visible customer-facing storefront — see "Current Storefront Gap" below
+for the actual, verified state. The project should not continue
+accumulating backend-only milestones while the storefront a customer can
+actually open and use remains behind what the backend already supports.
+
+Vertical Slices Over Backend Accumulation (Roadmap Principle 11)
+
+Do not follow: Backend → Backend → Backend → UI later.
+
+Prefer: Backend foundation → Frontend → Deploy → Manual testing → QA →
+Fix → Next milestone.
+
+Every customer-facing milestone should, by the time it is done, let the
+user open the deployed storefront and actually test the newly implemented
+functionality. Infrastructure-only milestones may remain backend-only when
+there is no meaningful customer-facing behavior to expose (e.g. a purely
+internal repository primitive established ahead of its first caller, in
+the same spirit `changeOrderStatus` and `PaymentRepository.updateStatusIfCurrent`
+were established ahead of their own first callers).
+
+Manual Testing Principle
+
+Customer-facing functionality should be manually testable through the
+deployed storefront. Each customer-facing milestone should be able to
+answer: "What can the customer now do through the storefront that they
+could not do before?"
+
+For customer-facing milestones, QA (Section 20, "Local QA Policy") verifies both:
+
+1. Repository correctness (the existing automated-test/typecheck/lint/
+   build verification this Roadmap already requires).
+2. Customer-facing usability — where applicable: reachable through normal
+   navigation; visible in the deployed frontend; happy path manually
+   testable; understandable validation/errors; correct guest/authenticated
+   behavior; no dead-end navigation; no accidental exposure of unfinished
+   backend-only functionality.
+
+Delivery Loop
+
+1. Architect defines the milestone.
+2. Implementation Engineer implements the vertical slice.
+3. Implementation Engineer deploys the result.
+4. User manually tests the feature through the deployed storefront.
+5. QA performs repository/code/test verification.
+6. Code Review validates architecture and scope.
+7. Defects are fixed through follow-up commits.
+8. Project proceeds to the next customer-facing milestone.
+
+Current Storefront Gap
+
+Verified directly against the repository (not assumed) as of this
+writing. The deployed frontend header/footer navigation
+(`src/shared/components/layout/nav-items.ts`) exposes exactly three
+links — Shop (`/shop`), About (`/about`), Contact (`/contact`) — plus a
+cart icon linking to `/cart`. No account/login/logout link, and no
+session/user indicator, appears anywhere in the header, mobile nav, or
+footer.
+
+Backend capability already exists — via `next-auth` session handling,
+Order ownership (IMP-029), and the Account/Orders pages — for
+Login (`/account/login`), Register (`/account/register`), an Account
+dashboard (`/account`, showing the signed-in email and a logout button),
+and My Orders (`/account/orders`, `/account/orders/[id]`). All four pages
+exist in the repository right now, but each is reachable ONLY by direct
+URL: none is linked from the header, mobile nav, or footer. Logout has no
+dedicated route — it is a button inside the Account dashboard page calling
+`next-auth`'s `signOut()`. Checkout (`/checkout`) is similarly reachable
+only from the Cart page's own "proceed" link, never from the header.
+
+No Stripe or payment UI exists anywhere in the frontend: the Checkout flow
+currently stops at contact + delivery + summary/success, and the Payment
+module's Stripe adapter (IMP-035) is entirely backend-only — no
+components, no route, no UI, exactly as every IMP-035-series entry above
+already documents under "What Is Deliberately Deferred".
+
+This Roadmap deliberately distinguishes "backend capability exists" from
+"customer-facing UI is available" because of this exact gap: do not claim
+Login/Register/Account/My Orders/Checkout UI is available to a customer
+merely because the page file exists in the repository — availability
+requires it to be reachable through normal navigation.
+
+Planned Milestones (direction only — see Section 16, "Next Milestone";
+NOT YET APPROVED, and none of the following is to be treated as
+implemented or scheduled without explicit Architect approval)
+
+IMP-036 — Storefront & Customer UX Foundation. Purpose: expose the
+already-existing customer functionality above through the actual
+frontend. Expected scope: customer-facing header/navigation; Cart
+navigation; Authentication navigation; Login; Registration; authenticated
+Account access; My Orders access; Logout; guest/authenticated navigation
+states; integration with the existing authentication/session
+functionality (never a second auth mechanism); customer-facing cart flow;
+Shop → Product → Cart → Checkout navigation; eliminating dead-end or
+hidden customer flows where the corresponding backend functionality
+already exists.
+
+IMP-037 — Checkout & Order Customer Flow. Expected direction: Shop →
+Product → Add to Cart → Cart → Checkout → Contact → Delivery → Order
+Summary → Place Order → Order Confirmation, making the existing
+checkout/order functionality fully usable through the storefront.
+Existing checkout/order defects discovered during implementation or QA
+are resolved as follow-up fix work, per Principle 8. Stripe payment UI is
+not implemented in this milestone unless explicitly approved.
+
+IMP-038 — Payment UI & Stripe Customer Flow. Exposes the already-
+implemented `PaymentProvider`/Stripe backend (IMP-033–IMP-035-series)
+through the customer-facing checkout. Expected direction: Checkout →
+Payment → Stripe → Payment result → Order/payment presentation.
+Stripe-specific dependencies remain isolated to the appropriate
+adapter/application boundary, exactly as IMP-035's own architecture
+already requires.
+
+IMP-039 — Asynchronous Payment Lifecycle. Future milestone for Stripe
+webhook/event processing, asynchronous payment state changes, Payment
+state synchronization, Order/payment lifecycle integration, and
+customer-facing payment/order status. Webhook processing remains separate
+from synchronous payment start (`processPayment`), consistent with every
+IMP-035-series entry's "What Is Deliberately Deferred" already stating no
+webhook is in scope until a dedicated milestone approves one.
+
+Architectural Rules Reinforced by This Strategy
+
+Reuse existing backend/domain functionality — do not duplicate
+authentication, and do not duplicate cart/order/payment mechanisms. Do not
+introduce unnecessary infrastructure, microservices, or Redis/Kafka/
+RabbitMQ unless a future milestone has an independently justified
+requirement (Principle 10). Keep provider-specific Stripe concerns out of
+the Payment domain (unchanged from IMP-033's original boundary). Prefer
+simple vertical slices over speculative abstraction. Keep customer-facing
+behavior manually testable, per the Manual Testing Principle above.
+
+16. Next Milestone
 
 Status
 
 NOT YET APPROVED
 
 The next milestone after IMP-035 must be explicitly defined by the
-Architect before implementation begins.
+Architect before implementation begins. Per the Development Strategy
+(Section 15), the anticipated direction is IMP-036 — Storefront &
+Customer UX Foundation, the first of a planned IMP-036–IMP-039
+vertical-slice sequence bringing the storefront's actual navigation up to
+what the backend already supports. This is a documented DIRECTION, not an
+approval: IMP-036 remains planned, unscheduled work until the Architect
+explicitly approves it, exactly like every other item on this page.
 
 IMP-035 approved exactly one thing: a concrete Stripe adapter for the
 `PaymentProvider` port. The following must NOT be assumed to be approved:
@@ -2048,7 +2204,7 @@ or any other future subsystem.
 
 These require separate requirements and architectural decisions.
 
-16. Future Roadmap Areas
+17. Future Roadmap Areas
 
 The following are possible future areas and are NOT yet approved implementation milestones:
 
@@ -2069,7 +2225,7 @@ Order status history / audit log
 
 No item above should be implemented without explicit Architect approval.
 
-17. Implementation Process
+18. Implementation Process
 
 Every milestone follows this lifecycle:
 
@@ -2098,7 +2254,7 @@ Manual acceptance when required
 Architect approval
     ↓
 Next milestone
-18. Code Review Policy
+19. Code Review Policy
 
 Code Review is performed through:
 
@@ -2122,7 +2278,7 @@ scope compliance.
 
 Claude/local resources should not be used for the primary Code Review when GitHub access is available.
 
-19. Local QA Policy
+20. Local QA Policy
 
 Local QA is performed by Claude/local tooling when possible.
 
@@ -2141,7 +2297,7 @@ relevant performance behavior.
 
 If browser automation is unavailable, browser-only scenarios must be reported as NOT VERIFIED, not assumed to pass.
 
-20. Definition of Done
+21. Definition of Done
 
 A milestone is complete only when:
 
@@ -2155,7 +2311,7 @@ no unresolved P0/P1/P2 defects remain;
 scope has not expanded without approval;
 the milestone commit is traceable;
 this roadmap is updated.
-21. Milestone Summary
+22. Milestone Summary
 Milestone	Status
 IMP-021 — Catalog Persistence Foundation	COMPLETED
 IMP-021-FIX-001 — Public API + Prisma Build Generation	COMPLETED
@@ -2168,8 +2324,12 @@ IMP-032 — Payment Foundation	COMPLETED
 IMP-033 — Payment Provider Port	COMPLETED
 IMP-034 — Payment Processing Application Flow (incl. IMP-034-FIX / CR-034)	COMPLETED
 IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01, IMP-035-FIX-2 / CR-035-FIX-01, CR-035-FIX-02, IMP-035-FIX-3 / CR-035-FIX-03)	COMPLETED — real Stripe test-mode verification pending (see Section 12)
+IMP-036 — Storefront & Customer UX Foundation	PLANNED — direction only, NOT YET APPROVED (see Section 15/16)
+IMP-037 — Checkout & Order Customer Flow	PLANNED — direction only, NOT YET APPROVED (see Section 15/16)
+IMP-038 — Payment UI & Stripe Customer Flow	PLANNED — direction only, NOT YET APPROVED (see Section 15/16)
+IMP-039 — Asynchronous Payment Lifecycle	PLANNED — direction only, NOT YET APPROVED (see Section 15/16)
 Next milestone	NOT YET APPROVED
-22. Source of Truth
+23. Source of Truth
 
 This document is the authoritative roadmap for implementation milestones.
 
