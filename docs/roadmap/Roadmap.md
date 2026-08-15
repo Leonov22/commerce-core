@@ -1311,7 +1311,7 @@ honors idempotency by a caller-supplied key (e.g. Stripe's
 `PROVIDER_REFERENCE_ALREADY_SET` conflation (documented above) remains
 deliberately unresolved pending a real status-changing caller.
 
-12. IMP-035 — Stripe Payment Provider Adapter
+12. IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01)
 
 Status
 
@@ -1319,11 +1319,12 @@ COMPLETED
 
 Commit
 
-IMP-035 pending — implementation and validation are complete but not yet
-committed at the time this entry was written. Record the actual commit
-SHA through the normal follow-up documentation process once the commit
-exists; do not treat any SHA embedded in this entry before that point as
-authoritative for IMP-035.
+8c798915111f96b1fb4244015375df095a04b265 (initial IMP-035)
+IMP-035-FIX pending — implementation and validation are complete but not
+yet committed at the time this entry was written. Record the actual
+commit SHA through the normal follow-up documentation process once the
+commit exists; do not treat any SHA embedded in this entry before that
+point as authoritative for IMP-035-FIX.
 
 Objective
 
@@ -1335,6 +1336,88 @@ IMP-032–IMP-034-FIX actually works against a real provider, and
 specifically that the IMP-034-FIX idempotency invariant (same `paymentId`
 → same provider-side idempotency identity → same external operation) holds
 against that real provider's own semantics, not just against a fake.
+
+Code Review Findings and Fixes (IMP-035-FIX / CR-035-01)
+
+Code Review of the initial IMP-035 implementation found one P1
+correctness defect, resolved:
+
+CR-035-01 — Stripe's native `Idempotency-Key` retention is finite
+("at least 24 hours", per Stripe's own documentation, with no guarantee
+beyond that), while `PaymentProvider`'s contract (IMP-034-FIX) requires
+the same internal Payment to resolve to the same external operation even
+after a genuinely delayed retry. If a retry's `create` call happened after
+Stripe had pruned the original idempotency key, Stripe would not error —
+it would silently create a second, genuinely independent PaymentIntent,
+reintroducing exactly the duplicate-external-operation problem
+IMP-034-FIX closed for the concurrent-call case.
+
+Root cause: the initial IMP-035 adapter relied ENTIRELY on the native
+idempotency key as the sole idempotency mechanism, with nothing to fall
+back on once that key's retention window had passed.
+
+Fix — durable reconciliation, layered underneath native idempotency
+rather than replacing it. `startPayment` now writes a stable identity
+(`metadata: { paymentId }`) onto every PaymentIntent it creates, and
+before ever calling `create`, searches for an existing PaymentIntent
+carrying that same `paymentId` via `stripe.paymentIntents.search`
+(`metadata["paymentId"]:"<paymentId>"`, verified against Stripe's official
+Search Query Language documentation). If exactly one non-canceled match
+exists, its amount/currency are checked against the authoritative Payment
+before its `id` is reused as `providerReference`; if none exists, `create`
+proceeds exactly as before, still protected by the native idempotency
+key.
+
+Why this closes the gap safely — Stripe's own documentation explicitly
+warns that Search is eventually consistent and unsafe for read-after-write
+flows ("data is searchable in under a minute" under normal conditions).
+This was investigated carefully before implementation (verified against
+the installed `stripe` SDK's type definitions and Stripe's official docs,
+not assumed) and found NOT to undermine the fix, because the two
+mechanisms' dangerous windows do not overlap:
+
+- A retry within roughly the first minute after the original `create` is
+  exactly the window where the idempotency key is still guaranteed fresh
+  (valid for at least 24 hours) — even if `search` hasn't indexed the
+  PaymentIntent yet, the retry falls through to `create`, which returns
+  Stripe's cached response for that key. No duplicate either way.
+- A retry long enough after the original attempt for the idempotency key
+  to plausibly have been pruned (on the order of a day or more) is also
+  long enough that `search`'s under-a-minute consistency lag has long
+  since resolved.
+
+`stripe.paymentIntents.list` was also investigated as an alternative and
+found NOT viable: `PaymentIntentListParams` supports no metadata filter at
+all (only `created`/`customer`/`customer_account`/`expand`), so it cannot
+answer "find the PaymentIntent for this `paymentId`" in any form. Search
+is the only Stripe-supported mechanism for this query shape.
+
+Multiple-match handling: if search ever returns more than one non-canceled
+match (or more than fit on one page), reconciliation refuses to guess —
+returns `PROVIDER_ERROR` rather than arbitrarily picking one and
+potentially hiding a genuine duplicate external payment. A `canceled`
+PaymentIntent among the matches is excluded before this count: it is
+unambiguously dead and must not be reused, nor must its presence
+manufacture a false "ambiguous" result alongside a genuine live match.
+
+Amount/currency validation: a found PaymentIntent is only reused if its
+`amount`/`currency` match the authoritative `StartPaymentInput` exactly;
+a mismatch fails safely (`PROVIDER_ERROR`) rather than silently attaching
+a wrong external reference — the internal Payment's own amount/currency
+are never modified based on what Stripe returns.
+
+Concurrency (IMP-034-FIX / CR-034-01) is preserved unchanged: two
+genuinely concurrent `startPayment` calls for a brand-new `paymentId` both
+search (most likely finding nothing yet) and then both call `create` with
+the identical idempotency key — Stripe's synchronous, immediately-
+consistent idempotency-key handling, not `search`, is what converges them
+safely, exactly as before this fix.
+
+No `PaymentAttempt`, no new database table or column, no schema
+migration, no new `PaymentStatus`, no infrastructure (Redis/queues/locks)
+— the entire fix is contained inside `stripe-payment-provider.ts`. The
+`PaymentProvider` public contract, `processPayment`, `PaymentRepository`,
+and the Payment domain are byte-for-byte unchanged.
 
 Provider Choice
 
@@ -1394,6 +1477,40 @@ carries no independent entropy; the same `paymentId` always produces the
 same key, and a different `paymentId` always produces a different one.
 `StartPaymentInput` has no separate idempotency-key field for this
 derivation to diverge from — it cannot vary independently of `paymentId`.
+IMP-035-FIX (CR-035-01): this key is no longer the ONLY idempotency
+mechanism — see "Code Review Findings and Fixes" above for the durable
+`metadata`-based reconciliation layered underneath it, and "Durable
+Reconciliation" below for its own dedicated write-up.
+
+Durable Reconciliation (IMP-035-FIX / CR-035-01)
+
+Every PaymentIntent `startPayment` creates carries `metadata: { paymentId }`
+— the same stable value used to derive the idempotency key. Before ever
+calling `create`, `startPayment` searches
+(`stripe.paymentIntents.search`) for an existing PaymentIntent carrying
+that `paymentId`, using the query `` metadata["paymentId"]:"<paymentId>" ``
+(Stripe's Search Query Language, verified against Stripe's official
+documentation). Outcomes:
+
+- No match → proceed to `create` (protected by the idempotency key).
+- Exactly one non-canceled match, amount/currency verified against the
+  authoritative Payment → reuse its `id` as `providerReference`, `create`
+  is never called.
+- More than one non-canceled match, or more results than fit on one page
+  → `PROVIDER_ERROR`; reconciliation refuses to guess.
+- Amount/currency mismatch on the one match found → `PROVIDER_ERROR`;
+  the found PaymentIntent is not reused, and the Payment's own
+  amount/currency are never altered by this check.
+- A `canceled` match is excluded before any of the above counting —
+  neither reused nor allowed to manufacture a false "ambiguous" result.
+
+This makes `Payment.providerReference` (once persisted locally) the
+actual durable source of truth for "does this Payment already have an
+external operation", with Stripe-side `search` as the mechanism that lets
+the adapter itself answer the same question when the local write hasn't
+happened yet or was lost — exactly the "conceptual mapping" the Architect
+approved: native idempotency for the short/medium term, durable
+`providerReference`/metadata-based reconciliation for the rest.
 
 Authoritative Payment Values
 
@@ -1419,13 +1536,17 @@ Error Mapping
 contract test for `PaymentProvider`): every error that is an instance of
 `Stripe.errors.StripeError` (covering card declines, invalid requests, API
 errors, rate limits, connection errors — Stripe's entire REST-API error
-hierarchy) is caught and mapped to the single `{ ok: false, error:
-"PROVIDER_ERROR" }` result the port already defines, after logging the
-error server-side (`console.error`, matching the existing
-`[api/orders]`-style convention used at other boundaries in this
-codebase). A non-Stripe error (a bug in this adapter itself) is
+hierarchy) from EITHER `search` or `create` is caught and mapped to the
+single `{ ok: false, error: "PROVIDER_ERROR" }` result the port already
+defines, after logging the error server-side (`console.error`, matching
+the existing `[api/orders]`-style convention used at other boundaries in
+this codebase). A non-Stripe error (a bug in this adapter itself) is
 deliberately NOT caught — it propagates, so a genuine defect surfaces
 rather than being silently absorbed into the provider-failure code path.
+A reconciliation ambiguity (multiple matches) or a validation mismatch
+(amount/currency) also resolves to `PROVIDER_ERROR` — no new
+provider-neutral error code was introduced for either, per the existing
+boundary already being sufficient.
 
 Application Wiring
 
@@ -1452,64 +1573,91 @@ this adapter introduces no new place for a client to influence them.
 
 Tests
 
-16 new tests in `stripe-payment-provider.test.ts`. Contract tests (8):
-correct amount/currency (lowercased) sent to Stripe, `paymentId` mapped
-into the idempotency key, Stripe's `PaymentIntent.id` returned as
-`providerReference`, a Stripe error mapped to `PROVIDER_ERROR`, four
-different Stripe error subclasses (`StripeCardError`,
-`StripeInvalidRequestError`, `StripeAPIError`, `StripeRateLimitError`,
-`StripeConnectionError`) all collapsing to the same result, a non-Stripe
-error propagating rather than being swallowed, the successful result
-carrying no field beyond `ok`/`providerReference`, and
-`getStripePaymentProvider()` throwing a clear configuration error when
-`STRIPE_SECRET_KEY` is unset. Idempotency-key-stability tests (4,
-IMP-035's most important acceptance criterion): the same `paymentId`
-produces the same key on a second sequential call (simulates a retry), the
-same key across genuinely concurrent calls, a different `paymentId`
-producing a different key, and the key being a pure function of
-`paymentId` alone (independent of `amountMinor`/`currency`). Real
-Stripe test-mode tests (3, gated by `STRIPE_SECRET_KEY` via
-`describe.skipIf` — not fabricated, see "Runtime Verification" below):
-create a PaymentIntent, prove a repeated call with the same `paymentId`
-returns the identical reference, prove a different `paymentId` creates a
-genuinely different one. Full pre-existing suite (Order, Checkout,
-Catalog, Identity, CR-029/030/031, IMP-032/033/034/034-FIX) re-run and
-confirmed passing unmodified.
+Initial IMP-035: 16 tests (see prior revision of this section; superseded
+by the rewritten file below, which retains full equivalent coverage plus
+CR-035-01's reconciliation scenarios). IMP-035-FIX:
+`stripe-payment-provider.test.ts` now has 30 tests (27 passing + 3 gated
+real-Stripe tests). Contract tests: amount/currency (lowercased) sent to
+Stripe, `paymentId` mapped into the idempotency key, `PaymentIntent.id`
+returned as `providerReference`, a Stripe error on `create` AND on
+`search` each mapped to `PROVIDER_ERROR`, five Stripe error subclasses
+(`StripeCardError`, `StripeInvalidRequestError`, `StripeAPIError`,
+`StripeRateLimitError`, `StripeConnectionError`) collapsing to the same
+result, a non-Stripe error propagating, the successful result carrying no
+field beyond `ok`/`providerReference`, `getStripePaymentProvider()`'s
+missing-key behavior, and the module's `server-only` boundary (source
+inspection). Idempotency-key-stability tests: same `paymentId` → same key
+on retry; different `paymentId` → different key. Durable-reconciliation
+tests (CR-035-01, the core of this fix): (A) normal creation with no
+existing match, the exact search query shape, and the exact metadata
+written; (B) native idempotency still converges a same-request retry; (C)
+an existing PaymentIntent found via search is reused with zero new
+`create` calls; (D/E) recovery after a simulated local persistence failure
+combined with a simulated expired idempotency key — reconciliation finds
+the original PaymentIntent and `create` is never called a second time; (F)
+amount mismatch on a found PaymentIntent fails safely; (G) currency
+mismatch fails safely; (H) multiple matches, and a search page reporting
+`has_more`, both fail safely rather than guessing; a `canceled` match is
+excluded from ambiguity counting and does not block reuse of a genuine
+live match, and a canceled-only match is treated as no match (a fresh
+PaymentIntent is created); (I) two genuinely concurrent `startPayment`
+calls, proven via an explicit barrier gating the fake's `create` (the same
+technique as the CR-034 P3 test fix) rather than trusting `Promise.all`
+alone, converge on one `providerReference` via native idempotency; (J)
+different Payments produce independent references. Real Stripe test-mode
+tests (3, gated by `STRIPE_SECRET_KEY` via `describe.skipIf` — not
+fabricated, see "Runtime Verification" below) are unchanged from initial
+IMP-035. Full pre-existing suite (Order, Checkout, Catalog, Identity,
+CR-029/030/031, IMP-032/033/034/034-FIX) re-run and confirmed passing
+unmodified.
 
 Runtime Verification
 
-No `STRIPE_SECRET_KEY` was available in this implementation environment.
-The 3 real-Stripe test-mode tests are implemented and gated correctly
+No `STRIPE_SECRET_KEY` was available in this implementation environment,
+for either the initial IMP-035 work or this fix. The 3 real-Stripe
+test-mode tests remain implemented and gated correctly
 (`describe.skipIf(!process.env.STRIPE_SECRET_KEY)`) but were **skipped**,
 not run and not fabricated as passing. `pnpm test` reports these 3 tests
-as explicitly skipped, not passing. Real Stripe test-mode verification of
-this adapter against Stripe's actual API remains genuinely pending until
-someone runs the suite with a real Stripe test-mode secret key configured.
+as explicitly skipped. Real Stripe test-mode verification of both the
+original adapter behavior and the new reconciliation logic against
+Stripe's actual API remains genuinely pending until someone runs the
+suite with a real Stripe test-mode secret key configured.
 
 Validation Results
 
-`pnpm test`: 309 passing + 3 skipped (the gated real-Stripe tests), 27
-test files, zero regressions in the pre-existing 296. `pnpm typecheck`:
-clean. `pnpm lint`: clean. `pnpm format:check`: limited to the same two
-pre-existing, unrelated warnings already noted for prior milestones
-(`next.config.ts`, `pnpm-workspace.yaml`). `pnpm build`: succeeded, all 15
-routes compiled/prerendered, with no `STRIPE_SECRET_KEY` set — confirming
-the lazy-wiring design does not force a Stripe credential requirement onto
-the build.
+Initial IMP-035: `pnpm test` 309 passing + 3 skipped, 27 test files.
+IMP-035-FIX: `pnpm test`: **323 passing + 3 skipped** (326 total), 27 test
+files, zero regressions in the pre-existing 309 (14 net new passing tests
+in `stripe-payment-provider.test.ts`, replacing the prior 13). `pnpm
+typecheck`: clean — including confirming the narrowed
+`StripePaymentIntentsClient` interface (now including `search`) is
+structurally satisfied by a real `Stripe` instance. `pnpm lint`: clean.
+`pnpm format:check`: limited to the same two pre-existing, unrelated
+warnings already noted for prior milestones (`next.config.ts`,
+`pnpm-workspace.yaml`). `pnpm build`: succeeded, all 15 routes
+compiled/prerendered, with no `STRIPE_SECRET_KEY` set — the lazy-wiring
+design still does not force a Stripe credential requirement onto the
+build.
 
 What Is Deliberately Deferred
 
 No webhook, no route, no UI, no `confirmPayment`/refund/cancellation, no
 second provider, no customer payment-method management, no
 `PaymentAttempt`, no retry/queue framework, no schema migration
-(`Payment.providerReference` is reused as-is), no new `PaymentStatus`
-value or transition — `processPayment` still only attaches
+(`Payment.providerReference` is reused as-is, no new column/table), no new
+`PaymentStatus` value or transition — `processPayment` still only attaches
 `providerReference` while the Payment stays `PENDING`, exactly as
 IMP-034/IMP-034-FIX left it. Real Stripe test-mode verification (above) is
-implemented but unexecuted pending real credentials. A future milestone
-decides how `getStripePaymentProvider()`/`processPayment` actually get
-called from a transport, and is responsible for turning Stripe's eventual
-confirmation (most likely a webhook) into a real status transition.
+implemented but unexecuted pending real credentials — this now includes
+verifying the reconciliation `search` path against Stripe's actual API,
+not just the original `create` path. The residual risk of a Stripe-side
+outage delaying `search` indexing for longer than the idempotency key's
+own retention window is documented as a known, unavoidable limitation
+(see the adapter's own doc comment) rather than assumed away. A future
+milestone decides how `getStripePaymentProvider()`/`processPayment`
+actually get called from a transport, and is responsible for turning
+Stripe's eventual confirmation (most likely a webhook) into a real status
+transition.
 
 13. Current Production State
 
@@ -1738,7 +1886,7 @@ IMP-031 — Checkout Submission Idempotency (incl. IMP-031-FIX / CR-031)	COMPLET
 IMP-032 — Payment Foundation	COMPLETED
 IMP-033 — Payment Provider Port	COMPLETED
 IMP-034 — Payment Processing Application Flow (incl. IMP-034-FIX / CR-034)	COMPLETED
-IMP-035 — Stripe Payment Provider Adapter	COMPLETED — real Stripe test-mode verification pending (see Section 12)
+IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01)	COMPLETED — real Stripe test-mode verification pending (see Section 12)
 Next milestone	NOT YET APPROVED
 22. Source of Truth
 
