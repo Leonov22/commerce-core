@@ -1047,11 +1047,7 @@ COMPLETED
 Commit
 
 a48e6c1fcd456778bedc3cff3efdfda045ff647d (initial IMP-034)
-IMP-034-FIX pending — implementation and validation are complete but not
-yet committed at the time this entry was written. Record the actual
-commit SHA through the normal follow-up documentation process once the
-commit exists; do not treat any SHA embedded in this entry before that
-point as authoritative for IMP-034-FIX.
+ff57c4b7f19b3e226496327112f2b03b13aa31c4 (IMP-034-FIX / CR-034)
 
 Objective
 
@@ -1542,7 +1538,7 @@ IMP-030 — Order Lifecycle & Status Management (incl. CR-030)	COMPLETED
 IMP-031 — Checkout Submission Idempotency (incl. IMP-031-FIX / CR-031)	COMPLETED
 IMP-032 — Payment Foundation	COMPLETED
 IMP-033 — Payment Provider Port	COMPLETED
-IMP-034 — Payment Processing Application Flow (incl. IMP-034-FIX / CR-034)	COMPLETED (IMP-034-FIX pending commit — see Section 11)
+IMP-034 — Payment Processing Application Flow (incl. IMP-034-FIX / CR-034)	COMPLETED
 Next milestone	NOT YET APPROVED
 21. Source of Truth
 

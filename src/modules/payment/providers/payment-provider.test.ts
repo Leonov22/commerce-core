@@ -74,6 +74,64 @@ function makeFakeCompliantPaymentProvider(): {
   return { provider, calls };
 }
 
+/**
+ * IMP-034-FIX (Code Review P3 follow-up): a purpose-built variant of
+ * `makeFakeCompliantPaymentProvider` above, used only by the concurrency
+ * test below. That fake's `Map` write happens before its first `await`, so
+ * a `Promise.all` of two calls never actually forces genuine overlap — the
+ * first call's promise can fully settle before the second one is even
+ * invoked, and the test would still pass on `Promise.all`'s scheduling
+ * alone, not on proven concurrent overlap.
+ *
+ * This variant instead blocks every `startPayment` call on an explicit
+ * latch that only releases once exactly `expectedConcurrentCalls` calls
+ * have all arrived at it. No call can produce a result before every other
+ * expected call has started its own — if fewer than `expectedConcurrentCalls`
+ * calls are ever in flight at once, the latch never releases and the test
+ * hangs/times out rather than passing. Completing at all is therefore
+ * itself the proof of genuine overlap, not an assumption about `Map`
+ * ordering or microtask scheduling.
+ */
+function makeFakeCompliantPaymentProviderWithBarrier(expectedConcurrentCalls: number): {
+  provider: PaymentProvider;
+  calls: StartPaymentInput[];
+} {
+  const calls: StartPaymentInput[] = [];
+  const referencesByPaymentId = new Map<string, string>();
+  let nextId = 0;
+  let arrived = 0;
+  let releaseLatch: () => void;
+  const latch = new Promise<void>((resolve) => {
+    releaseLatch = resolve;
+  });
+
+  const provider: PaymentProvider = {
+    async startPayment(input: StartPaymentInput): Promise<StartPaymentResult> {
+      calls.push(input);
+
+      // Block here until every expected concurrent call has arrived --
+      // this is the actual overlap guarantee, not just a same-tick push
+      // onto `calls` before the first `await`.
+      arrived += 1;
+      if (arrived >= expectedConcurrentCalls) {
+        releaseLatch();
+      }
+      await latch;
+
+      const existing = referencesByPaymentId.get(input.paymentId);
+      if (existing) {
+        return { ok: true, providerReference: existing };
+      }
+      nextId += 1;
+      const providerReference = `compliant-ref-${nextId}`;
+      referencesByPaymentId.set(input.paymentId, providerReference);
+      return { ok: true, providerReference };
+    },
+  };
+
+  return { provider, calls };
+}
+
 const validInput: StartPaymentInput = {
   paymentId: "payment-1",
   amountMinor: 24800,
@@ -176,7 +234,14 @@ describe("PaymentProvider contract — provider-side idempotency (IMP-034-FIX)",
   });
 
   it("a compliant provider returns the SAME providerReference for genuinely concurrent calls sharing the same paymentId (simulates two racing processPayment() calls — CR-034-01)", async () => {
-    const { provider, calls } = makeFakeCompliantPaymentProvider();
+    // Uses the barrier-based fake, not the plain Map-based one above: the
+    // latch inside it can only release once BOTH calls have actually
+    // arrived at it, so the two `startPayment` invocations below are
+    // structurally guaranteed to be in flight at the same time -- if they
+    // ran sequentially instead, the second call would never be issued, the
+    // latch would never see its second arrival, and this `Promise.all`
+    // would hang instead of resolving.
+    const { provider, calls } = makeFakeCompliantPaymentProviderWithBarrier(2);
     const input: StartPaymentInput = {
       paymentId: "payment-1",
       amountMinor: 24800,
