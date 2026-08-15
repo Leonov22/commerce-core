@@ -268,10 +268,7 @@ COMPLETED
 
 Commit
 
-Pending — this entry covers implementation work completed and validated
-ahead of its commit. Update this field with the actual commit SHA
-immediately once the IMP-030-FIX commit is created; do not leave this
-placeholder in place after that point.
+08ebcba437a6af4e9073720f209e1fc7ad9a3bbb
 
 Objective
 
