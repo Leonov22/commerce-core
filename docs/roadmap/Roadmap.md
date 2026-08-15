@@ -910,7 +910,135 @@ webhook handling, and how `initializePayment`/`updateStatusIfCurrent`
 get wired to a real transport — before implementation begins. This
 milestone approves only the internal foundation documented above.
 
-10. Current Production State
+10. IMP-033 — Payment Provider Port
+
+Status
+
+COMPLETED
+
+Commit
+
+200f464149671f060e765567f97f366ca48a2a2e
+
+Objective
+
+Establish the minimal, provider-neutral outbound port a future concrete
+payment provider (Stripe, PayPal, or otherwise) will implement, so that
+integration can happen without redesigning the Payment domain
+(IMP-032). This milestone defines the port's shape only — no provider
+implementation, no PaymentAttempt entity, no database change, no route,
+no webhook, no UI.
+
+Requirements
+
+A `PaymentProvider` interface with exactly one capability: starting a
+payment. A provider-neutral `StartPaymentInput` (derived from the
+authoritative, already-persisted `Payment` — never client input) and a
+provider-neutral `StartPaymentResult`. Exported through
+`@/modules/payment`'s public boundary. Focused contract tests proving
+the port is genuinely implementable. No concrete provider, no wiring
+into `initializePayment` or any other caller, no schema change, no new
+infrastructure.
+
+Architecture Decisions
+
+`PaymentProvider` lives in a new `src/modules/payment/providers/`
+directory — parallel to `repositories/`, since both are outbound ports
+(one to Postgres, one to an eventual external payment gateway), not
+business logic. The file itself has zero imports, not even from
+Payment's own domain module: `StartPaymentInput`/`StartPaymentResult`
+are built from primitives (`paymentId: string`, `amountMinor: number`,
+`currency: string`, an opaque `providerReference: string` on success, a
+single collapsed `PROVIDER_ERROR` on failure) so the port cannot
+accidentally accrue a dependency, provider-specific field, or Payment
+Prisma-shape leakage merely by association.
+
+The result's failure case is deliberately a single `PROVIDER_ERROR`
+rather than an open-ended taxonomy of provider-specific failure reasons
+(a declined card, an expired session, a network timeout) — that
+taxonomy cannot be designed correctly in the abstract before a real
+provider exists to observe it; a future adapter and its caller are the
+right place to refine this.
+
+The port is established with zero callers, deliberately — the same
+choice already made twice in this codebase (`changeOrderStatus`/
+`isValidOrderStatusTransition` in IMP-030, `PaymentRepository.updateStatusIfCurrent`
+in IMP-032): shipping the abstraction ahead of its first real
+implementation and caller means a future payment-provider milestone can
+build directly on it without redesigning the shape.
+
+Database Changes
+
+None. This milestone is TypeScript interfaces only.
+
+API
+
+None. No route, no webhook, no UI. `PaymentProvider` is not wired to
+`initializePayment` or any other caller.
+
+Security
+
+`StartPaymentInput` carries no client-controlled field — a caller can
+only construct it from an already-persisted, server-resolved `Payment`
+(`paymentId`, `amountMinor`, `currency` all originate there, not from
+any request body). No PII. No secret/credential of any kind is part of
+this port — provider credentials belong to a future concrete adapter,
+never to this interface. This milestone does not change Order/Checkout
+behavior, CR-029 IDOR/pagination, CR-030 atomic transitions, or IMP-031
+idempotency in any way — verified by full regression of their existing
+test suites.
+
+Tests
+
+5 contract tests (`payment-provider.test.ts`) against a minimal
+in-memory fake defined only in the test file (never exported, never
+shipped) — the same role fake repositories play elsewhere in this
+codebase: successful `startPayment` returns a non-empty opaque
+`providerReference`; failure returns a controlled `PROVIDER_ERROR`
+rather than throwing; the fake receives exactly the three documented
+input fields and nothing else; the port is usable through its type
+alone (a small helper function depends on `PaymentProvider` structurally,
+never a concrete implementation); two different Payments produce
+independent provider references. Full existing suite (Order, Checkout,
+Catalog, Identity, CR-029, CR-030, IMP-031, IMP-032) re-run and
+confirmed passing unmodified.
+
+Validation Results
+
+`pnpm test`: 272/272 passing (267 pre-existing + 5 new), 25 test files,
+zero regressions. `pnpm typecheck`: clean. `pnpm lint`: clean. `pnpm
+format:check`: limited to the two pre-existing, unrelated warnings
+(`next.config.ts`, `pnpm-workspace.yaml`). `pnpm build`: succeeded (all
+15 routes compiled/prerendered — this milestone adds no route).
+
+Runtime Verification
+
+Not applicable in the traditional sense — this milestone introduces no
+database access, no HTTP surface, and no wiring into any existing
+runtime path, so there is no additional system to exercise beyond the
+contract test suite itself (above), which is the complete verification
+of this port's behavior.
+
+Remaining Limitations
+
+No concrete `PaymentProvider` implementation exists — every capability
+this port describes is unusable in practice until a future milestone
+supplies a real adapter (Stripe, PayPal, or otherwise) and wires it into
+`initializePayment` or a successor. No `confirmPayment`/`refund`/
+`cancelPayment` method exists on the port yet — deliberately deferred
+until a real provider's actual requirements are known, per Architecture
+Decisions above. No `PaymentAttempt` entity — out of this milestone's
+explicit scope.
+
+Next Milestone State
+
+NOT YET APPROVED. A future milestone must define which concrete
+provider to integrate, implement `PaymentProvider` for it, and wire the
+result into `initializePayment` (or a successor) before any real
+payment can be processed. This milestone approves only the port's
+shape.
+
+11. Current Production State
 
 The following functionality is currently implemented:
 
@@ -950,7 +1078,7 @@ Prisma
    ↓
 Neon PostgreSQL
 
-11. Known Limitations
+12. Known Limitations
 Product Details
 
 Product Details is dynamically rendered because database access must not be required during build.
@@ -984,22 +1112,25 @@ The project currently has unit/integration tests but no dedicated browser E2E te
 
 Browser-level testing should be introduced when justified by upcoming user-critical flows.
 
-12. Next Milestone
+13. Next Milestone
 
 Status
 
 NOT YET APPROVED
 
-The next milestone after IMP-032 must be explicitly defined by the
+The next milestone after IMP-033 must be explicitly defined by the
 Architect before implementation begins.
 
 The following must NOT be assumed to be approved:
 
 an external payment provider (Stripe, PayPal, or any other) — IMP-032
-approved only the internal Payment domain/persistence foundation, not
-provider integration;
+approved only the internal Payment domain/persistence foundation and
+IMP-033 approved only the provider-neutral `PaymentProvider` port's
+shape, neither approves provider integration itself;
 payment webhooks;
 a transport layer (API/UI) for `initializePayment` or `changeOrderStatus`;
+`confirmPayment`/`refund`/`cancelPayment` or any other addition to the
+`PaymentProvider` port;
 Inventory;
 Admin tooling / Admin UI;
 roles/permissions;
@@ -1011,7 +1142,7 @@ or any other future subsystem.
 
 These require separate requirements and architectural decisions.
 
-13. Future Roadmap Areas
+14. Future Roadmap Areas
 
 The following are possible future areas and are NOT yet approved implementation milestones:
 
@@ -1032,7 +1163,7 @@ Order status history / audit log
 
 No item above should be implemented without explicit Architect approval.
 
-14. Implementation Process
+15. Implementation Process
 
 Every milestone follows this lifecycle:
 
@@ -1061,7 +1192,7 @@ Manual acceptance when required
 Architect approval
     ↓
 Next milestone
-15. Code Review Policy
+16. Code Review Policy
 
 Code Review is performed through:
 
@@ -1085,7 +1216,7 @@ scope compliance.
 
 Claude/local resources should not be used for the primary Code Review when GitHub access is available.
 
-16. Local QA Policy
+17. Local QA Policy
 
 Local QA is performed by Claude/local tooling when possible.
 
@@ -1104,7 +1235,7 @@ relevant performance behavior.
 
 If browser automation is unavailable, browser-only scenarios must be reported as NOT VERIFIED, not assumed to pass.
 
-17. Definition of Done
+18. Definition of Done
 
 A milestone is complete only when:
 
@@ -1118,7 +1249,7 @@ no unresolved P0/P1/P2 defects remain;
 scope has not expanded without approval;
 the milestone commit is traceable;
 this roadmap is updated.
-18. Milestone Summary
+19. Milestone Summary
 Milestone	Status
 IMP-021 — Catalog Persistence Foundation	COMPLETED
 IMP-021-FIX-001 — Public API + Prisma Build Generation	COMPLETED
@@ -1128,8 +1259,9 @@ IMP-023 through IMP-029 (incl. fix follow-ups)	COMPLETED — see Section 6 note;
 IMP-030 — Order Lifecycle & Status Management (incl. CR-030)	COMPLETED
 IMP-031 — Checkout Submission Idempotency (incl. IMP-031-FIX / CR-031)	COMPLETED
 IMP-032 — Payment Foundation	COMPLETED
+IMP-033 — Payment Provider Port	COMPLETED
 Next milestone	NOT YET APPROVED
-19. Source of Truth
+20. Source of Truth
 
 This document is the authoritative roadmap for implementation milestones.
 

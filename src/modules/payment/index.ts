@@ -16,6 +16,16 @@ import * as initializePaymentCommand from "@/modules/payment/application/initial
 
 export type { Payment, PaymentStatus } from "@/modules/payment/domain/payment";
 export type { InitializePaymentResult } from "@/modules/payment/application/initialize-payment";
+/**
+ * The outbound provider port (IMP-033) — no implementation exists yet;
+ * exported so a future payment-provider milestone can implement it
+ * without reaching into `@/modules/payment/providers/...` internals.
+ */
+export type {
+  PaymentProvider,
+  StartPaymentInput,
+  StartPaymentResult,
+} from "@/modules/payment/providers/payment-provider";
 
 /**
  * Initializes a Payment for an existing Order (IMP-032). Not customer-
