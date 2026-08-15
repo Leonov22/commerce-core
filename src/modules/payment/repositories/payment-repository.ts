@@ -68,4 +68,32 @@ export interface PaymentRepository {
     expectedStatus: PaymentStatus,
     nextStatus: PaymentStatus,
   ): Promise<Payment | null>;
+
+  /**
+   * Atomically attaches a provider-issued reference to a still-`PENDING`
+   * Payment that doesn't already have one (IMP-034) —
+   * `WHERE id = ? AND status = 'PENDING' AND providerReference IS NULL`,
+   * the same database-conditional-write principle CR-030/IMP-032 already
+   * established for `updateStatusIfCurrent`/`create`: never a prior "does
+   * it already have a reference?" read as authority. Two concurrent calls
+   * for the same Payment both reach this statement; Postgres allows
+   * exactly one to actually write, so a provider reference can never be
+   * silently overwritten by a second, differently-valued call.
+   *
+   * Deliberately does not change `status` — attaching a provider
+   * reference is not the same as the Payment being confirmed successful;
+   * it stays `PENDING`. Only a future milestone, once a provider
+   * genuinely reports a final result, is responsible for any status
+   * transition (via `updateStatusIfCurrent` above, unmodified by this
+   * addition).
+   *
+   * Returns the updated Payment if the write applied, or `null` if it
+   * didn't — either the Payment was no longer `PENDING`, or another call
+   * already attached a reference first. The caller must not treat a
+   * `null` result as this call's own reference having been persisted.
+   */
+  setProviderReferenceIfPending(
+    paymentId: string,
+    providerReference: string,
+  ): Promise<Payment | null>;
 }

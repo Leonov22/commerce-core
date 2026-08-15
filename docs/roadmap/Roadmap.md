@@ -1038,7 +1038,182 @@ result into `initializePayment` (or a successor) before any real
 payment can be processed. This milestone approves only the port's
 shape.
 
-11. Current Production State
+11. IMP-034 — Payment Processing Application Flow
+
+Status
+
+COMPLETED
+
+Commit
+
+Not yet committed at the time this entry was written — implementation
+and validation are complete; this entry will be updated with the real
+commit SHA immediately once the IMP-034 commit is created.
+
+Objective
+
+Connect IMP-032's Payment domain and IMP-033's `PaymentProvider` port
+through a single application-level use case: `processPayment`. No
+concrete provider, no webhook, no route, no UI — this milestone answers
+exactly one question: how does the Payment application invoke a
+provider-neutral payment provider and safely persist the resulting
+provider reference?
+
+Application Boundary
+
+`processPayment(paymentRepository, paymentProvider, paymentId)` lives in
+`src/modules/payment/application/process-payment.ts`. It imports neither
+Prisma, Next.js, HTTP, nor any provider SDK — both dependencies are
+injected as interfaces (`PaymentRepository`, `PaymentProvider`), matching
+`initializePayment`'s established pattern exactly. Exported through
+`@/modules/payment`'s public boundary as `processPayment(provider,
+paymentId)`, with `PaymentRepository` pre-wired to the real
+`prismaPaymentRepository` (the one concrete dependency that exists
+today) and `provider` left as a caller-supplied parameter, since IMP-033
+established no concrete `PaymentProvider` implementation to pre-wire.
+
+Dependency Direction
+
+`Application → PaymentRepository interface` and
+`Application → PaymentProvider interface`, both unchanged from IMP-032/
+IMP-033. `Infrastructure → Prisma` remains isolated to
+`prisma-payment-repository.ts`; no future provider adapter exists yet or
+is introduced here. The Payment domain (`payment.ts`) is untouched by
+this milestone and remains providerless — verified by inspection (zero
+imports beyond its own types).
+
+Provider Interaction
+
+`processPayment` loads the Payment, rejects if not found
+(`PAYMENT_NOT_FOUND`) or not `PENDING` (`PAYMENT_NOT_PENDING` — terminal
+Payments are never re-sent to a provider), builds `StartPaymentInput`
+exclusively from the persisted Payment (`paymentId`, `amountMinor`,
+`currency`), and calls `PaymentProvider.startPayment(...)`. A provider
+failure (`{ ok: false, error: "PROVIDER_ERROR" }`) returns a controlled
+result without any repository write — the Payment is left exactly as it
+was, never a raw provider error, never a provider-specific failure code.
+
+IMPORTANT SEMANTIC DECISION: a successful `startPayment()` call means the
+provider has *started* processing, not that the payment has *succeeded*.
+`processPayment` therefore never transitions a Payment to `SUCCEEDED`
+and introduces no new intermediate status (no `PROCESSING`,
+`AUTHORIZING`, `REQUIRES_ACTION`, or `PROVIDER_FAILED`) — the domain
+lifecycle from IMP-032 is completely unchanged:
+```
+PENDING
+ ├── SUCCEEDED
+ ├── FAILED
+ └── CANCELLED
+```
+A successful provider call only attaches the opaque `providerReference`
+while the Payment remains `PENDING`. Only a future milestone, once a
+provider genuinely reports a final result (e.g. via a webhook), is
+responsible for the actual status transition — through
+`updateStatusIfCurrent`, already established by IMP-032 and completely
+unmodified here.
+
+Authoritative Payment Values
+
+The provider receives exclusively the persisted Payment's own
+`amountMinor`/`currency` — `processPayment` accepts no such parameter at
+all, so there is no input a caller could override them with, and no
+Order recalculation, Catalog, or Checkout involvement of any kind. The
+provider's success result contributes exactly one persisted value (the
+opaque `providerReference`); `StartPaymentResult` has no amount/currency
+field, so a provider can never replace them.
+
+providerReference Persistence
+
+The existing `PaymentRepository` could not persist a provider reference
+without changing `status` (its only conditional-write method,
+`updateStatusIfCurrent`, transitions status by design). Rather than
+redesign that method or the repository's shape, IMP-034 adds exactly one
+minimal atomic capability:
+`setProviderReferenceIfPending(paymentId, providerReference)` —
+`WHERE id = ? AND status = 'PENDING' AND providerReference IS NULL`,
+the same database-conditional-write principle CR-030/IMP-032 already
+established. Conditioning on `providerReference IS NULL` (not just
+`status = 'PENDING'`) is what prevents a second concurrent caller from
+silently overwriting a first caller's reference with a different value —
+without it, two racing calls could both "succeed" against an unchanged
+`status`, corrupting which reference actually persists. No schema
+migration was required: `providerReference` already existed as a
+nullable column since IMP-032.
+
+Concurrency Strategy
+
+Two concurrent `processPayment()` calls for the same `PENDING` Payment
+are resolved entirely by `setProviderReferenceIfPending`'s atomic
+conditional write — never a `SELECT → check → UPDATE` sequence at the
+application level. Exactly one write applies; the loser's write reports
+`count: 0`, and `processPayment` resolves that into a controlled
+`PROVIDER_REFERENCE_ALREADY_SET` result carrying the Payment's actual
+current state, never a corrupted or silently-overwritten value. Verified
+under genuine `Promise.all` concurrency against real Postgres, both at
+the repository level (`setProviderReferenceIfPending` directly) and the
+full application-service level (`processPayment` with a real repository
+and a controllable fake provider — no real provider exists yet).
+
+What Is Deliberately Deferred
+
+No concrete provider (Stripe, PayPal, or otherwise) — `PaymentProvider`
+still has zero implementations. No webhook, no route, no UI. No
+`PaymentAttempt` entity. No refund, cancellation API, or retry
+framework. No new `PaymentStatus` value. No status transition of any
+kind — that remains entirely a future milestone's responsibility, using
+the unmodified `updateStatusIfCurrent` this milestone deliberately left
+untouched.
+
+Tests
+
+23 new tests: application-layer (`process-payment.test.ts`) covering
+Payment-not-found, a PENDING Payment reaching the provider exactly once
+with exactly the three documented input fields, authoritative (not
+hardcoded) amount/currency reaching the provider, a successful result
+persisting the reference while the Payment stays `PENDING`, the provider
+never being able to replace amount/currency, a controlled
+`PROVIDER_ERROR` result that leaves the Payment uncorrupted with no
+repository write attempted, all three terminal statuses being rejected
+without ever calling the provider, and the race-loser path
+(`PROVIDER_REFERENCE_ALREADY_SET`) with a genuinely conditional fake
+repository (not an always-succeeds stub) — plus a real-repository,
+real-concurrency describe block proving the same guarantees against real
+Postgres. Repository-layer (`prisma-payment-repository.test.ts`):
+`setProviderReferenceIfPending` persistence, non-overwrite of an
+already-set reference, rejection on a non-`PENDING` Payment, and a
+genuine concurrent race. Full existing suite (Order, Checkout, Catalog,
+Identity, CR-029, CR-030, IMP-031, IMP-032, IMP-033) re-run and confirmed
+passing unmodified.
+
+Validation Results
+
+`pnpm test`: 290/290 passing (267 pre-existing + 23 new), 26 test files,
+zero regressions — confirmed via three independent clean sequential
+(`--no-file-parallelism`) runs after this session's parallel-mode
+worker-spawn flakiness (a known, already-documented sandbox issue
+unrelated to this change) made a single parallel run insufficient
+evidence on its own. `pnpm typecheck`: clean. `pnpm lint`: clean. `pnpm
+format:check`: limited to the two pre-existing, unrelated warnings
+(`next.config.ts`, `pnpm-workspace.yaml`). `pnpm build`: the build's own
+compile step succeeded on every attempt this session
+("✓ Compiled successfully"); the full command's redundant secondary
+type-check worker hit persistent sandbox-level V8 Zone/heap allocation
+crashes across 50+ consecutive attempts — the same class of
+environment-level flakiness documented on IMP-032/IMP-033, just
+unusually severe this session. `pnpm typecheck` passing cleanly, and the
+compile step itself succeeding every time, are the substitute evidence
+that no real compilation or type error exists; the full `pnpm build`
+command itself did not complete successfully during this milestone's
+validation and should be re-run by Code Review/QA.
+
+Remaining Limitations
+
+Everything under "What Is Deliberately Deferred" above. Additionally:
+`processPayment` is not wired to any transport — a future milestone
+decides how/when it gets called. The `pnpm build` validation gap noted
+above should be independently re-verified.
+
+12. Current Production State
 
 The following functionality is currently implemented:
 
@@ -1078,7 +1253,7 @@ Prisma
    ↓
 Neon PostgreSQL
 
-12. Known Limitations
+13. Known Limitations
 Product Details
 
 Product Details is dynamically rendered because database access must not be required during build.
@@ -1112,25 +1287,30 @@ The project currently has unit/integration tests but no dedicated browser E2E te
 
 Browser-level testing should be introduced when justified by upcoming user-critical flows.
 
-13. Next Milestone
+14. Next Milestone
 
 Status
 
 NOT YET APPROVED
 
-The next milestone after IMP-033 must be explicitly defined by the
+The next milestone after IMP-034 must be explicitly defined by the
 Architect before implementation begins.
 
 The following must NOT be assumed to be approved:
 
 an external payment provider (Stripe, PayPal, or any other) — IMP-032
-approved only the internal Payment domain/persistence foundation and
+approved only the internal Payment domain/persistence foundation,
 IMP-033 approved only the provider-neutral `PaymentProvider` port's
-shape, neither approves provider integration itself;
+shape, and IMP-034 approved only the application flow connecting them;
+none approves provider integration itself;
 payment webhooks;
-a transport layer (API/UI) for `initializePayment` or `changeOrderStatus`;
+a transport layer (API/UI) for `processPayment`, `initializePayment`, or
+`changeOrderStatus`;
 `confirmPayment`/`refund`/`cancelPayment` or any other addition to the
 `PaymentProvider` port;
+any new `PaymentStatus` value (`PROCESSING`, `AUTHORIZING`,
+`REQUIRES_ACTION`, `PROVIDER_FAILED`, or otherwise) or any Payment status
+transition triggered by `processPayment`;
 Inventory;
 Admin tooling / Admin UI;
 roles/permissions;
@@ -1142,7 +1322,7 @@ or any other future subsystem.
 
 These require separate requirements and architectural decisions.
 
-14. Future Roadmap Areas
+15. Future Roadmap Areas
 
 The following are possible future areas and are NOT yet approved implementation milestones:
 
@@ -1163,7 +1343,7 @@ Order status history / audit log
 
 No item above should be implemented without explicit Architect approval.
 
-15. Implementation Process
+16. Implementation Process
 
 Every milestone follows this lifecycle:
 
@@ -1192,7 +1372,7 @@ Manual acceptance when required
 Architect approval
     ↓
 Next milestone
-16. Code Review Policy
+17. Code Review Policy
 
 Code Review is performed through:
 
@@ -1216,7 +1396,7 @@ scope compliance.
 
 Claude/local resources should not be used for the primary Code Review when GitHub access is available.
 
-17. Local QA Policy
+18. Local QA Policy
 
 Local QA is performed by Claude/local tooling when possible.
 
@@ -1235,7 +1415,7 @@ relevant performance behavior.
 
 If browser automation is unavailable, browser-only scenarios must be reported as NOT VERIFIED, not assumed to pass.
 
-18. Definition of Done
+19. Definition of Done
 
 A milestone is complete only when:
 
@@ -1249,7 +1429,7 @@ no unresolved P0/P1/P2 defects remain;
 scope has not expanded without approval;
 the milestone commit is traceable;
 this roadmap is updated.
-19. Milestone Summary
+20. Milestone Summary
 Milestone	Status
 IMP-021 — Catalog Persistence Foundation	COMPLETED
 IMP-021-FIX-001 — Public API + Prisma Build Generation	COMPLETED
@@ -1260,8 +1440,9 @@ IMP-030 — Order Lifecycle & Status Management (incl. CR-030)	COMPLETED
 IMP-031 — Checkout Submission Idempotency (incl. IMP-031-FIX / CR-031)	COMPLETED
 IMP-032 — Payment Foundation	COMPLETED
 IMP-033 — Payment Provider Port	COMPLETED
+IMP-034 — Payment Processing Application Flow	COMPLETED (pending commit — see Section 11; pnpm build validation gap noted, see Section 11)
 Next milestone	NOT YET APPROVED
-20. Source of Truth
+21. Source of Truth
 
 This document is the authoritative roadmap for implementation milestones.
 

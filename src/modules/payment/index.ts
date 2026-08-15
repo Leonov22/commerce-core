@@ -13,9 +13,12 @@ import "server-only";
 import { getOrderById } from "@/modules/order";
 import { prismaPaymentRepository } from "@/modules/payment/infrastructure/prisma-payment-repository";
 import * as initializePaymentCommand from "@/modules/payment/application/initialize-payment";
+import * as processPaymentCommand from "@/modules/payment/application/process-payment";
+import type { PaymentProvider } from "@/modules/payment/providers/payment-provider";
 
 export type { Payment, PaymentStatus } from "@/modules/payment/domain/payment";
 export type { InitializePaymentResult } from "@/modules/payment/application/initialize-payment";
+export type { ProcessPaymentResult } from "@/modules/payment/application/process-payment";
 /**
  * The outbound provider port (IMP-033) — no implementation exists yet;
  * exported so a future payment-provider milestone can implement it
@@ -36,4 +39,21 @@ export type {
  */
 export function initializePayment(orderId: string) {
   return initializePaymentCommand.initializePayment(prismaPaymentRepository, getOrderById, orderId);
+}
+
+/**
+ * Processes an existing Payment through a supplied `PaymentProvider`
+ * (IMP-034). Not wired to any transport, and — unlike `initializePayment`
+ * — not wired to a concrete provider either: IMP-033 established the
+ * `PaymentProvider` port with no implementation, so there is nothing real
+ * to pre-wire here yet. `PaymentRepository` (the one dependency that IS
+ * concrete today) is pre-wired the same way as `initializePayment`; a
+ * future milestone supplies `provider` once a real adapter exists. Does
+ * not transition Payment status — a successful provider call only
+ * attaches its opaque provider reference while the Payment stays
+ * `PENDING`; only a future milestone, once a provider genuinely reports a
+ * final result, is responsible for any status transition.
+ */
+export function processPayment(provider: PaymentProvider, paymentId: string) {
+  return processPaymentCommand.processPayment(prismaPaymentRepository, provider, paymentId);
 }

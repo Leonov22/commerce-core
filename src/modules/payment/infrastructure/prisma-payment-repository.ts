@@ -117,4 +117,30 @@ export const prismaPaymentRepository: PaymentRepository = {
     const row = await findPaymentRecord(paymentId);
     return row ? toDomainPayment(row) : null;
   },
+
+  async setProviderReferenceIfPending(
+    paymentId: string,
+    providerReference: string,
+  ): Promise<Payment | null> {
+    // IMP-034: `updateMany` (not `update`) so the WHERE clause can include
+    // both `status` and `providerReference` alongside `id` — Prisma's
+    // single-record `update` only accepts a unique selector. Conditioning
+    // on `providerReference: null` (in addition to `status: "PENDING"`) is
+    // what actually prevents two concurrent callers from silently
+    // overwriting each other's reference: whichever write lands first
+    // flips `providerReference` away from `null`, so the second write's
+    // WHERE clause no longer matches and `count` is 0 — never a
+    // last-write-wins clobber.
+    const result = await prisma.payment.updateMany({
+      where: { id: paymentId, status: "PENDING", providerReference: null },
+      data: { providerReference },
+    });
+
+    if (result.count === 0) {
+      return null;
+    }
+
+    const row = await findPaymentRecord(paymentId);
+    return row ? toDomainPayment(row) : null;
+  },
 };

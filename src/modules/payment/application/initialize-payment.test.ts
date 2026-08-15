@@ -114,6 +114,9 @@ function makeFakePaymentRepository(): {
     async updateStatusIfCurrent() {
       throw new Error("not used by these tests");
     },
+    async setProviderReferenceIfPending() {
+      throw new Error("not used by these tests");
+    },
   };
 
   return { repository, createCalls };

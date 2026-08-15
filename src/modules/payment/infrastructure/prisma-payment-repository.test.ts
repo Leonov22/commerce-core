@@ -216,4 +216,119 @@ describe("prismaPaymentRepository", () => {
     const matching = await prisma.payment.findMany({ where: { orderId: order.id } });
     expect(matching).toHaveLength(1);
   });
+
+  it("IMP-034: setProviderReferenceIfPending persists the reference and keeps status PENDING, confirmed by a fresh re-read", async () => {
+    const order = await createTestOrder();
+    const created = await prismaPaymentRepository.create({
+      orderId: order.id,
+      amountMinor: order.totalAmountMinor,
+      currency: order.currency,
+    });
+    expect(created.outcome).toBe("created");
+    if (created.outcome !== "created") return;
+    paymentIds.push(created.payment.id);
+
+    const updated = await prismaPaymentRepository.setProviderReferenceIfPending(
+      created.payment.id,
+      "provider-ref-abc",
+    );
+    expect(updated?.providerReference).toBe("provider-ref-abc");
+    expect(updated?.status).toBe("PENDING");
+
+    const refetched = await prismaPaymentRepository.findById(created.payment.id);
+    expect(refetched?.providerReference).toBe("provider-ref-abc");
+    expect(refetched?.status).toBe("PENDING");
+  });
+
+  it("IMP-034: setProviderReferenceIfPending does NOT overwrite an already-set reference", async () => {
+    const order = await createTestOrder();
+    const created = await prismaPaymentRepository.create({
+      orderId: order.id,
+      amountMinor: order.totalAmountMinor,
+      currency: order.currency,
+    });
+    expect(created.outcome).toBe("created");
+    if (created.outcome !== "created") return;
+    paymentIds.push(created.payment.id);
+
+    const first = await prismaPaymentRepository.setProviderReferenceIfPending(
+      created.payment.id,
+      "provider-ref-first",
+    );
+    expect(first?.providerReference).toBe("provider-ref-first");
+
+    const second = await prismaPaymentRepository.setProviderReferenceIfPending(
+      created.payment.id,
+      "provider-ref-second",
+    );
+    expect(second).toBeNull();
+
+    const refetched = await prismaPaymentRepository.findById(created.payment.id);
+    expect(refetched?.providerReference).toBe("provider-ref-first");
+  });
+
+  it("IMP-034: setProviderReferenceIfPending does NOT update a non-PENDING Payment", async () => {
+    const order = await createTestOrder();
+    const created = await prismaPaymentRepository.create({
+      orderId: order.id,
+      amountMinor: order.totalAmountMinor,
+      currency: order.currency,
+    });
+    expect(created.outcome).toBe("created");
+    if (created.outcome !== "created") return;
+    paymentIds.push(created.payment.id);
+
+    const toSucceeded = await prismaPaymentRepository.updateStatusIfCurrent(
+      created.payment.id,
+      "PENDING",
+      "SUCCEEDED",
+    );
+    expect(toSucceeded?.status).toBe("SUCCEEDED");
+
+    const rejected = await prismaPaymentRepository.setProviderReferenceIfPending(
+      created.payment.id,
+      "provider-ref-too-late",
+    );
+    expect(rejected).toBeNull();
+
+    const refetched = await prismaPaymentRepository.findById(created.payment.id);
+    expect(refetched?.providerReference).toBeNull();
+    expect(refetched?.status).toBe("SUCCEEDED");
+  });
+
+  it("IMP-034: genuine concurrent setProviderReferenceIfPending calls for the same Payment — exactly one write applies, the reference is never corrupted", async () => {
+    const order = await createTestOrder();
+    const created = await prismaPaymentRepository.create({
+      orderId: order.id,
+      amountMinor: order.totalAmountMinor,
+      currency: order.currency,
+    });
+    expect(created.outcome).toBe("created");
+    if (created.outcome !== "created") return;
+    paymentIds.push(created.payment.id);
+
+    // Real parallel execution against the same live Postgres connection
+    // pool, two DIFFERENT reference values racing for the same row —
+    // Postgres's own evaluation of `providerReference IS NULL` at write
+    // time, not this test's control flow, decides which one lands.
+    const [a, b] = await Promise.all([
+      prismaPaymentRepository.setProviderReferenceIfPending(created.payment.id, "race-ref-a"),
+      prismaPaymentRepository.setProviderReferenceIfPending(created.payment.id, "race-ref-b"),
+    ]);
+
+    const results = [a, b];
+    const succeeded = results.filter((r) => r !== null);
+    const failed = results.filter((r) => r === null);
+
+    expect(succeeded).toHaveLength(1);
+    expect(failed).toHaveLength(1);
+
+    const winningReference = succeeded[0]!.providerReference;
+    expect(["race-ref-a", "race-ref-b"]).toContain(winningReference);
+
+    // The database's actual final state matches whichever one "won" —
+    // never a mix, never overwritten by the loser.
+    const refetched = await prismaPaymentRepository.findById(created.payment.id);
+    expect(refetched?.providerReference).toBe(winningReference);
+  });
 });
