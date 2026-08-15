@@ -156,6 +156,26 @@ model Order {
 
   items OrderItem[]
 
+  // Checkout submission idempotency (IMP-031). Nullable + unique: Postgres
+  // treats every NULL as distinct from every other NULL, so orders created
+  // without an idempotency key (e.g. the generic internal `createOrder`
+  // command) coexist freely, while any two orders that DO supply a key are
+  // guaranteed distinct at the database level — including guest orders,
+  // where `userId` is null and therefore cannot itself be part of a safe
+  // compound unique key (`UNIQUE(userId, idempotencyKey)` would let two
+  // different guest submissions share one key, since Postgres never
+  // considers two NULL `userId`s equal). A single-column unique constraint
+  // on the required, non-null key itself has no such gap.
+  idempotencyKey String? @unique
+
+  // Hash of the client-submitted checkout payload (customer info, cart
+  // items, delivery amount, resolved userId) captured when the key was
+  // first used. Lets a replay of the same submission be distinguished from
+  // a genuine conflict — the same key reused for a materially different
+  // submission, including a different user — without storing the raw
+  // payload a second time.
+  idempotencyRequestHash String?
+
   @@index([status])
   @@index([createdAt])
   // Supports the customer order-history query: filter by owner, ordered

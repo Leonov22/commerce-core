@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   createOrderFromCheckout,
   MAX_QUANTITY_PER_ITEM,
@@ -7,9 +7,16 @@ import {
   isWithinSafeAmountRange,
 } from "@/modules/order/application/checkout-order";
 import type { CheckoutOrderCustomer } from "@/modules/order/application/checkout-order";
-import type { OrderRepository, NewOrderInput } from "@/modules/order/repositories/order-repository";
+import type {
+  OrderRepository,
+  NewOrderInput,
+  CreateIdempotentOrderInput,
+  CreateIdempotentOrderResult,
+} from "@/modules/order/repositories/order-repository";
 import type { Order } from "@/modules/order/domain/order";
 import type { Product } from "@/modules/catalog/domain/product";
+import { prismaOrderRepository } from "@/modules/order/infrastructure/prisma-order-repository";
+import { prisma } from "@/modules/order/infrastructure/prisma-client";
 
 /**
  * `qa-overflow-fixture` is a reserved id intercepted by the `@/modules/catalog`
@@ -77,33 +84,49 @@ vi.mock("@/modules/catalog", async (importOriginal) => {
  * which exercises the real repository and does clean up).
  */
 
-function makeFakeRepository(): { repository: OrderRepository; calls: NewOrderInput[] } {
+function makeFakeRepository(): {
+  repository: OrderRepository;
+  calls: NewOrderInput[];
+  createIdempotentCalls: CreateIdempotentOrderInput[];
+} {
   const calls: NewOrderInput[] = [];
+  const createIdempotentCalls: CreateIdempotentOrderInput[] = [];
+  // IMP-031: mirrors the real Prisma repository's `idempotencyKey` unique
+  // constraint semantics — a key maps to at most one persisted Order and
+  // its fingerprint, forever; a second `createIdempotent` call under the
+  // same key never persists a second Order, it only resolves against
+  // whichever one is already in this map.
+  const byIdempotencyKey = new Map<string, { order: Order; hash: string }>();
+  let nextOrderId = 0;
+
+  function buildOrder(input: NewOrderInput, id: string): Order {
+    const now = new Date();
+    return {
+      id,
+      status: input.status ?? "PENDING",
+      firstName: input.firstName,
+      lastName: input.lastName,
+      email: input.email,
+      phone: input.phone,
+      userId: input.userId,
+      subtotalAmountMinor: input.subtotalAmountMinor,
+      deliveryAmountMinor: input.deliveryAmountMinor,
+      totalAmountMinor: input.totalAmountMinor,
+      currency: input.currency,
+      createdAt: now,
+      updatedAt: now,
+      items: input.items.map((item, index) => ({
+        id: `fake-item-${id}-${index}`,
+        orderId: id,
+        ...item,
+      })),
+    };
+  }
+
   const repository: OrderRepository = {
     async create(input) {
       calls.push(input);
-      const now = new Date();
-      const order: Order = {
-        id: "fake-order-id",
-        status: input.status ?? "PENDING",
-        firstName: input.firstName,
-        lastName: input.lastName,
-        email: input.email,
-        phone: input.phone,
-        userId: input.userId,
-        subtotalAmountMinor: input.subtotalAmountMinor,
-        deliveryAmountMinor: input.deliveryAmountMinor,
-        totalAmountMinor: input.totalAmountMinor,
-        currency: input.currency,
-        createdAt: now,
-        updatedAt: now,
-        items: input.items.map((item, index) => ({
-          id: `fake-item-${index}`,
-          orderId: "fake-order-id",
-          ...item,
-        })),
-      };
-      return order;
+      return buildOrder(input, "fake-order-id");
     },
     // Not exercised by this file's tests (IMP-026/026-FIX/026-FIX-TESTS
     // predate customer order history and order lifecycle) — present only
@@ -120,8 +143,22 @@ function makeFakeRepository(): { repository: OrderRepository; calls: NewOrderInp
     async updateStatusIfCurrent() {
       throw new Error("not used by these tests");
     },
+    async createIdempotent(input): Promise<CreateIdempotentOrderResult> {
+      createIdempotentCalls.push(input);
+      const existing = byIdempotencyKey.get(input.idempotencyKey);
+      if (existing) {
+        if (existing.hash === input.idempotencyRequestHash) {
+          return { outcome: "duplicate", order: existing.order };
+        }
+        return { outcome: "conflict" };
+      }
+      nextOrderId += 1;
+      const order = buildOrder(input, `fake-order-id-${nextOrderId}`);
+      byIdempotencyKey.set(input.idempotencyKey, { order, hash: input.idempotencyRequestHash });
+      return { outcome: "created", order };
+    },
   };
-  return { repository, calls };
+  return { repository, calls, createIdempotentCalls };
 }
 
 const validCustomer: CheckoutOrderCustomer = {
@@ -467,6 +504,302 @@ describe("createOrderFromCheckout — monetary overflow (application path)", () 
     if (result.ok) return;
     expect(result.error).toBe("AMOUNT_OUT_OF_RANGE");
     expect(calls).toHaveLength(0);
+  });
+});
+
+/**
+ * IMP-031 checkout submission idempotency, at the application layer. The
+ * `OrderRepository` here is a fake that genuinely implements
+ * `createIdempotent`'s conditional semantics (see `makeFakeRepository`
+ * above) — real database-enforced atomicity under actual concurrency is
+ * covered separately in `prisma-order-repository.test.ts`, against the real
+ * repository and a real Postgres unique constraint.
+ */
+describe("createOrderFromCheckout — idempotency (IMP-031)", () => {
+  it("Case 1: a new idempotency key creates exactly one Order and reports created: true", async () => {
+    const { repository, createIdempotentCalls } = makeFakeRepository();
+    const result = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 1 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+      idempotencyKey: "key-case-1-aaaaaaaaaaaa",
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.created).toBe(true);
+    expect(createIdempotentCalls).toHaveLength(1);
+    expect(createIdempotentCalls[0]?.idempotencyKey).toBe("key-case-1-aaaaaaaaaaaa");
+  });
+
+  it("Case 2: replaying the same key with the same logical request returns the same Order and reports created: false, without a second repository create", async () => {
+    const { repository } = makeFakeRepository();
+    const submit = () =>
+      createOrderFromCheckout(repository, {
+        customer: validCustomer,
+        items: [{ productId: "1", quantity: 1 }],
+        deliveryAmountMinor: 800,
+        locale: "en",
+        idempotencyKey: "key-case-2-aaaaaaaaaaaa",
+      });
+
+    const first = await submit();
+    const second = await submit();
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+    expect(second.order.id).toBe(first.order.id);
+    expect(first.created).toBe(true);
+    expect(second.created).toBe(false);
+  });
+
+  it("Case 4: different keys for otherwise-identical requests create independent Orders", async () => {
+    const { repository } = makeFakeRepository();
+    const first = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 1 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+      idempotencyKey: "key-case-4-a-aaaaaaaaaaaa",
+    });
+    const second = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 1 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+      idempotencyKey: "key-case-4-b-aaaaaaaaaaaa",
+    });
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+    expect(first.order.id).not.toBe(second.order.id);
+    expect(first.created).toBe(true);
+    expect(second.created).toBe(true);
+  });
+
+  it("Case 5: the same key with a different cart is rejected with IDEMPOTENCY_KEY_CONFLICT, and the original Order is not returned", async () => {
+    const { repository } = makeFakeRepository();
+    const key = "key-case-5-aaaaaaaaaaaaaa";
+    const first = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 1 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+      idempotencyKey: key,
+    });
+    expect(first.ok).toBe(true);
+
+    const second = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 2 }], // different cart, same key
+      deliveryAmountMinor: 800,
+      locale: "en",
+      idempotencyKey: key,
+    });
+
+    expect(second).toEqual({ ok: false, error: "IDEMPOTENCY_KEY_CONFLICT" });
+  });
+
+  it("Case 5: the same key with different customer info is rejected with IDEMPOTENCY_KEY_CONFLICT", async () => {
+    const { repository } = makeFakeRepository();
+    const key = "key-case-5b-aaaaaaaaaaaaa";
+    const first = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 1 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+      idempotencyKey: key,
+    });
+    expect(first.ok).toBe(true);
+
+    const second = await createOrderFromCheckout(repository, {
+      customer: { ...validCustomer, email: "someone-else@example.com" },
+      items: [{ productId: "1", quantity: 1 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+      idempotencyKey: key,
+    });
+
+    expect(second).toEqual({ ok: false, error: "IDEMPOTENCY_KEY_CONFLICT" });
+  });
+
+  it("Case 6/9: a guest reusing an authenticated user's key gets a conflict, never that user's Order (ownership isolation)", async () => {
+    const { repository } = makeFakeRepository();
+    const key = "key-case-9-aaaaaaaaaaaaaa";
+    const authenticated = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 1 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+      userId: "user-a",
+      idempotencyKey: key,
+    });
+    expect(authenticated.ok).toBe(true);
+
+    // Same cart, same customer info, same key — the ONLY difference is the
+    // resolved userId (guest vs. the original authenticated user). Must
+    // not resolve as a "duplicate" and hand back user-a's Order.
+    const guestReplay = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 1 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+      userId: null,
+      idempotencyKey: key,
+    });
+
+    expect(guestReplay).toEqual({ ok: false, error: "IDEMPOTENCY_KEY_CONFLICT" });
+  });
+
+  it("Case 6: guest idempotency — a retry by the same guest (no session) returns the same Order and userId stays null", async () => {
+    const { repository } = makeFakeRepository();
+    const submit = () =>
+      createOrderFromCheckout(repository, {
+        customer: validCustomer,
+        items: [{ productId: "1", quantity: 1 }],
+        deliveryAmountMinor: 800,
+        locale: "en",
+        userId: null,
+        idempotencyKey: "key-case-6-aaaaaaaaaaaaa",
+      });
+
+    const first = await submit();
+    const second = await submit();
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+    expect(second.order.id).toBe(first.order.id);
+    expect(second.order.userId).toBeNull();
+    expect(second.created).toBe(false);
+  });
+
+  it("Case 7: authenticated idempotency — a retry by the same user returns the same Order and preserves userId", async () => {
+    const { repository } = makeFakeRepository();
+    const submit = () =>
+      createOrderFromCheckout(repository, {
+        customer: validCustomer,
+        items: [{ productId: "1", quantity: 1 }],
+        deliveryAmountMinor: 800,
+        locale: "en",
+        userId: "user-a",
+        idempotencyKey: "key-case-7-aaaaaaaaaaaaa",
+      });
+
+    const first = await submit();
+    const second = await submit();
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+    expect(second.order.id).toBe(first.order.id);
+    expect(second.order.userId).toBe("user-a");
+  });
+
+  it("Case 10 (backward compatibility): omitting the idempotency key entirely falls back to the plain, unconditional create path", async () => {
+    const { repository, calls, createIdempotentCalls } = makeFakeRepository();
+    const result = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [{ productId: "1", quantity: 1 }],
+      deliveryAmountMinor: 800,
+      locale: "en",
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.created).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(createIdempotentCalls).toHaveLength(0);
+  });
+
+  it("existing validation (EMPTY_CART) still runs before any repository call, even with an idempotency key present", async () => {
+    const { repository, createIdempotentCalls } = makeFakeRepository();
+    const result = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [],
+      deliveryAmountMinor: 800,
+      locale: "en",
+      idempotencyKey: "key-case-10-aaaaaaaaaaaa",
+    });
+
+    expect(result).toEqual({ ok: false, error: "EMPTY_CART" });
+    expect(createIdempotentCalls).toHaveLength(0);
+  });
+});
+
+/**
+ * IMP-031 idempotency, full pipeline: real Catalog resolution (as above)
+ * AND the real `prismaOrderRepository` (unlike every other test in this
+ * file, which injects a fake) against the real Neon database — the
+ * strongest available proof that `createOrderFromCheckout` itself, not
+ * just the repository in isolation, is safe under genuine concurrency.
+ */
+describe("createOrderFromCheckout — idempotency (IMP-031), real repository + real Catalog + real concurrency", () => {
+  const createdOrderIds: string[] = [];
+
+  afterAll(async () => {
+    if (createdOrderIds.length > 0) {
+      await prisma.order.deleteMany({ where: { id: { in: createdOrderIds } } });
+    }
+    await prisma.$disconnect();
+  });
+
+  it("a full-pipeline retry (real Catalog + real repository) returns the same Order and creates nothing new", async () => {
+    const key = `idem-full-pipeline-${Date.now()}`;
+    const submit = () =>
+      createOrderFromCheckout(prismaOrderRepository, {
+        customer: validCustomer,
+        items: [{ productId: "1", quantity: 1 }],
+        deliveryAmountMinor: 800,
+        locale: "en",
+        idempotencyKey: key,
+      });
+
+    const first = await submit();
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    createdOrderIds.push(first.order.id);
+    expect(first.created).toBe(true);
+
+    const second = await submit();
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.order.id).toBe(first.order.id);
+    expect(second.created).toBe(false);
+
+    const matching = await prisma.order.findMany({ where: { idempotencyKey: key } });
+    expect(matching).toHaveLength(1);
+  });
+
+  it("IMP-031/Case 3, full pipeline: genuine concurrent duplicate checkout submissions (real Catalog + real repository) create exactly one Order", async () => {
+    const key = `idem-full-pipeline-race-${Date.now()}`;
+    const submit = () =>
+      createOrderFromCheckout(prismaOrderRepository, {
+        customer: validCustomer,
+        items: [{ productId: "1", quantity: 1 }],
+        deliveryAmountMinor: 800,
+        locale: "en",
+        idempotencyKey: key,
+      });
+
+    const [a, b] = await Promise.all([submit(), submit()]);
+
+    expect(a.ok).toBe(true);
+    expect(b.ok).toBe(true);
+    if (!a.ok || !b.ok) return;
+    expect(a.order.id).toBe(b.order.id);
+    createdOrderIds.push(a.order.id);
+
+    // Exactly one of the two calls reports having actually created it.
+    const createdFlags = [a.created, b.created];
+    expect(createdFlags.filter((flag) => flag === true)).toHaveLength(1);
+    expect(createdFlags.filter((flag) => flag === false)).toHaveLength(1);
+
+    const matching = await prisma.order.findMany({ where: { idempotencyKey: key } });
+    expect(matching).toHaveLength(1);
   });
 });
 

@@ -5,11 +5,13 @@ import { createOrderFromCheckout, MAX_QUANTITY_PER_ITEM } from "@/modules/order"
 import { getCurrentUser } from "@/modules/identity";
 import { routing } from "@/core/i18n/routing";
 import { isPlainRequestObject } from "@/app/api/orders/validate-request-body";
+import { isValidIdempotencyKey } from "@/app/api/orders/validate-idempotency-key";
 
 /**
  * Order Creation boundary for Checkout.
  *
  * POST /api/orders
+ * Header: Idempotency-Key: <opaque-key> (required)
  *
  * - Accepts only what the client is legitimately responsible for: customer
  *   contact info, cart product ids/quantities, and a delivery method key.
@@ -18,6 +20,12 @@ import { isPlainRequestObject } from "@/app/api/orders/validate-request-body";
  *   value is resolved/calculated server-side in
  *   `createOrderFromCheckout` (see `@/modules/order`).
  * - No payment. Every created Order is PENDING.
+ * - IMP-031: the `Idempotency-Key` header (never a body field — the request
+ *   body is the business payload, not a place to carry a correlation
+ *   token) makes a retried submission return the original Order instead of
+ *   creating a duplicate. It is a correlation token only — never treated as
+ *   authorization; `userId` below is still resolved solely from the
+ *   session.
  */
 
 const MAX_ITEMS_PER_REQUEST = 50;
@@ -35,6 +43,14 @@ interface RawOrderItem {
 }
 
 export async function POST(request: Request) {
+  const idempotencyKey = request.headers.get("Idempotency-Key");
+  if (!idempotencyKey) {
+    return NextResponse.json({ error: "IDEMPOTENCY_KEY_REQUIRED" }, { status: 400 });
+  }
+  if (!isValidIdempotencyKey(idempotencyKey)) {
+    return NextResponse.json({ error: "INVALID_IDEMPOTENCY_KEY" }, { status: 400 });
+  }
+
   let rawBody: unknown;
   try {
     rawBody = await request.json();
@@ -110,6 +126,7 @@ export async function POST(request: Request) {
       deliveryAmountMinor,
       locale,
       userId,
+      idempotencyKey,
     });
 
     if (!result.ok) {
@@ -130,12 +147,22 @@ export async function POST(request: Request) {
           return NextResponse.json({ error: "INTERNAL_ERROR" }, { status: 500 });
         case "AMOUNT_OUT_OF_RANGE":
           return NextResponse.json({ error: "AMOUNT_OUT_OF_RANGE" }, { status: 400 });
+        case "IDEMPOTENCY_KEY_CONFLICT":
+          // Same key, different logical request (or a different resolved
+          // user) — reject outright, never return the mismatched Order.
+          return NextResponse.json({ error: "IDEMPOTENCY_KEY_CONFLICT" }, { status: 409 });
         default:
           return NextResponse.json({ error: "INTERNAL_ERROR" }, { status: 500 });
       }
     }
 
     const { order } = result;
+    // `created === false` means this key was already used for the same
+    // logical submission — nothing new was persisted, so 200 rather than
+    // 201. `created` is `undefined` only if `createOrderFromCheckout` were
+    // ever called without an idempotency key, which never happens from
+    // this route since it's required above.
+    const statusCode = result.created === false ? 200 : 201;
     return NextResponse.json(
       {
         order: {
@@ -147,7 +174,7 @@ export async function POST(request: Request) {
           currency: order.currency,
         },
       },
-      { status: 201 },
+      { status: statusCode },
     );
   } catch (error) {
     // Never leak raw database/Prisma errors to the client.

@@ -406,6 +406,190 @@ describe("prismaOrderRepository — order lifecycle", () => {
 });
 
 /**
+ * Checkout submission idempotency (IMP-031) — real Postgres integration
+ * tests for `createIdempotent`. The unique constraint on `idempotencyKey`
+ * is what actually provides the guarantee under real concurrency; a fake
+ * repository cannot prove this (see `checkout-order.test.ts`'s comment on
+ * why its own fake-repository race would be meaningless), so the Case 3
+ * (concurrent duplicate) requirement is proven here, against the real
+ * database, not simulated.
+ */
+describe("prismaOrderRepository — checkout idempotency (IMP-031)", () => {
+  const idempotencyOrderIds: string[] = [];
+
+  afterAll(async () => {
+    if (idempotencyOrderIds.length > 0) {
+      await prisma.order.deleteMany({ where: { id: { in: idempotencyOrderIds } } });
+    }
+    await prisma.$disconnect();
+  });
+
+  function baseInput(overrides: Partial<NewOrderInput> = {}): NewOrderInput {
+    return {
+      firstName: "John",
+      lastName: "Smith",
+      email: "john.smith@example.com",
+      phone: "+421 900 123 456",
+      userId: null,
+      subtotalAmountMinor: 24000,
+      deliveryAmountMinor: 800,
+      totalAmountMinor: 24800,
+      currency: "USD",
+      items: [
+        {
+          productId: "1",
+          productName: "Studio Chair",
+          unitPriceAmountMinor: 24000,
+          quantity: 1,
+          lineTotalAmountMinor: 24000,
+          currency: "USD",
+        },
+      ],
+      ...overrides,
+    };
+  }
+
+  it("a brand-new idempotency key persists a new Order (outcome: created)", async () => {
+    const result = await prismaOrderRepository.createIdempotent({
+      ...baseInput(),
+      idempotencyKey: `idem-created-${Date.now()}`,
+      idempotencyRequestHash: "hash-a",
+    });
+    expect(result.outcome).toBe("created");
+    if (result.outcome !== "created") return;
+    idempotencyOrderIds.push(result.order.id);
+    expect(result.order.status).toBe("PENDING");
+  });
+
+  it("replaying the same key with the same request hash returns the existing Order (outcome: duplicate) and persists no second row", async () => {
+    const key = `idem-duplicate-${Date.now()}`;
+    const first = await prismaOrderRepository.createIdempotent({
+      ...baseInput(),
+      idempotencyKey: key,
+      idempotencyRequestHash: "hash-b",
+    });
+    expect(first.outcome).toBe("created");
+    if (first.outcome !== "created") return;
+    idempotencyOrderIds.push(first.order.id);
+
+    const second = await prismaOrderRepository.createIdempotent({
+      ...baseInput(),
+      idempotencyKey: key,
+      idempotencyRequestHash: "hash-b",
+    });
+    expect(second.outcome).toBe("duplicate");
+    if (second.outcome === "conflict") return;
+    expect(second.order.id).toBe(first.order.id);
+
+    // Independent re-count proves no second row was persisted under this key.
+    const matching = await prisma.order.findMany({ where: { idempotencyKey: key } });
+    expect(matching).toHaveLength(1);
+  });
+
+  it("replaying the same key with a different request hash returns outcome: conflict and persists no second row", async () => {
+    const key = `idem-conflict-${Date.now()}`;
+    const first = await prismaOrderRepository.createIdempotent({
+      ...baseInput(),
+      idempotencyKey: key,
+      idempotencyRequestHash: "hash-original",
+    });
+    expect(first.outcome).toBe("created");
+    if (first.outcome !== "created") return;
+    idempotencyOrderIds.push(first.order.id);
+
+    const second = await prismaOrderRepository.createIdempotent({
+      ...baseInput({ subtotalAmountMinor: 9999, totalAmountMinor: 10799 }),
+      idempotencyKey: key,
+      idempotencyRequestHash: "hash-different",
+    });
+    expect(second.outcome).toBe("conflict");
+
+    const matching = await prisma.order.findMany({ where: { idempotencyKey: key } });
+    expect(matching).toHaveLength(1);
+    expect(matching[0]?.totalAmountMinor).toBe(24800); // the original, unmodified
+  });
+
+  it("different keys create independent Orders", async () => {
+    const first = await prismaOrderRepository.createIdempotent({
+      ...baseInput(),
+      idempotencyKey: `idem-distinct-a-${Date.now()}`,
+      idempotencyRequestHash: "hash-distinct-a",
+    });
+    const second = await prismaOrderRepository.createIdempotent({
+      ...baseInput(),
+      idempotencyKey: `idem-distinct-b-${Date.now()}`,
+      idempotencyRequestHash: "hash-distinct-b",
+    });
+    expect(first.outcome).toBe("created");
+    expect(second.outcome).toBe("created");
+    if (first.outcome !== "created" || second.outcome !== "created") return;
+    idempotencyOrderIds.push(first.order.id, second.order.id);
+    expect(first.order.id).not.toBe(second.order.id);
+  });
+
+  it("IMP-031/Case 3: genuine concurrent createIdempotent calls with the same key and hash — exactly one 'created', one 'duplicate', both pointing at one Order, and exactly one row persisted", async () => {
+    const key = `idem-race-${Date.now()}`;
+    const input = {
+      ...baseInput(),
+      idempotencyKey: key,
+      idempotencyRequestHash: "hash-race",
+    };
+
+    // Real parallel execution against the same live Postgres connection
+    // pool — Postgres's own unique constraint on `idempotencyKey`, not this
+    // test's control flow, decides which INSERT actually lands.
+    const [a, b] = await Promise.all([
+      prismaOrderRepository.createIdempotent(input),
+      prismaOrderRepository.createIdempotent(input),
+    ]);
+
+    const results = [a, b];
+    const created = results.filter((r) => r.outcome === "created");
+    const duplicate = results.filter((r) => r.outcome === "duplicate");
+
+    expect(created).toHaveLength(1);
+    expect(duplicate).toHaveLength(1);
+
+    const createdOrderId = created[0]!.outcome === "created" ? created[0]!.order.id : null;
+    const duplicateOrderId = duplicate[0]!.outcome === "duplicate" ? duplicate[0]!.order.id : null;
+    expect(duplicateOrderId).toBe(createdOrderId);
+    if (createdOrderId) idempotencyOrderIds.push(createdOrderId);
+
+    const matching = await prisma.order.findMany({ where: { idempotencyKey: key } });
+    expect(matching).toHaveLength(1);
+  });
+
+  it("IMP-031: repeats the concurrent race 10 times with fresh keys — every iteration produces exactly one created + one duplicate outcome and exactly one persisted row", async () => {
+    for (let i = 0; i < 10; i += 1) {
+      const key = `idem-race-repeat-${Date.now()}-${i}`;
+      const input = {
+        ...baseInput(),
+        idempotencyKey: key,
+        idempotencyRequestHash: `hash-race-repeat-${i}`,
+      };
+
+      const [a, b] = await Promise.all([
+        prismaOrderRepository.createIdempotent(input),
+        prismaOrderRepository.createIdempotent(input),
+      ]);
+
+      const results = [a, b];
+      const created = results.filter((r) => r.outcome === "created");
+      const duplicate = results.filter((r) => r.outcome === "duplicate");
+
+      expect(created).toHaveLength(1);
+      expect(duplicate).toHaveLength(1);
+
+      const createdOrderId = created[0]!.outcome === "created" ? created[0]!.order.id : null;
+      if (createdOrderId) idempotencyOrderIds.push(createdOrderId);
+
+      const matching = await prisma.order.findMany({ where: { idempotencyKey: key } });
+      expect(matching).toHaveLength(1);
+    }
+  }, 30000);
+});
+
+/**
  * Customer order history (IMP-029) — real Postgres integration tests, same
  * rationale as the suite above. Creates real `User` rows directly via
  * `prisma.user.create` for FK-valid test data; this touches the shared

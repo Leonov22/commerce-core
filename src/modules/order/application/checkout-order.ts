@@ -1,5 +1,6 @@
 import "server-only";
 import { getProductsByIds } from "@/modules/catalog";
+import { computeCheckoutSubmissionFingerprint } from "@/modules/order/application/idempotency";
 import type { OrderRepository } from "@/modules/order/repositories/order-repository";
 import type { Order } from "@/modules/order/domain/order";
 
@@ -35,15 +36,45 @@ export interface CheckoutOrderRequest {
    * case that doesn't specify it keeps compiling as a guest-order test.
    */
   userId?: string | null;
+  /**
+   * IMP-031 checkout submission idempotency. The transport boundary (the
+   * `POST /api/orders` route) requires this on every real request via the
+   * `Idempotency-Key` header; it stays optional here — mirroring `userId`
+   * above — so callers that don't care about idempotency (the generic
+   * internal `createOrder` command, and every pre-IMP-031 test exercising
+   * pure checkout validation) keep working unchanged via a plain
+   * `repository.create()`. Supplying it switches this function onto the
+   * atomic `repository.createIdempotent()` path.
+   */
+  idempotencyKey?: string;
 }
 
 export type CreateOrderFromCheckoutResult =
-  | { ok: true; order: Order }
+  | {
+      ok: true;
+      order: Order;
+      /**
+       * `false` only when this call returned an Order that had already
+       * been created by an earlier (or concurrently racing) call under the
+       * same idempotency key — i.e. nothing new was persisted this time.
+       * Absent when no `idempotencyKey` was supplied at all. The API route
+       * uses this to choose between 201 (created) and 200 (replayed).
+       */
+      created?: boolean;
+    }
   | { ok: false; error: "EMPTY_CART" }
   | { ok: false; error: "INVALID_QUANTITY"; productId: string }
   | { ok: false; error: "UNRESOLVED_PRODUCTS"; productIds: string[] }
   | { ok: false; error: "INCONSISTENT_CURRENCY" }
-  | { ok: false; error: "AMOUNT_OUT_OF_RANGE" };
+  | { ok: false; error: "AMOUNT_OUT_OF_RANGE" }
+  /**
+   * IMP-031: `idempotencyKey` was already used for a Order whose submission
+   * fingerprint doesn't match this request — a materially different
+   * submission (including a different resolved user) reusing someone
+   * else's key. The caller must reject this outright and must never fall
+   * back to returning the mismatched existing Order.
+   */
+  | { ok: false; error: "IDEMPOTENCY_KEY_CONFLICT" };
 
 /**
  * A single OrderItem's quantity ceiling. 100 units of one product is
@@ -165,8 +196,8 @@ export async function createOrderFromCheckout(
     return { ok: false, error: "AMOUNT_OUT_OF_RANGE" };
   }
 
-  const order = await repository.create({
-    status: "PENDING",
+  const newOrderInput = {
+    status: "PENDING" as const,
     firstName: request.customer.firstName,
     lastName: request.customer.lastName,
     email: request.customer.email,
@@ -177,7 +208,33 @@ export async function createOrderFromCheckout(
     totalAmountMinor,
     currency,
     items,
+  };
+
+  if (!request.idempotencyKey) {
+    const order = await repository.create(newOrderInput);
+    return { ok: true, order };
+  }
+
+  // IMP-031: fingerprint the *client-submitted* request (raw items +
+  // customer + delivery amount + resolved userId), not the Catalog-resolved
+  // `items` built above — a Catalog price change between two retries of the
+  // same cart must never make a genuine retry look like a conflict.
+  const idempotencyRequestHash = computeCheckoutSubmissionFingerprint({
+    customer: request.customer,
+    items: request.items,
+    deliveryAmountMinor: request.deliveryAmountMinor,
+    userId: request.userId ?? null,
   });
 
-  return { ok: true, order };
+  const result = await repository.createIdempotent({
+    ...newOrderInput,
+    idempotencyKey: request.idempotencyKey,
+    idempotencyRequestHash,
+  });
+
+  if (result.outcome === "conflict") {
+    return { ok: false, error: "IDEMPOTENCY_KEY_CONFLICT" };
+  }
+
+  return { ok: true, order: result.order, created: result.outcome === "created" };
 }

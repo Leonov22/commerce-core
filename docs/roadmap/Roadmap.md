@@ -401,7 +401,182 @@ NOT YET APPROVED. Payments, admin tooling, or any transport layer for
 changeOrderStatus require separate Architect-approved requirements before
 implementation begins.
 
-8. Current Production State
+8. IMP-031 — Checkout Submission Idempotency
+
+Status
+
+COMPLETED (implementation + validation; not yet committed — see Commit below)
+
+Commit
+
+Not yet committed at the time this entry was written — implementation and
+validation are complete, pending Code Review before a commit is created.
+Update this field with the real commit SHA immediately once the IMP-031
+commit is created; do not leave this placeholder in a completed entry
+after that point.
+
+Objective
+
+Prevent duplicate Orders when the same logical Checkout submission is
+retried (network timeout, double-click, client retry logic) or arrives as
+genuinely concurrent duplicate requests — without introducing any new
+infrastructure (no Redis, queue, event bus, CQRS, or generic
+optimistic-concurrency framework). One logical Checkout submission must
+produce exactly one Order, under retries and under real concurrency.
+
+Requirements (approved architecture)
+
+Database-enforced uniqueness, not an application-level "check, then
+insert" sequence — that pattern cannot rule out two concurrent callers
+both passing the check before either insert lands. `POST /api/orders`
+requires a client-supplied `Idempotency-Key` header (never a body field)
+on every request. Every newly created Order remains `PENDING` —
+`changeOrderStatus()` is not wired to this endpoint.
+
+Architecture Decisions
+
+Idempotency is represented as two nullable columns directly on `Order`
+(`idempotencyKey`, `idempotencyRequestHash`), not a dedicated persistence
+structure — the simplest design that is actually correct for both
+authenticated and guest checkout. A naive `UNIQUE(userId, idempotencyKey)`
+compound constraint was explicitly rejected: Postgres treats every NULL
+`userId` as distinct from every other NULL, so two different guest
+submissions could share one key and both pass that constraint, defeating
+idempotency exactly for the guest case the requirements called out.
+Instead, `idempotencyKey` alone is `@unique` — a single-column unique
+constraint has no such gap, since the key itself (not `userId`) is what
+must never repeat, and it is required on every real request so it is
+never NULL in practice. Orders created without a key (the generic
+internal `createOrder` command, unrelated to Checkout) coexist freely,
+since Postgres allows unlimited NULLs in a nullable unique column.
+
+`OrderRepository.createIdempotent()` performs the persist and the
+duplicate-detection as one database operation — a single `INSERT`,
+relying on Postgres's own unique-constraint enforcement to decide which
+of two concurrent callers actually wins, never a prior existence check.
+The loser's constraint violation is resolved by re-reading the row that
+actually got persisted and comparing a request fingerprint
+(`idempotencyRequestHash`, a SHA-256 hash of the client-submitted
+customer info, cart items, delivery amount, and server-resolved `userId`)
+against the caller's own: an equal fingerprint means a genuine retry
+(`"duplicate"`, the existing Order is returned); a different fingerprint
+means the same key was reused for a materially different submission —
+including a different resolved user — and is rejected outright
+(`"conflict"`), never silently returning the mismatched Order. This same
+mechanism is what provides ownership isolation: a submission's resolved
+`userId` is part of what the fingerprint covers, so a different user (or
+a guest) presenting someone else's key cannot receive that other
+person's Order — the fingerprint mismatch is rejected as a conflict.
+
+Database Changes
+
+Migration `20260815102154_add_order_idempotency_key`: adds
+`idempotencyKey TEXT` (nullable, unique) and `idempotencyRequestHash
+TEXT` (nullable) to `orders`. No other schema changes. No new
+tables/models — this is the minimal, sufficient shape per the
+requirements' explicit preference for a field over a dedicated structure
+where a field suffices.
+
+API Contract
+
+`POST /api/orders` requires an `Idempotency-Key` request header
+(non-body): required (400 `IDEMPOTENCY_KEY_REQUIRED` if absent), bounded
+length 16-128, restricted to `[A-Za-z0-9_-]` (400
+`INVALID_IDEMPOTENCY_KEY` otherwise) — an opaque correlation token only,
+never authorization and never a payload carrier; a same-named field in
+the JSON body is never read. A brand-new key returns 201 with the new
+`PENDING` Order. A replay of the same key with the same logical
+submission returns 200 with the original Order (nothing new persisted).
+The same key reused for a different submission (including a different
+resolved user) returns 409 `IDEMPOTENCY_KEY_CONFLICT` — the original
+Order is never returned to the second caller.
+
+Security
+
+Client still cannot control Order status, price, currency, or delivery
+amount — createOrderFromCheckout's existing server-side resolution is
+completely unchanged by this milestone. The idempotency key is a
+correlation token only: `userId` is still resolved solely from the
+Auth.js session via Identity's `getCurrentUser()`, exactly as before;
+the key grants no capability and bypasses no check. Ownership isolation
+(a user cannot retrieve another user's Order via a guessed/reused key)
+is enforced by the request-fingerprint mechanism described above. CR-029
+IDOR protections (`findByIdForUser`/`findManyByUserId`, composite keyset
+pagination) and CR-030's atomic status-transition guarantee
+(`updateStatusIfCurrent`) are both completely unmodified by this
+milestone — verified by full regression of their existing test suites.
+
+Known, accepted limitation: two different guests who coincidentally
+reuse the exact same key value for genuinely identical cart/customer
+data cannot be distinguished by this design, since the system has no
+guest-session concept to scope by — the second guest would receive the
+first guest's Order summary (id, status, subtotal/delivery/total,
+currency only; no PII beyond what `POST /api/orders` already returns on
+creation). This is an inherent limitation of key-based idempotency
+without a session/account scope, not an oversight; introducing a guest
+session mechanism is out of scope for this milestone and would need its
+own Architect-approved requirements.
+
+Tests
+
+45 new/changed tests: a pure-function unit suite for the request
+fingerprint (determinism, item-order independence, sensitivity to every
+covered field including `userId`); fake-repository application-layer
+tests for all required cases (new key, replay, different keys, payload
+conflict, ownership-isolation conflict, guest retry, authenticated
+retry, backward-compatible no-key fallback, existing validation ordering
+preserved); real-Postgres repository integration tests for created/
+duplicate/conflict outcomes, independent re-reads confirming exactly one
+row persisted per key, and a genuine `Promise.all` concurrency race
+(plus a 10-iteration repeat) proving exactly one `"created"` and one
+`"duplicate"` outcome every time; a full-pipeline real-Catalog +
+real-repository test (including its own real concurrency race); and
+route-level tests for the header contract (missing/too-short/too-long/
+invalid-charset), body-field-is-never-read, and the 201/200/409 status
+mapping. All pre-existing CR-029/CR-030/IMP-026 regression tests
+continue to pass unmodified except for a required fake-repository stub
+addition (`createIdempotent`) in two unrelated test files, needed only
+because that method is now part of the `OrderRepository` interface
+shape.
+
+Validation Results
+
+`pnpm test`: 224/224 passing (179 pre-existing + 45 new), 21 test files,
+zero regressions. `pnpm typecheck`: clean. `pnpm lint`: clean. `pnpm
+format:check`: limited to the two pre-existing, unrelated warnings
+(`next.config.ts`, `pnpm-workspace.yaml`). `pnpm build`: succeeded (all
+15 routes compiled/prerendered).
+
+Runtime Verification
+
+Manually verified against the real Neon database through the actual
+running `POST /api/orders` route (not a test double): a first request
+returns 201 and a new Order; a retry with the same key returns 200 and
+the identical Order id; a same-key-different-payload request returns 409
+`IDEMPOTENCY_KEY_CONFLICT`; a different key returns 201 with an
+independent Order; two genuinely concurrent HTTP requests with the same
+key (fired in parallel against the running dev server) returned exactly
+one 201 and one 200, both referencing the same Order id; a same-key
+request from a second "guest" with different customer data returned 409
+rather than the first guest's Order. All manually-created test Orders
+were deleted afterward and confirmed removed.
+
+Remaining Limitations
+
+changeOrderStatus() is still not wired to any transport — unaffected by
+this milestone, unchanged from IMP-030. The guest-key-collision
+limitation described under Security above. No idempotency-key expiry/
+cleanup policy exists — keys and their Orders persist indefinitely,
+consistent with Orders themselves having no retention policy; introducing
+one is a future decision, not required by this milestone's objective.
+
+Next Milestone State
+
+NOT YET APPROVED — unchanged. This milestone does not approve Payments,
+Inventory, Admin tooling, a transport layer for changeOrderStatus, or any
+other future subsystem; see Section 11 (Next Milestone) below.
+
+9. Current Production State
 
 The following functionality is currently implemented:
 
@@ -440,7 +615,8 @@ Repository
 Prisma
    ↓
 Neon PostgreSQL
-9. Known Limitations
+
+10. Known Limitations
 Product Details
 
 Product Details is dynamically rendered because database access must not be required during build.
@@ -458,12 +634,15 @@ Server-side Order creation is implemented: `createOrderFromCheckout()`
 status, price, and currency from Catalog server-side, validates quantity
 and monetary bounds, and persists the Order atomically — a client can
 never author these values. Order ownership (IMP-029) and lifecycle status
-transitions (IMP-030 / CR-030) are also implemented. Payment processing
-and inventory reservation are not yet implemented — every created Order
-starts and generally remains `PENDING` pending a future Payments
-milestone. Client-side Checkout availability must never be treated as
-authorization or pricing authority; this was always the server-side
-boundary's responsibility, and it now genuinely exists.
+transitions (IMP-030 / CR-030) are also implemented. Checkout submission
+idempotency (IMP-031) is also implemented: a required `Idempotency-Key`
+header prevents a retried or genuinely concurrent duplicate submission
+from creating more than one Order. Payment processing and inventory
+reservation are not yet implemented — every created Order starts and
+generally remains `PENDING` pending a future Payments milestone.
+Client-side Checkout availability must never be treated as authorization
+or pricing authority; this was always the server-side boundary's
+responsibility, and it now genuinely exists.
 
 E2E Testing
 
@@ -471,13 +650,13 @@ The project currently has unit/integration tests but no dedicated browser E2E te
 
 Browser-level testing should be introduced when justified by upcoming user-critical flows.
 
-10. Next Milestone
+11. Next Milestone
 
 Status
 
 NOT YET APPROVED
 
-The next milestone after IMP-030 must be explicitly defined by the
+The next milestone after IMP-031 must be explicitly defined by the
 Architect before implementation begins.
 
 The following must NOT be assumed to be approved:
@@ -496,7 +675,7 @@ or any other future subsystem.
 
 These require separate requirements and architectural decisions.
 
-11. Future Roadmap Areas
+12. Future Roadmap Areas
 
 The following are possible future areas and are NOT yet approved implementation milestones:
 
@@ -517,7 +696,7 @@ Order status history / audit log
 
 No item above should be implemented without explicit Architect approval.
 
-12. Implementation Process
+13. Implementation Process
 
 Every milestone follows this lifecycle:
 
@@ -546,7 +725,7 @@ Manual acceptance when required
 Architect approval
     ↓
 Next milestone
-13. Code Review Policy
+14. Code Review Policy
 
 Code Review is performed through:
 
@@ -570,7 +749,7 @@ scope compliance.
 
 Claude/local resources should not be used for the primary Code Review when GitHub access is available.
 
-14. Local QA Policy
+15. Local QA Policy
 
 Local QA is performed by Claude/local tooling when possible.
 
@@ -589,7 +768,7 @@ relevant performance behavior.
 
 If browser automation is unavailable, browser-only scenarios must be reported as NOT VERIFIED, not assumed to pass.
 
-15. Definition of Done
+16. Definition of Done
 
 A milestone is complete only when:
 
@@ -603,16 +782,17 @@ no unresolved P0/P1/P2 defects remain;
 scope has not expanded without approval;
 the milestone commit is traceable;
 this roadmap is updated.
-16. Milestone Summary
+17. Milestone Summary
 Milestone	Status
 IMP-021 — Catalog Persistence Foundation	COMPLETED
 IMP-021-FIX-001 — Public API + Prisma Build Generation	COMPLETED
 IMP-021-FIX-002 — Remove Build-Time DB Dependency	COMPLETED
 IMP-022 — Cart → Checkout Navigation	COMPLETED
 IMP-023 through IMP-029 (incl. fix follow-ups)	COMPLETED — see Section 6 note; git history authoritative
-IMP-030 — Order Lifecycle & Status Management	COMPLETED
+IMP-030 — Order Lifecycle & Status Management (incl. CR-030)	COMPLETED
+IMP-031 — Checkout Submission Idempotency	COMPLETED (pending commit — see Section 8)
 Next milestone	NOT YET APPROVED
-17. Source of Truth
+18. Source of Truth
 
 This document is the authoritative roadmap for implementation milestones.
 

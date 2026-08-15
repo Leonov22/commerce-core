@@ -84,6 +84,9 @@ function makeFakeRepository(
       order = { ...order, status: currentStatus };
       return order;
     },
+    async createIdempotent(): Promise<never> {
+      throw new Error("not used by these tests");
+    },
   };
 
   return { repository, updateStatusIfCurrentCalls };

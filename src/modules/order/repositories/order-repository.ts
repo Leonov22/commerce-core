@@ -42,6 +42,24 @@ export interface FindManyByUserIdOptions {
 }
 
 /**
+ * Checkout submission idempotency (IMP-031). `idempotencyKey` is the
+ * client-supplied `Idempotency-Key` header value; `idempotencyRequestHash`
+ * is a hash of the logical checkout submission (see
+ * `computeCheckoutRequestFingerprint` in the application layer) computed
+ * once, before the first attempt to persist — never recomputed from the
+ * eventually-stored row.
+ */
+export interface CreateIdempotentOrderInput extends NewOrderInput {
+  idempotencyKey: string;
+  idempotencyRequestHash: string;
+}
+
+export type CreateIdempotentOrderResult =
+  | { outcome: "created"; order: Order }
+  | { outcome: "duplicate"; order: Order }
+  | { outcome: "conflict" };
+
+/**
  * Read/write abstraction the Order application layer depends on. It never
  * depends on the Prisma implementation directly — only on this interface.
  *
@@ -81,4 +99,30 @@ export interface OrderRepository {
     expectedStatus: OrderStatus,
     nextStatus: OrderStatus,
   ): Promise<Order | null>;
+
+  /**
+   * Atomic idempotent create (IMP-031). Attempts to persist a new Order
+   * under `idempotencyKey` as a single database operation — never a
+   * "check if it exists, then insert" sequence, which cannot rule out two
+   * concurrent callers both passing the check before either insert lands.
+   * Postgres's own unique constraint on `idempotencyKey` is the sole
+   * arbiter of which caller "wins" when two concurrent calls use the same
+   * key: exactly one insert succeeds; the other observes the constraint
+   * violation and this method resolves it into `"duplicate"` or
+   * `"conflict"` by comparing `idempotencyRequestHash` against the row
+   * that actually got persisted, never by re-deciding based on its own
+   * stale view of "does it exist yet".
+   *
+   * - `"created"`: no prior Order existed under this key; this call's
+   *   Order was persisted.
+   * - `"duplicate"`: an Order already exists under this key with the same
+   *   `idempotencyRequestHash` — the same logical submission being
+   *   retried. Returns that existing Order; nothing new was persisted.
+   * - `"conflict"`: an Order already exists under this key with a
+   *   *different* `idempotencyRequestHash` — the same key reused for a
+   *   materially different submission (including a different resolved
+   *   user). No Order is returned; the caller must treat this as a
+   *   rejected request, never fall back to returning the mismatched Order.
+   */
+  createIdempotent(input: CreateIdempotentOrderInput): Promise<CreateIdempotentOrderResult>;
 }

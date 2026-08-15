@@ -35,12 +35,25 @@ vi.mock("@/modules/checkout", () => ({
 const orderRouteModule = await import("@/app/api/orders/route");
 const { POST } = orderRouteModule;
 
-function makeRequest(body: unknown): Request {
+const VALID_IDEMPOTENCY_KEY = "test-idempotency-key-aaaaaaaa";
+
+function makeRequest(body: unknown, headers: Record<string, string> = {}): Request {
   return new Request("http://localhost/api/orders", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "Idempotency-Key": VALID_IDEMPOTENCY_KEY,
+      ...headers,
+    },
     body: JSON.stringify(body),
   });
+}
+
+/** Builds a request with no `Idempotency-Key` header at all (IMP-031). */
+function makeRequestWithoutIdempotencyKey(body: unknown): Request {
+  const request = makeRequest(body);
+  request.headers.delete("Idempotency-Key");
+  return request;
 }
 
 function validBody(extra: Record<string, unknown> = {}) {
@@ -163,5 +176,160 @@ describe("api/orders/route module surface — no Customer-facing status mutation
     expect(exported.PATCH).toBeUndefined();
     expect(exported.PUT).toBeUndefined();
     expect(exported.DELETE).toBeUndefined();
+  });
+});
+
+describe("POST /api/orders — Idempotency-Key header contract (IMP-031)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("rejects a request with no Idempotency-Key header at all, and never calls createOrderFromCheckout", async () => {
+    const response = await POST(makeRequestWithoutIdempotencyKey(validBody()));
+
+    expect(response.status).toBe(400);
+    const json = (await response.json()) as { error: string };
+    expect(json.error).toBe("IDEMPOTENCY_KEY_REQUIRED");
+    expect(mockCreateOrderFromCheckout).not.toHaveBeenCalled();
+  });
+
+  it("rejects an Idempotency-Key shorter than the minimum length", async () => {
+    const response = await POST(makeRequest(validBody(), { "Idempotency-Key": "short" }));
+
+    expect(response.status).toBe(400);
+    const json = (await response.json()) as { error: string };
+    expect(json.error).toBe("INVALID_IDEMPOTENCY_KEY");
+    expect(mockCreateOrderFromCheckout).not.toHaveBeenCalled();
+  });
+
+  it("rejects an Idempotency-Key longer than the maximum length", async () => {
+    const response = await POST(makeRequest(validBody(), { "Idempotency-Key": "a".repeat(200) }));
+
+    expect(response.status).toBe(400);
+    expect(mockCreateOrderFromCheckout).not.toHaveBeenCalled();
+  });
+
+  it("rejects an Idempotency-Key containing characters outside the safe charset", async () => {
+    const response = await POST(
+      makeRequest(validBody(), { "Idempotency-Key": "not a valid key! <script>" }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(mockCreateOrderFromCheckout).not.toHaveBeenCalled();
+  });
+
+  it("does not read an idempotency key from the JSON body — only the header is honored", async () => {
+    mockGetCurrentUser.mockResolvedValueOnce(null);
+    mockCreateOrderFromCheckout.mockResolvedValueOnce({
+      ok: true,
+      created: true,
+      order: {
+        id: "order-idem-1",
+        status: "PENDING",
+        userId: null,
+        subtotalAmountMinor: 100,
+        deliveryAmountMinor: 0,
+        totalAmountMinor: 100,
+        currency: "USD",
+      },
+    });
+
+    const response = await POST(
+      makeRequest(validBody({ idempotencyKey: "body-supplied-key-aaaaaaaaaaaaaa" })),
+    );
+
+    expect(response.status).toBe(201);
+    const callArg = mockCreateOrderFromCheckout.mock.calls[0]?.[0];
+    // The header's value (from `makeRequest`'s default), never the body field.
+    expect(callArg.idempotencyKey).toBe(VALID_IDEMPOTENCY_KEY);
+  });
+
+  it("passes a valid Idempotency-Key header through to createOrderFromCheckout", async () => {
+    mockGetCurrentUser.mockResolvedValueOnce(null);
+    mockCreateOrderFromCheckout.mockResolvedValueOnce({
+      ok: true,
+      created: true,
+      order: {
+        id: "order-idem-2",
+        status: "PENDING",
+        userId: null,
+        subtotalAmountMinor: 100,
+        deliveryAmountMinor: 0,
+        totalAmountMinor: 100,
+        currency: "USD",
+      },
+    });
+
+    const response = await POST(
+      makeRequest(validBody(), { "Idempotency-Key": "a-perfectly-valid-key-123456" }),
+    );
+
+    expect(response.status).toBe(201);
+    const callArg = mockCreateOrderFromCheckout.mock.calls[0]?.[0];
+    expect(callArg.idempotencyKey).toBe("a-perfectly-valid-key-123456");
+  });
+});
+
+describe("POST /api/orders — idempotency result handling (IMP-031)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("returns 201 when createOrderFromCheckout reports created: true", async () => {
+    mockGetCurrentUser.mockResolvedValueOnce(null);
+    mockCreateOrderFromCheckout.mockResolvedValueOnce({
+      ok: true,
+      created: true,
+      order: {
+        id: "order-created",
+        status: "PENDING",
+        userId: null,
+        subtotalAmountMinor: 100,
+        deliveryAmountMinor: 0,
+        totalAmountMinor: 100,
+        currency: "USD",
+      },
+    });
+
+    const response = await POST(makeRequest(validBody()));
+    expect(response.status).toBe(201);
+    const json = (await response.json()) as { order: { id: string } };
+    expect(json.order.id).toBe("order-created");
+  });
+
+  it("returns 200 (not 201) when createOrderFromCheckout reports created: false — a replayed submission, not a new Order", async () => {
+    mockGetCurrentUser.mockResolvedValueOnce(null);
+    mockCreateOrderFromCheckout.mockResolvedValueOnce({
+      ok: true,
+      created: false,
+      order: {
+        id: "order-replayed",
+        status: "PENDING",
+        userId: null,
+        subtotalAmountMinor: 100,
+        deliveryAmountMinor: 0,
+        totalAmountMinor: 100,
+        currency: "USD",
+      },
+    });
+
+    const response = await POST(makeRequest(validBody()));
+    expect(response.status).toBe(200);
+    const json = (await response.json()) as { order: { id: string } };
+    expect(json.order.id).toBe("order-replayed");
+  });
+
+  it("returns 409 IDEMPOTENCY_KEY_CONFLICT when the key was already used for a different submission, and never leaks the other Order", async () => {
+    mockGetCurrentUser.mockResolvedValueOnce(null);
+    mockCreateOrderFromCheckout.mockResolvedValueOnce({
+      ok: false,
+      error: "IDEMPOTENCY_KEY_CONFLICT",
+    });
+
+    const response = await POST(makeRequest(validBody()));
+    expect(response.status).toBe(409);
+    const json = (await response.json()) as { error: string; order?: unknown };
+    expect(json.error).toBe("IDEMPOTENCY_KEY_CONFLICT");
+    expect(json.order).toBeUndefined();
   });
 });

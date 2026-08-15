@@ -1,4 +1,5 @@
 import "server-only";
+import { Prisma } from "@/generated/prisma/client";
 import { prisma } from "@/modules/order/infrastructure/prisma-client";
 import { encodeOrderCursor, decodeOrderCursor } from "@/modules/order/application/order-cursor";
 import type {
@@ -6,35 +7,57 @@ import type {
   NewOrderInput,
   FindManyByUserIdOptions,
   OrderListPage,
+  CreateIdempotentOrderInput,
+  CreateIdempotentOrderResult,
 } from "@/modules/order/repositories/order-repository";
 import type { Order, OrderItem, OrderStatus } from "@/modules/order/domain/order";
 
+function toOrderCreateData(input: NewOrderInput) {
+  return {
+    status: input.status ?? "PENDING",
+    firstName: input.firstName,
+    lastName: input.lastName,
+    email: input.email,
+    phone: input.phone,
+    userId: input.userId,
+    subtotalAmountMinor: input.subtotalAmountMinor,
+    deliveryAmountMinor: input.deliveryAmountMinor,
+    totalAmountMinor: input.totalAmountMinor,
+    currency: input.currency,
+    items: {
+      create: input.items.map((item) => ({
+        productId: item.productId,
+        productName: item.productName,
+        unitPriceAmountMinor: item.unitPriceAmountMinor,
+        quantity: item.quantity,
+        lineTotalAmountMinor: item.lineTotalAmountMinor,
+        currency: item.currency,
+      })),
+    },
+  };
+}
+
 async function createOrderRecord(input: NewOrderInput) {
   return prisma.order.create({
-    data: {
-      status: input.status ?? "PENDING",
-      firstName: input.firstName,
-      lastName: input.lastName,
-      email: input.email,
-      phone: input.phone,
-      userId: input.userId,
-      subtotalAmountMinor: input.subtotalAmountMinor,
-      deliveryAmountMinor: input.deliveryAmountMinor,
-      totalAmountMinor: input.totalAmountMinor,
-      currency: input.currency,
-      items: {
-        create: input.items.map((item) => ({
-          productId: item.productId,
-          productName: item.productName,
-          unitPriceAmountMinor: item.unitPriceAmountMinor,
-          quantity: item.quantity,
-          lineTotalAmountMinor: item.lineTotalAmountMinor,
-          currency: item.currency,
-        })),
-      },
-    },
+    data: toOrderCreateData(input),
     include: { items: true },
   });
+}
+
+/**
+ * True for any unique-constraint violation on `orders` — safe to treat as
+ * specifically the `idempotencyKey` constraint because that's the only
+ * unique column `orders` has besides its primary key (which `create()`
+ * cannot collide on: `id` is a fresh `cuid()`). Not narrowed further via
+ * `error.meta.target`: with this Prisma version's driver-adapter error
+ * shape, the violated constraint's field names live nested under
+ * `error.meta.driverAdapterError.cause.constraint.fields`, not the flat
+ * `meta.target` array Prisma's own docs describe — brittle to depend on
+ * across Prisma/adapter versions, and unnecessary given the constraint
+ * argument above.
+ */
+function isIdempotencyKeyViolation(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002";
 }
 
 async function findOrderRecord(orderId: string) {
@@ -185,5 +208,49 @@ export const prismaOrderRepository: OrderRepository = {
     // using the same read path `findById` uses.
     const row = await findOrderRecord(orderId);
     return row ? toDomainOrder(row) : null;
+  },
+
+  async createIdempotent(input: CreateIdempotentOrderInput): Promise<CreateIdempotentOrderResult> {
+    // IMP-031: a single INSERT that either succeeds outright or fails on
+    // Postgres's own unique constraint on `idempotencyKey` — never a
+    // separate "does a row with this key already exist?" read beforehand.
+    // Two concurrent calls with the same key both reach this statement;
+    // Postgres allows exactly one of them to actually insert and rejects
+    // the other with a constraint violation, so which caller "wins" is
+    // decided by the database, not by this function's control flow.
+    try {
+      const row = await prisma.order.create({
+        data: {
+          ...toOrderCreateData(input),
+          idempotencyKey: input.idempotencyKey,
+          idempotencyRequestHash: input.idempotencyRequestHash,
+        },
+        include: { items: true },
+      });
+      return { outcome: "created", order: toDomainOrder(row) };
+    } catch (error) {
+      if (!isIdempotencyKeyViolation(error)) {
+        throw error;
+      }
+
+      // Lost the race (or this is a genuine sequential retry) — the row
+      // that actually exists under this key is the only source of truth
+      // for what happens next, never this call's own (rejected) input.
+      const existing = await prisma.order.findUnique({
+        where: { idempotencyKey: input.idempotencyKey },
+        include: { items: true },
+      });
+      if (!existing) {
+        // The row that caused the violation is gone by the time we
+        // re-read (e.g. deleted between the two statements) — surface the
+        // original database error rather than fabricating an outcome.
+        throw error;
+      }
+
+      if (existing.idempotencyRequestHash === input.idempotencyRequestHash) {
+        return { outcome: "duplicate", order: toDomainOrder(existing) };
+      }
+      return { outcome: "conflict" };
+    }
   },
 };

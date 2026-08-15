@@ -46,6 +46,9 @@ function makeFakeRepository(): {
     async updateStatusIfCurrent(): Promise<Order | null> {
       throw new Error("not used by these tests");
     },
+    async createIdempotent(): Promise<never> {
+      throw new Error("not used by these tests");
+    },
   };
 
   return { repository, findManyCalls, findByIdCalls };
