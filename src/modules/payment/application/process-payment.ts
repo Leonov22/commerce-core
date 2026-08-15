@@ -20,11 +20,25 @@ export type ProcessPaymentResult =
   | { ok: false; error: "PROVIDER_ERROR" }
   /**
    * The provider call succeeded, but by the time this call tried to
-   * persist the reference, the Payment was no longer eligible — almost
-   * always because a concurrently racing `processPayment()` call already
-   * attached a (possibly different) reference first. The current Payment
-   * is returned so the caller isn't left without a result; it must not be
-   * treated as this call's own provider reference having been recorded.
+   * persist the reference, `setProviderReferenceIfPending`'s conditional
+   * write (`id = ? AND status = 'PENDING' AND providerReference IS NULL`)
+   * no longer matched. The current Payment is returned so the caller
+   * isn't left without a result; it must not be treated as this call's
+   * own provider reference having been recorded.
+   *
+   * IMP-034-FIX: this collapses two distinct causes into one result,
+   * deliberately, because today's architecture cannot actually produce
+   * the second one — see `setProviderReferenceIfPending`'s own doc
+   * comment for the full invariant this relies on:
+   *
+   *   1. A concurrently racing `processPayment()` call already attached a
+   *      reference first (the expected, common case — see the
+   *      "CONCURRENT processPayment() CALLS" note below).
+   *   2. The Payment transitioned away from `PENDING` by some other path
+   *      between this call's read and write. No such path exists yet
+   *      (`updateStatusIfCurrent` has zero callers anywhere in this
+   *      codebase); if one is ever introduced, revisit whether these two
+   *      causes still deserve a single result code.
    */
   | { ok: false; error: "PROVIDER_REFERENCE_ALREADY_SET"; payment: Payment };
 
@@ -49,6 +63,41 @@ export type ProcessPaymentResult =
  * Never exposed to a customer-facing transport in this milestone: no
  * route calls this. A future payment-provider milestone supplies the
  * first concrete `PaymentProvider` and decides how this gets invoked.
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * CONCURRENT processPayment() CALLS (IMP-034-FIX / CR-034-01)
+ * ═══════════════════════════════════════════════════════════════════════
+ * Two concurrent `processPayment(paymentId)` calls for the same Payment
+ * CAN both reach `paymentProvider.startPayment(...)` — this function
+ * deliberately does not add an application-level mutex/lock to prevent
+ * that (see the architectural rule against unnecessary infrastructure).
+ * This is safe only because both calls send the identical `paymentId` in
+ * their `StartPaymentInput`, and `PaymentProvider`'s contract (see
+ * `payment-provider.ts`) requires a compliant implementation to treat
+ * repeated calls with the same `paymentId` as the SAME logical external
+ * operation, never a second one. `setProviderReferenceIfPending`'s atomic
+ * conditional write is what then guarantees only ONE of the two calls
+ * actually *persists* a reference locally — the other observes `count: 0`
+ * and returns `PROVIDER_REFERENCE_ALREADY_SET`. Two different guarantees,
+ * from two different layers, are both required: PostgreSQL cannot make
+ * the external call atomic, and the provider contract alone cannot
+ * prevent a duplicate *local* write racing itself.
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * PROVIDER SUCCESS + LOCAL PERSISTENCE FAILURE (IMP-034-FIX / CR-034-02)
+ * ═══════════════════════════════════════════════════════════════════════
+ * If `paymentProvider.startPayment(...)` succeeds but the following
+ * `setProviderReferenceIfPending` call then throws (a transient database
+ * error, a crash before it runs, etc.), this function does not attempt
+ * any provider-specific recovery — it simply propagates the failure. The
+ * recovery invariant lives entirely in the provider contract: a *later*
+ * `processPayment(paymentId)` call resolves the same Payment and sends
+ * the provider the identical `paymentId` again, so a compliant provider
+ * returns the SAME `providerReference` it already created rather than
+ * starting a second external operation — the local write then simply
+ * succeeds on that later attempt. No provider-specific retry/recovery API
+ * is introduced here; this is a property the contract requires of every
+ * future adapter, not something this function orchestrates itself.
  */
 export async function processPayment(
   paymentRepository: PaymentRepository,

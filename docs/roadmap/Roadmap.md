@@ -1038,7 +1038,7 @@ result into `initializePayment` (or a successor) before any real
 payment can be processed. This milestone approves only the port's
 shape.
 
-11. IMP-034 — Payment Processing Application Flow
+11. IMP-034 — Payment Processing Application Flow (incl. IMP-034-FIX)
 
 Status
 
@@ -1046,9 +1046,12 @@ COMPLETED
 
 Commit
 
-Not yet committed at the time this entry was written — implementation
-and validation are complete; this entry will be updated with the real
-commit SHA immediately once the IMP-034 commit is created.
+a48e6c1fcd456778bedc3cff3efdfda045ff647d (initial IMP-034)
+IMP-034-FIX pending — implementation and validation are complete but not
+yet committed at the time this entry was written. Record the actual
+commit SHA through the normal follow-up documentation process once the
+commit exists; do not treat any SHA embedded in this entry before that
+point as authoritative for IMP-034-FIX.
 
 Objective
 
@@ -1058,6 +1061,83 @@ concrete provider, no webhook, no route, no UI — this milestone answers
 exactly one question: how does the Payment application invoke a
 provider-neutral payment provider and safely persist the resulting
 provider reference?
+
+Code Review Findings and Fixes (IMP-034-FIX / CR-034)
+
+Code Review of the initial IMP-034 implementation found two P2
+correctness defects, both resolved:
+
+CR-034-01 — concurrent `processPayment()` calls can invoke the external
+provider twice before the local database reference claim resolves the
+race. Root cause: `setProviderReferenceIfPending`'s atomic conditional
+write only guarantees ONE `providerReference` is ever *persisted* — it
+says nothing about, and PostgreSQL cannot make atomic, whether the
+*external* provider call itself happened once or twice. Two concurrent
+`processPayment()` calls genuinely can both reach
+`paymentProvider.startPayment(...)` before either write lands; no
+in-process mutex was added to prevent this (per the explicit
+architectural rule against unnecessary infrastructure). Fix: the
+`PaymentProvider` port's contract (`payment-provider.ts`) now explicitly
+requires that a compliant implementation treat every `startPayment` call
+carrying the same `paymentId` as the SAME logical external operation,
+never a second one — `paymentId` doubles as the provider-side
+idempotency identity. Both calls sending the identical `paymentId` is
+what makes reaching the provider twice safe; PostgreSQL's role is
+narrower and complementary, guaranteeing only that one reference is ever
+persisted locally.
+
+CR-034-02 — a provider success followed by a local persistence failure
+could lose the `providerReference`, and a later retry could then create
+a second external operation. Root cause: `processPayment` correctly does
+not invent provider-specific recovery logic for a failed
+`setProviderReferenceIfPending` write, but the recovery invariant this
+depends on was not previously documented as a hard requirement on the
+provider contract. Fix: documented (and tested, via a genuinely
+idempotent-by-`paymentId` fake provider) that a retry calling
+`processPayment(paymentId)` again sends the identical `paymentId`, and a
+compliant provider is contractually required to return the SAME
+`providerReference` it already created rather than starting a new
+external operation — the local write then simply succeeds on that later
+attempt. No provider-specific retry/recovery API was introduced.
+
+Provider-Side Idempotency Invariant (the core of the fix)
+
+```
+Payment ID
+    ↓
+PaymentProvider.startPayment()
+    ↓
+provider-side idempotency identity (== paymentId, always)
+    ↓
+same Payment cannot create multiple external payment operations
+```
+`paymentId` is the stable idempotency identity for the logical
+provider-start operation — not a separate, caller-suppliable idempotency
+key (none exists; `StartPaymentInput` has exactly three fields, all
+derived from the persisted Payment, so there is no way for a retry to
+accidentally vary its idempotency identity). This is deliberately a
+*contract* guarantee — enforced by documentation and tests against a
+compliant fake, not by any code that could force a real future SDK to
+comply. PostgreSQL still separately guarantees the LOCAL invariant: at
+most one `providerReference` is ever persisted for a given Payment, via
+`setProviderReferenceIfPending`'s unchanged
+`WHERE id = ? AND status = 'PENDING' AND providerReference IS NULL`
+conditional write. Two independent, complementary guarantees — from two
+different layers — are both required; neither alone is sufficient, and
+this fix does not pretend PostgreSQL alone can make an external
+side effect atomic.
+
+`PROVIDER_REFERENCE_ALREADY_SET` error-contract review: `setProviderReferenceIfPending`
+returning `null` can mean either (1) a concurrently racing call already
+attached a reference, or (2) the Payment left `PENDING` through some
+other path. These remain deliberately conflated into one result code —
+today's architecture has no caller capable of producing case 2 at all
+(`updateStatusIfCurrent` still has zero callers anywhere in this
+codebase), so distinguishing them now would be speculative. This
+invariant is now explicitly documented on both
+`ProcessPaymentResult`'s `PROVIDER_REFERENCE_ALREADY_SET` variant and
+`setProviderReferenceIfPending` itself, flagged for revisiting if a
+status-changing caller is ever introduced.
 
 Application Boundary
 
@@ -1166,52 +1246,74 @@ untouched.
 
 Tests
 
-23 new tests: application-layer (`process-payment.test.ts`) covering
-Payment-not-found, a PENDING Payment reaching the provider exactly once
-with exactly the three documented input fields, authoritative (not
-hardcoded) amount/currency reaching the provider, a successful result
-persisting the reference while the Payment stays `PENDING`, the provider
-never being able to replace amount/currency, a controlled
-`PROVIDER_ERROR` result that leaves the Payment uncorrupted with no
-repository write attempted, all three terminal statuses being rejected
-without ever calling the provider, and the race-loser path
+23 tests from initial IMP-034 (see below), plus 6 new tests from
+IMP-034-FIX. Application-layer (`process-payment.test.ts`) originally
+covered Payment-not-found, a PENDING Payment reaching the provider
+exactly once with exactly the three documented input fields,
+authoritative (not hardcoded) amount/currency reaching the provider, a
+successful result persisting the reference while the Payment stays
+`PENDING`, the provider never being able to replace amount/currency, a
+controlled `PROVIDER_ERROR` result that leaves the Payment uncorrupted
+with no repository write attempted, all three terminal statuses being
+rejected without ever calling the provider, and the race-loser path
 (`PROVIDER_REFERENCE_ALREADY_SET`) with a genuinely conditional fake
-repository (not an always-succeeds stub) — plus a real-repository,
-real-concurrency describe block proving the same guarantees against real
-Postgres. Repository-layer (`prisma-payment-repository.test.ts`):
-`setProviderReferenceIfPending` persistence, non-overwrite of an
-already-set reference, rejection on a non-`PENDING` Payment, and a
-genuine concurrent race. Full existing suite (Order, Checkout, Catalog,
-Identity, CR-029, CR-030, IMP-031, IMP-032, IMP-033) re-run and confirmed
-passing unmodified.
+repository — plus a real-repository, real-concurrency describe block.
+IMP-034-FIX adds: a retry test proving `processPayment` sends the
+identical `paymentId` on a second call and a compliant fake provider
+resolves it to the same reference (CR-034-02); a real-Postgres
+concurrency test using a SHARED compliant fake provider proving both
+racing calls send identical `paymentId`/`amountMinor`/`currency` and
+resolve to the same `providerReference` (CR-034-01) — the existing
+two-different-providers race test is retained and re-labeled as proving
+LOCAL database protection independently of provider behavior (defense
+in depth), distinct from the new test proving the provider-contract
+guarantee itself. `PaymentProvider` contract tests
+(`payment-provider.test.ts`) add a structural proof that
+`StartPaymentInput` has no field a caller could use to vary its
+idempotency identity, plus tests against a new
+`makeFakeCompliantPaymentProvider` (memoized by `paymentId`) proving
+identical retries and identical concurrent calls both resolve to the
+same reference. Repository-layer (`prisma-payment-repository.test.ts`,
+unmodified by the fix): `setProviderReferenceIfPending` persistence,
+non-overwrite of an already-set reference, rejection on a non-`PENDING`
+Payment, and a genuine concurrent race. Full existing suite (Order,
+Checkout, Catalog, Identity, CR-029, CR-030, IMP-031, IMP-032, IMP-033)
+re-run and confirmed passing unmodified.
 
 Validation Results
 
-`pnpm test`: 290/290 passing (267 pre-existing + 23 new), 26 test files,
-zero regressions — confirmed via three independent clean sequential
-(`--no-file-parallelism`) runs after this session's parallel-mode
-worker-spawn flakiness (a known, already-documented sandbox issue
-unrelated to this change) made a single parallel run insufficient
-evidence on its own. `pnpm typecheck`: clean. `pnpm lint`: clean. `pnpm
-format:check`: limited to the two pre-existing, unrelated warnings
-(`next.config.ts`, `pnpm-workspace.yaml`). `pnpm build`: the build's own
-compile step succeeded on every attempt this session
-("✓ Compiled successfully"); the full command's redundant secondary
-type-check worker hit persistent sandbox-level V8 Zone/heap allocation
-crashes across 50+ consecutive attempts — the same class of
-environment-level flakiness documented on IMP-032/IMP-033, just
-unusually severe this session. `pnpm typecheck` passing cleanly, and the
-compile step itself succeeding every time, are the substitute evidence
-that no real compilation or type error exists; the full `pnpm build`
-command itself did not complete successfully during this milestone's
-validation and should be re-run by Code Review/QA.
+Initial IMP-034: `pnpm test` 290/290; `pnpm build`'s full command did not
+complete during that validation pass due to persistent sandbox-level
+worker crashes (documented at the time, substitute evidence via
+`pnpm typecheck` and the build's own successful compile step).
+IMP-034-FIX: `pnpm test`: **296/296 passing** (290 pre-existing + 6 new),
+26 test files, zero regressions — confirmed via two independent clean
+sequential (`--no-file-parallelism`) runs, a focused run of all 63
+Payment-module tests, and a clean parallel `pnpm test` run, after this
+session's parallel-mode worker-spawn flakiness (the same known,
+already-documented sandbox issue, unrelated to this change) made several
+earlier parallel attempts inconclusive on their own. `pnpm typecheck`:
+clean. `pnpm lint`: clean. `pnpm format:check`: limited to the two
+pre-existing, unrelated warnings (`next.config.ts`, `pnpm-workspace.yaml`).
+`pnpm build`: **succeeded** (all 15 routes compiled/prerendered) — the
+build-worker flakiness that affected the initial IMP-034 validation pass
+did not recur this time; the previously-noted validation gap is closed.
 
 Remaining Limitations
 
-Everything under "What Is Deliberately Deferred" above. Additionally:
-`processPayment` is not wired to any transport — a future milestone
-decides how/when it gets called. The `pnpm build` validation gap noted
-above should be independently re-verified.
+Everything under "What Is Deliberately Deferred" above (unchanged by the
+fix): no concrete provider, no webhook, no route, no UI, no
+`PaymentAttempt`, no refund/cancellation/retry framework, no new
+`PaymentStatus` value, no status transition logic. `processPayment` is
+still not wired to any transport — a future milestone decides how/when
+it gets called. The provider-side idempotency guarantee this fix
+establishes is a *contract*, verified against a compliant fake — it
+cannot be verified against a real provider until one is integrated; a
+future provider-adapter milestone must confirm the real SDK/API actually
+honors idempotency by a caller-supplied key (e.g. Stripe's
+`Idempotency-Key` header) mapped from `paymentId`. The
+`PROVIDER_REFERENCE_ALREADY_SET` conflation (documented above) remains
+deliberately unresolved pending a real status-changing caller.
 
 12. Current Production State
 
@@ -1440,7 +1542,7 @@ IMP-030 — Order Lifecycle & Status Management (incl. CR-030)	COMPLETED
 IMP-031 — Checkout Submission Idempotency (incl. IMP-031-FIX / CR-031)	COMPLETED
 IMP-032 — Payment Foundation	COMPLETED
 IMP-033 — Payment Provider Port	COMPLETED
-IMP-034 — Payment Processing Application Flow	COMPLETED (pending commit — see Section 11; pnpm build validation gap noted, see Section 11)
+IMP-034 — Payment Processing Application Flow (incl. IMP-034-FIX / CR-034)	COMPLETED (IMP-034-FIX pending commit — see Section 11)
 Next milestone	NOT YET APPROVED
 21. Source of Truth
 

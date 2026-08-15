@@ -91,6 +91,17 @@ export interface PaymentRepository {
    * didn't — either the Payment was no longer `PENDING`, or another call
    * already attached a reference first. The caller must not treat a
    * `null` result as this call's own reference having been persisted.
+   *
+   * IMP-034-FIX: this alone only guarantees ONE `providerReference` is
+   * ever persisted — it says nothing about, and cannot make atomic,
+   * whether the external provider call itself happened once or twice.
+   * Safety under concurrent callers additionally depends on
+   * `PaymentProvider`'s own idempotency contract (see
+   * `@/modules/payment/providers/payment-provider.ts`): a compliant
+   * provider treats repeated `startPayment` calls carrying the same
+   * `paymentId` as the same logical external operation. This method and
+   * that contract are two independent, complementary guarantees — this
+   * one alone is not sufficient to make the whole flow safe.
    */
   setProviderReferenceIfPending(
     paymentId: string,

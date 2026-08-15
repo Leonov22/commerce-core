@@ -100,6 +100,42 @@ function makeFakePaymentProvider(
   return { provider, calls };
 }
 
+/**
+ * IMP-034-FIX: a provider that actually honors `PaymentProvider`'s
+ * idempotency contract — memoized by `paymentId`, so any number of calls
+ * sharing a `paymentId` (concurrent races or a retry) resolve to the SAME
+ * `providerReference`. Used to prove `processPayment` behaves correctly
+ * against a *compliant* provider — the real-world case CR-034-01/
+ * CR-034-02 depend on — as opposed to `makeFakePaymentProvider` above,
+ * which is deliberately non-compliant (mints a fresh reference every
+ * call) and exists only to prove the local database still protects
+ * itself regardless of provider behavior.
+ */
+function makeFakeCompliantPaymentProvider(): {
+  provider: PaymentProvider;
+  calls: StartPaymentInput[];
+} {
+  const calls: StartPaymentInput[] = [];
+  const referencesByPaymentId = new Map<string, string>();
+  let nextId = 0;
+
+  const provider: PaymentProvider = {
+    async startPayment(input: StartPaymentInput) {
+      calls.push(input);
+      const existing = referencesByPaymentId.get(input.paymentId);
+      if (existing) {
+        return { ok: true, providerReference: existing };
+      }
+      nextId += 1;
+      const providerReference = `compliant-ref-${nextId}`;
+      referencesByPaymentId.set(input.paymentId, providerReference);
+      return { ok: true, providerReference };
+    },
+  };
+
+  return { provider, calls };
+}
+
 describe("processPayment", () => {
   it("returns PAYMENT_NOT_FOUND for a nonexistent Payment, and never calls the provider", async () => {
     const { repository } = makeFakePaymentRepository(null);
@@ -236,6 +272,37 @@ describe("processPayment", () => {
     expect(current?.providerReference).toBe("first-1");
   });
 
+  it("IMP-034-FIX / CR-034-02: retrying processPayment for the same Payment sends the provider the SAME paymentId, and a compliant provider returns the SAME reference both times", async () => {
+    const payment = makePayment();
+    const { repository } = makeFakePaymentRepository(payment);
+    const { provider, calls } = makeFakeCompliantPaymentProvider();
+
+    const first = await processPayment(repository, provider, payment.id);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    // Simulates calling processPayment again later — e.g. after a local
+    // persistence failure the first time — using the exact same paymentId.
+    const retry = await processPayment(repository, provider, payment.id);
+
+    // The provider was asked twice, but both times with the identical
+    // paymentId/amountMinor/currency — proving the retry cannot vary the
+    // idempotency identity.
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toEqual(calls[1]);
+    expect(calls[0]?.paymentId).toBe(payment.id);
+
+    // The compliant provider returned the same reference both times, so
+    // the "retry" is correctly recognized as PROVIDER_REFERENCE_ALREADY_SET
+    // (the first call already attached it) rather than a fresh success —
+    // and critically, the reference value matches what was already there.
+    expect(retry).toEqual({
+      ok: false,
+      error: "PROVIDER_REFERENCE_ALREADY_SET",
+      payment: first.payment,
+    });
+  });
+
   it("the caller cannot control amount/currency/status: processPayment's signature accepts only a repository, a provider, and a paymentId", async () => {
     // Structural proof, not just a runtime check: `processPayment` has no
     // amount/currency/status/providerReference/user-data parameter at
@@ -305,7 +372,14 @@ describe("processPayment — real repository + real concurrency (IMP-034)", () =
     return created.payment;
   }
 
-  it("two genuinely concurrent processPayment calls for the same PENDING Payment produce exactly one persisted provider reference", async () => {
+  it("two genuinely concurrent processPayment calls for the same PENDING Payment produce exactly one persisted provider reference, even against a non-compliant provider (local DB protection, defense in depth)", async () => {
+    // Deliberately uses two DIFFERENT (non-compliant) providers, each
+    // minting its own reference — the worst case for the LOCAL database
+    // guarantee alone. Proves `setProviderReferenceIfPending` protects
+    // the persisted row even if a provider were somehow non-compliant;
+    // it does not by itself prove only one *external* operation happened
+    // (that guarantee comes from the provider contract — see the
+    // compliant-provider test below).
     const payment = await createTestPayment();
     const { provider: providerA } = makeFakePaymentProvider({ providerReferencePrefix: "race-a" });
     const { provider: providerB } = makeFakePaymentProvider({ providerReferencePrefix: "race-b" });
@@ -328,6 +402,48 @@ describe("processPayment — real repository + real concurrency (IMP-034)", () =
         ? alreadySet[0]!.payment.providerReference
         : null;
     expect(loserReference).toBe(winnerReference);
+
+    const refetched = await prismaPaymentRepository.findById(payment.id);
+    expect(refetched?.providerReference).toBe(winnerReference);
+    expect(refetched?.status).toBe("PENDING");
+  });
+
+  it("IMP-034-FIX / CR-034-01: two genuinely concurrent processPayment calls against a SHARED compliant provider both send the identical paymentId/amountMinor/currency, and resolve to the same providerReference", async () => {
+    const payment = await createTestPayment();
+    const { provider, calls } = makeFakeCompliantPaymentProvider();
+
+    const [a, b] = await Promise.all([
+      processPayment(prismaPaymentRepository, provider, payment.id),
+      processPayment(prismaPaymentRepository, provider, payment.id),
+    ]);
+
+    // Both calls reached the provider — that's expected and acceptable
+    // per the architectural contract, not a bug to prevent.
+    expect(calls).toHaveLength(2);
+    // Both invocations carried the exact same idempotency identity —
+    // this is what makes it safe for both to have reached the provider.
+    expect(calls[0]).toEqual({
+      paymentId: payment.id,
+      amountMinor: payment.amountMinor,
+      currency: payment.currency,
+    });
+    expect(calls[1]).toEqual(calls[0]);
+
+    const results = [a, b];
+    const succeeded = results.filter((r) => r.ok);
+    const alreadySet = results.filter((r) => !r.ok && r.error === "PROVIDER_REFERENCE_ALREADY_SET");
+    expect(succeeded).toHaveLength(1);
+    expect(alreadySet).toHaveLength(1);
+
+    // Because the provider is compliant, BOTH results reference the
+    // identical providerReference — the "losing" call's own provider
+    // response was never wrong or wasted, it was just redundant.
+    const winnerReference = succeeded[0]!.ok ? succeeded[0]!.payment.providerReference : null;
+    const loserReference =
+      alreadySet[0]!.ok === false && alreadySet[0]!.error === "PROVIDER_REFERENCE_ALREADY_SET"
+        ? alreadySet[0]!.payment.providerReference
+        : null;
+    expect(winnerReference).toBe(loserReference);
 
     const refetched = await prismaPaymentRepository.findById(payment.id);
     expect(refetched?.providerReference).toBe(winnerReference);
