@@ -678,7 +678,243 @@ NOT YET APPROVED — unchanged. This milestone does not approve Payments,
 Inventory, Admin tooling, a transport layer for changeOrderStatus, or any
 other future subsystem; see Section 11 (Next Milestone) below.
 
-9. Current Production State
+9. IMP-032 — Payment Foundation
+
+Status
+
+COMPLETED
+
+Commit
+
+Not yet committed at the time this entry was written — implementation and
+validation are complete, pending Code Review before a commit is created.
+Update this field with the real commit SHA once the IMP-032 commit is
+created; do not leave this placeholder in a completed entry after that
+point.
+
+Objective
+
+Establish a clean, provider-neutral internal representation of "the
+payment that pays for an Order" so a future payment-provider milestone
+(Stripe, PayPal, or otherwise) can integrate without redesigning the
+Payment domain. Explicitly not a payment-processing milestone: no
+external provider, no webhook, no UI, no route. Every Payment this
+milestone can create starts and remains `PENDING`.
+
+Requirements
+
+Dedicated Payment module (`src/modules/payment/`, singular — distinct
+from the pre-existing empty `src/modules/payments/` scaffold, which this
+milestone does not touch), following the Catalog/Order module convention
+(`domain/`, `application/`, `repositories/`, `infrastructure/`, a single
+`index.ts` public boundary). Payment amount/currency must be derived
+from the authoritative Order, never client-supplied. Duplicate Payment
+creation for the same Order must be prevented by a database constraint,
+verified under genuine concurrency. No customer-facing route. No
+external provider, webhook, refund, inventory, shipping, UI, queue,
+event bus, or distributed lock.
+
+Architecture Decisions
+
+One Order has at most one current Payment — `Payment.orderId` is
+`@unique`, both encoding the relationship at the database level and
+giving the duplicate-creation guard (§12/§13) its atomicity, via the
+exact same pattern CR-030/IMP-031 already established:
+`PaymentRepository.create()` performs a single `INSERT`; Postgres's own
+unique constraint decides which of two concurrent callers wins; the
+loser's constraint violation is caught, the row that actually won is
+re-read, and a controlled `"duplicate"` outcome is returned — never a
+prior "does it exist?" read, which would be race-prone. This is
+`OrderRepository.createIdempotent`'s mechanism, applied to
+`Payment.orderId` instead of `Order.idempotencyKey`.
+
+`Payment` references `Order` by id rather than duplicating the rest of
+the Order (customer info, line items) — nothing about a payment needs
+that data, and Order/OrderItem remain the single source of truth for it.
+`amountMinor`/`currency` ARE copied onto Payment, deliberately: they are
+the payment's immutable payable snapshot at initialization time, exactly
+mirroring how OrderItem snapshots a Product's name/price rather than
+referencing Product live.
+
+The Payment domain (`payment.ts`) imports nothing beyond its own types —
+no Prisma, no Next.js, no provider SDK, matching Order's domain exactly.
+It does not import Order's domain either: the Order-eligibility check
+(PENDING/PAID/CANCELLED) lives in the application layer
+(`initialize-payment.ts`), consistent with this codebase's existing
+convention that cross-module dependencies happen at the application
+layer, never inside a domain file.
+
+`getOrderById` was added to Order's public boundary (`@/modules/order`) —
+a thin, already-tested pass-through to the existing
+`OrderRepository.findById` (introduced in IMP-030, unscoped by owner, for
+internal callers only). This is the one necessary, minimal touch to the
+Order module this milestone required: Payment cannot resolve the
+authoritative Order server-side without either reaching into Order's
+repository internals (forbidden by the module-boundary rule) or Order
+exposing some unscoped lookup — and no such export existed yet.
+`initializePayment` does not import this directly, though: Order's public
+barrel re-exports `.tsx` presentation components this project's Vitest
+config has no JSX transform for (unlike Catalog's barrel, which is
+JSX-free — the reason `createOrderFromCheckout` can safely import
+Catalog's `getProductsByIds` directly). To keep the Payment application
+layer cleanly unit-testable against real Order data without that
+transform failure, the Order lookup is an injected `GetOrderById`
+function parameter; only `@/modules/payment/index.ts` — the wiring layer
+— imports the real `@/modules/order` barrel and supplies the real
+`getOrderById`.
+
+A Payment status lifecycle policy (`isValidPaymentStatusTransition`) and
+an atomic `PaymentRepository.updateStatusIfCurrent` were established now
+— mirroring Order's exact CR-030 pattern — even though nothing in this
+milestone calls either yet (no provider exists to report a result). This
+is the same choice IMP-030 made for `changeOrderStatus`/
+`isValidOrderStatusTransition`, shipped unwired until a real caller
+existed; doing the same here means a future payment-processing milestone
+has the atomic primitive ready without redesigning this repository.
+
+Payment Domain
+
+`PaymentStatus = "PENDING" | "SUCCEEDED" | "FAILED" | "CANCELLED"`.
+`PENDING` is the only non-terminal status; a Payment is initialized as
+`PENDING` and, once a future milestone processes it, moves exactly once
+to one of the three terminal states. `providerReference: string | null`
+is the one field reserved for a future provider integration (e.g. a
+Stripe PaymentIntent id) — always `null` today, deliberately
+provider-neutral (never a provider-specific concept like PaymentIntent
+in the domain itself).
+
+Payment Lifecycle
+
+Allowed: `PENDING -> SUCCEEDED`, `PENDING -> CANCELLED`. Forbidden:
+every transition out of `SUCCEEDED`/`FAILED`/`CANCELLED` (all three are
+terminal), and the `PENDING -> PENDING` no-op. Creating a Payment is
+explicitly NOT the same as the Order being paid — `initializePayment`
+never mutates Order status; only a future payment-processing milestone,
+once an external provider actually reports success, is responsible for
+that separate `changeOrderStatus` transition.
+
+Database Changes
+
+Migration `20260815133630_add_payment_foundation`: adds enum
+`PaymentStatus` and table `payments` (`id` cuid PK; `orderId` unique,
+FK to `orders.id` with `onDelete: Cascade` — a Payment has no
+independent meaning once its Order is gone, the same reasoning as
+`OrderItem`'s cascade; `status` defaulting to `PENDING`; `amountMinor`
+Int; `currency` char(3); `providerReference` nullable text;
+`createdAt`/`updatedAt`). Index on `status` (mirrors `Order`'s own
+`@@index([status])`). No separate index on `orderId` — its `@unique`
+constraint already provides one. `Order` gained one required,
+Prisma-mandated back-relation field (`payment Payment?`) — purely
+relational, not a new business-data column. No other schema changes.
+
+Repository Design
+
+`PaymentRepository`: `create` (atomic create-or-detect-duplicate, per
+above), `findById`, `findByOrderId`, `updateStatusIfCurrent`.
+Deliberately not a generic CRUD repository — no `delete`, no unconditional
+`update`, no listing. `create` never accepts a `status` — the Prisma
+implementation always initializes `PENDING`, the same way
+`createOrderFromCheckout` never lets a caller choose an Order's initial
+status.
+
+Application Contract
+
+`initializePayment(repository, getOrder, orderId)`: resolves the Order via
+`getOrder`; `ORDER_NOT_FOUND` if absent; `ORDER_ALREADY_PAID` if
+`order.status === "PAID"`; `ORDER_CANCELLED` if `"CANCELLED"`; otherwise
+derives `amountMinor`/`currency` from the Order and calls
+`repository.create()`; `PAYMENT_ALREADY_EXISTS` (carrying the existing
+Payment) if a Payment already exists for this Order; otherwise
+`{ ok: true, payment }`. No amount/currency/status parameter exists on
+this function at all — there is no input a caller could even attempt to
+override them with. Exported through `@/modules/payment`'s public
+boundary as `initializePayment(orderId)`; not wired to any transport.
+
+Security
+
+Client cannot control payment amount, currency, or status through this
+foundation — no such parameters exist on `initializePayment`'s public
+signature; amount/currency are always the resolved Order's own values,
+status is always hardcoded `PENDING` in the repository implementation.
+No customer-facing route was added — `initializePayment` has no
+ownership/session check today because nothing customer-facing can reach
+it; a future milestone that exposes this to any transport must add its
+own ownership check first, the same explicit obligation already
+documented on `OrderRepository.findById`. Duplicate Payment creation is
+prevented at the database level (§13). No Prisma type or error leaks
+into the domain or application layers — verified by inspection. CR-029
+IDOR/pagination, CR-030 atomic status transitions, and IMP-031 Checkout
+idempotency are all completely unmodified by this milestone — verified
+by full regression of their existing test suites.
+
+Concurrency Verification
+
+Real Postgres, both at the repository level and the full application-
+service level: two genuinely concurrent `PaymentRepository.create()` (and
+separately, `initializePayment()`) calls for the same Order consistently
+produced exactly one `"created"`/successful result and one
+`"duplicate"`/`PAYMENT_ALREADY_EXISTS` result referencing the identical
+Payment, with exactly one row ever persisted. A concurrent pair of
+`initializePayment()` calls against a CANCELLED Order was also verified
+to create zero Payments under real concurrency.
+
+Tests
+
+Domain: 12 tests covering every allowed/forbidden `PaymentStatus`
+transition, including all three terminal states and cross-terminal
+transitions. Application (`initialize-payment.test.ts`): not-found,
+successful initialization with amount/currency verification, a
+differing-amount case proving no hardcoded value, PAID rejection,
+CANCELLED rejection, duplicate detection returning the existing Payment,
+proof that Order status is never mutated, plus a real-repository +
+real-concurrency describe block (the two concurrency scenarios above).
+Repository (`prisma-payment-repository.test.ts`): create/duplicate
+outcomes, `findById`/`findByOrderId` (hit and miss), `updateStatusIfCurrent`
+persistence and conditional-mismatch behavior, and a real concurrent-race
+test. Full existing suite (Order, Checkout, Catalog, Identity, CR-029,
+CR-030, IMP-031) re-run and confirmed passing unmodified.
+
+Validation Results
+
+`pnpm test`: 267/267 passing (233 pre-existing + 34 new), 24 test files,
+zero regressions. `pnpm typecheck`: clean. `pnpm lint`: clean. `pnpm
+format:check`: limited to the two pre-existing, unrelated warnings
+(`next.config.ts`, `pnpm-workspace.yaml`). `pnpm build`: succeeded (all
+15 routes compiled/prerendered — Payment adds no route).
+
+Runtime Verification
+
+Manually verified against the real Neon database (temporary script,
+deleted afterward): a PENDING Order initializes a Payment successfully;
+repeating it returns `PAYMENT_ALREADY_EXISTS` with the same Payment; a
+PAID Order is rejected with `ORDER_ALREADY_PAID` and creates no Payment
+row; a CANCELLED Order is rejected with `ORDER_CANCELLED` and creates no
+Payment row; two genuinely concurrent initializations for a fresh
+PENDING Order produced exactly one success and one
+`PAYMENT_ALREADY_EXISTS`, both referencing the same Payment, with
+exactly one database row. All manually-created Orders/Payments were
+deleted afterward and confirmed removed.
+
+Remaining Limitations
+
+No external payment provider — every Payment starts and remains
+`PENDING` indefinitely until a future milestone processes it. No
+transport (route/UI) calls `initializePayment` yet — intentionally out
+of scope, exactly like `changeOrderStatus` after IMP-030. No webhook, no
+refund, no retry-against-a-provider logic — none of these can exist
+without a provider first. `updateStatusIfCurrent` and
+`isValidPaymentStatusTransition` are established but unused by any
+caller in this milestone, by design (see Architecture Decisions above).
+
+Next Milestone State
+
+NOT YET APPROVED. A future payment-provider milestone (e.g. IMP-033)
+must be explicitly defined by the Architect — including which provider,
+webhook handling, and how `initializePayment`/`updateStatusIfCurrent`
+get wired to a real transport — before implementation begins. This
+milestone approves only the internal foundation documented above.
+
+10. Current Production State
 
 The following functionality is currently implemented:
 
@@ -718,7 +954,7 @@ Prisma
    ↓
 Neon PostgreSQL
 
-10. Known Limitations
+11. Known Limitations
 Product Details
 
 Product Details is dynamically rendered because database access must not be required during build.
@@ -752,22 +988,24 @@ The project currently has unit/integration tests but no dedicated browser E2E te
 
 Browser-level testing should be introduced when justified by upcoming user-critical flows.
 
-11. Next Milestone
+12. Next Milestone
 
 Status
 
 NOT YET APPROVED
 
-The next milestone after IMP-031 must be explicitly defined by the
+The next milestone after IMP-032 must be explicitly defined by the
 Architect before implementation begins.
 
 The following must NOT be assumed to be approved:
 
-Payments;
-Stripe or any payment provider;
+an external payment provider (Stripe, PayPal, or any other) — IMP-032
+approved only the internal Payment domain/persistence foundation, not
+provider integration;
+payment webhooks;
+a transport layer (API/UI) for `initializePayment` or `changeOrderStatus`;
 Inventory;
 Admin tooling / Admin UI;
-transport layer (API/UI) for changeOrderStatus;
 roles/permissions;
 ISR;
 caching;
@@ -777,11 +1015,11 @@ or any other future subsystem.
 
 These require separate requirements and architectural decisions.
 
-12. Future Roadmap Areas
+13. Future Roadmap Areas
 
 The following are possible future areas and are NOT yet approved implementation milestones:
 
-Payments (using the IMP-030 lifecycle contract)
+Payments (using the IMP-030 lifecycle contract and the IMP-032 Payment foundation)
 Inventory
 Admin Catalog management
 Admin Order management
@@ -798,7 +1036,7 @@ Order status history / audit log
 
 No item above should be implemented without explicit Architect approval.
 
-13. Implementation Process
+14. Implementation Process
 
 Every milestone follows this lifecycle:
 
@@ -827,7 +1065,7 @@ Manual acceptance when required
 Architect approval
     ↓
 Next milestone
-14. Code Review Policy
+15. Code Review Policy
 
 Code Review is performed through:
 
@@ -851,7 +1089,7 @@ scope compliance.
 
 Claude/local resources should not be used for the primary Code Review when GitHub access is available.
 
-15. Local QA Policy
+16. Local QA Policy
 
 Local QA is performed by Claude/local tooling when possible.
 
@@ -870,7 +1108,7 @@ relevant performance behavior.
 
 If browser automation is unavailable, browser-only scenarios must be reported as NOT VERIFIED, not assumed to pass.
 
-16. Definition of Done
+17. Definition of Done
 
 A milestone is complete only when:
 
@@ -884,7 +1122,7 @@ no unresolved P0/P1/P2 defects remain;
 scope has not expanded without approval;
 the milestone commit is traceable;
 this roadmap is updated.
-17. Milestone Summary
+18. Milestone Summary
 Milestone	Status
 IMP-021 — Catalog Persistence Foundation	COMPLETED
 IMP-021-FIX-001 — Public API + Prisma Build Generation	COMPLETED
@@ -893,8 +1131,9 @@ IMP-022 — Cart → Checkout Navigation	COMPLETED
 IMP-023 through IMP-029 (incl. fix follow-ups)	COMPLETED — see Section 6 note; git history authoritative
 IMP-030 — Order Lifecycle & Status Management (incl. CR-030)	COMPLETED
 IMP-031 — Checkout Submission Idempotency (incl. IMP-031-FIX / CR-031)	COMPLETED
+IMP-032 — Payment Foundation	COMPLETED (pending commit — see Section 9)
 Next milestone	NOT YET APPROVED
-18. Source of Truth
+19. Source of Truth
 
 This document is the authoritative roadmap for implementation milestones.
 

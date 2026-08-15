@@ -156,6 +156,12 @@ model Order {
 
   items OrderItem[]
 
+  // Prisma-required opposite side of `Payment.order` (IMP-032) — purely
+  // relational (virtual, not a real column). `Payment?` (not `Payment[]`)
+  // because the approved IMP-032 model is one current Payment per Order,
+  // enforced at the database level by `Payment.orderId`'s own uniqueness.
+  payment Payment?
+
   // Checkout submission idempotency (IMP-031). Nullable + unique: Postgres
   // treats every NULL as distinct from every other NULL, so orders created
   // without an idempotency key (e.g. the generic internal `createOrder`
@@ -205,6 +211,68 @@ model OrderItem {
   @@index([orderId])
   @@index([productId])
   @@map("order_items")
+}
+
+// =============================================================================
+// Payment — internal Payment foundation (IMP-032)
+//
+// Establishes a provider-neutral internal representation of "the payment
+// that pays for an Order", so a future payment-provider milestone can
+// integrate a real provider without redesigning this model. No provider is
+// integrated here — every Payment created by this milestone starts and
+// remains PENDING; only a future milestone will ever move it to SUCCEEDED
+// or FAILED (via a provider webhook/callback) or CANCELLED.
+//
+// One Order has at most one current Payment: `orderId` is `@unique`, both
+// enforcing that relationship at the database level and giving the
+// duplicate-Payment-creation guard (IMP-032 §12) its atomicity — a second
+// concurrent `create` for the same Order collides with this constraint
+// exactly the way IMP-031's `idempotencyKey` collision does, resolved the
+// same way (catch the constraint violation, re-read the row that actually
+// won, return it as a controlled "duplicate" outcome).
+//
+// `amountMinor`/`currency` are an immutable snapshot of the Order's
+// authoritative payable amount at the moment the Payment was initialized —
+// never re-derived from a live Order read afterward, and never
+// client-supplied. Payment references Order by id rather than duplicating
+// the rest of the Order (customer info, line items) — nothing about a
+// payment needs that data, and the existing Order/OrderItem rows remain the
+// single source of truth for it.
+// =============================================================================
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+model Payment {
+  id String @id @default(cuid())
+
+  orderId String @unique
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  status PaymentStatus @default(PENDING)
+
+  // Integer minor units, never floating point — same convention as
+  // Order/Product. Copied from `Order.totalAmountMinor`/`Order.currency` at
+  // creation time; this milestone provides no way to change either
+  // afterward (no update path exists beyond `status`).
+  amountMinor Int
+  currency    String @db.Char(3)
+
+  // Opaque identifier a future external payment provider integration will
+  // set (e.g. a Stripe PaymentIntent id, a PayPal order id) once a provider
+  // is chosen — deliberately provider-neutral: this column never encodes
+  // which provider, only an id string. Unused (always null) until then.
+  providerReference String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@map("payments")
 }
 
 // =============================================================================

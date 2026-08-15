@@ -10,6 +10,7 @@ import * as orderCommands from "@/modules/order/application/order-commands";
 import * as checkoutOrderCommands from "@/modules/order/application/checkout-order";
 import * as customerOrdersCommands from "@/modules/order/application/customer-orders";
 import * as orderStatusCommands from "@/modules/order/application/order-status";
+import * as getOrderCommand from "@/modules/order/application/get-order";
 import type { NewOrderInput } from "@/modules/order/repositories/order-repository";
 import type { CheckoutOrderRequest } from "@/modules/order/application/checkout-order";
 import type { OrderStatus } from "@/modules/order/domain/order";
@@ -73,4 +74,14 @@ export function getCustomerOrder(userId: string, orderId: string) {
  */
 export function changeOrderStatus(orderId: string, nextStatus: OrderStatus) {
   return orderStatusCommands.changeOrderStatus(prismaOrderRepository, orderId, nextStatus);
+}
+
+/**
+ * Internal, unscoped-by-owner Order lookup (IMP-032) — for server-side use
+ * by other trusted internal modules (e.g. Payment) that need the
+ * authoritative Order, never for customer-facing use. Customer-facing code
+ * must use `getCustomerOrder` (owner-scoped) instead.
+ */
+export function getOrderById(orderId: string) {
+  return getOrderCommand.getOrderById(prismaOrderRepository, orderId);
 }
