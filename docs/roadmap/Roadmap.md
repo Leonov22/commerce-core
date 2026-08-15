@@ -405,15 +405,11 @@ implementation begins.
 
 Status
 
-COMPLETED (implementation + validation; not yet committed — see Commit below)
+COMPLETED
 
 Commit
 
-Not yet committed at the time this entry was written — implementation and
-validation are complete, pending Code Review before a commit is created.
-Update this field with the real commit SHA immediately once the IMP-031
-commit is created; do not leave this placeholder in a completed entry
-after that point.
+d122508f9447629c5f5bb0ac1964f58dca6b89c8
 
 Objective
 
