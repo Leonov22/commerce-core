@@ -4,6 +4,7 @@ import {
   guestAccountNavItems,
   authenticatedAccountNavItems,
 } from "@/shared/components/layout/nav-items";
+import messages from "@/core/i18n/messages/en.json";
 
 /**
  * Pure data, no rendering — this project's Vitest config has no JSX
@@ -42,6 +43,49 @@ describe("guestAccountNavItems / authenticatedAccountNavItems (IMP-036)", () => 
     );
     for (const href of allHrefs) {
       expect(href.startsWith("/account")).toBe(true);
+    }
+  });
+});
+
+/**
+ * IMP-036-FIX-01: resolves each item's `labelKey` against the actual `en.json`
+ * message catalog `SiteHeader`/`MobileNav` render through (`tNav(item.labelKey)`),
+ * the closest this project's JSX-transform-free Vitest config can get to
+ * asserting on-screen text without rendering anything. Locks in the exact
+ * guest/authenticated label sets the ticket's acceptance criteria specify.
+ */
+describe("resolved navigation labels (IMP-036-FIX-01)", () => {
+  const nav: Record<string, string> = messages.Nav;
+
+  it("guest labels resolve to exactly Log in, Register — never My Account/My Orders", () => {
+    const labels = guestAccountNavItems.map((item) => nav[item.labelKey]);
+    expect(labels).toEqual(["Log in", "Register"]);
+  });
+
+  it("authenticated labels resolve to exactly My Account, My Orders — never Log in/Register", () => {
+    const labels = authenticatedAccountNavItems.map((item) => nav[item.labelKey]);
+    expect(labels).toEqual(["My Account", "My Orders"]);
+  });
+
+  it("My Account links to /account, and My Orders links to /account/orders", () => {
+    const myAccount = authenticatedAccountNavItems.find(
+      (item) => nav[item.labelKey] === "My Account",
+    );
+    const myOrders = authenticatedAccountNavItems.find(
+      (item) => nav[item.labelKey] === "My Orders",
+    );
+    expect(myAccount?.href).toBe("/account");
+    expect(myOrders?.href).toBe("/account/orders");
+  });
+
+  it("no guest label text appears among authenticated labels, and vice versa", () => {
+    const guestLabels = guestAccountNavItems.map((item) => nav[item.labelKey]);
+    const authenticatedLabels = authenticatedAccountNavItems.map((item) => nav[item.labelKey]);
+    for (const label of guestLabels) {
+      expect(authenticatedLabels).not.toContain(label);
+    }
+    for (const label of authenticatedLabels) {
+      expect(guestLabels).not.toContain(label);
     }
   });
 });
