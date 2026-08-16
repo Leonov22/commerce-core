@@ -11,4 +11,5 @@
  */
 export { useCatalogProducts } from "@/modules/catalog/presentation/use-catalog-products";
 export { formatProductPrice } from "@/modules/catalog/presentation/format-price";
+export { productDetailsHref } from "@/modules/catalog/presentation/product-route";
 export type { StorefrontProductSummary } from "@/modules/catalog/presentation/storefront-product";

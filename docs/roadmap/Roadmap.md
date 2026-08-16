@@ -37,7 +37,7 @@ The project follows these principles:
     backend work with frontend integration, deployment, and manual
     testability — over accumulating backend-only milestones; infrastructure-
     only milestones with no meaningful customer-facing behavior may remain
-    backend-only (see Section 15, "Development Strategy — Backend + Frontend
+    backend-only (see Section 16, "Development Strategy — Backend + Frontend
     Vertical Slices").
 
 ---
@@ -682,7 +682,7 @@ Next Milestone State
 
 NOT YET APPROVED — unchanged. This milestone does not approve Payments,
 Inventory, Admin tooling, a transport layer for changeOrderStatus, or any
-other future subsystem; see Section 16 (Next Milestone) below.
+other future subsystem; see Section 17 (Next Milestone) below.
 
 9. IMP-032 — Payment Foundation
 
@@ -1946,7 +1946,156 @@ confirmation (most likely a webhook) into a real status transition, and
 for whatever recovery/reconciliation tooling a permanently-claimed,
 never-started Payment eventually needs.
 
-13. Current Production State
+13. IMP-037 — Product Discovery & Product Details Vertical Slice
+
+Status
+
+COMPLETED
+
+Commit
+
+IMP-037 pending — implementation and validation are complete but not yet
+committed at the time this entry was written. Record the actual commit
+SHA through the normal follow-up documentation process once the commit
+exists; do not treat any SHA embedded in this entry before that point
+as authoritative for IMP-037.
+
+Objective
+
+The first Product Discovery vertical slice per the Section 16 strategy:
+Homepage → Featured Product → Product Details → Add to Cart → Cart →
+Checkout, manually reachable end to end without a hidden URL.
+
+Discovery (repository inspection performed before any change)
+
+The Shop → Product Details → Add to Cart → Cart → Checkout path already
+existed and already worked: `src/app/[locale]/shop/[product]/page.tsx`
+resolves a product by `id` via `getProductById` (Catalog's existing,
+`server-only`-guarded public API), calls `notFound()` for an unknown id,
+and renders `ProductDetailsView` — which already includes
+`AddToCartButton` wired to the existing Cart Context (`useCart().addItem`).
+`catalog-grid.tsx` (the Shop listing) already linked each card to
+`` `/shop/${product.id}` ``. None of this needed to be built.
+
+The ONLY broken link was the Homepage's "Selected pieces" / Featured
+Products section: `featured-products-section.tsx` rendered four
+hardcoded mock objects (not real `Product` entities) through the shared
+`ProductCard` component WITHOUT an `href` — `ProductCard` already
+supports an optional `href` (wraps its content in one accessible `Link`,
+avoiding nested interactive elements), but nothing was passed, so the
+cards were visibly styled but inert. Separately, `Product.isFeatured`
+already existed on the domain entity and Prisma schema (with its own
+`@@index([isFeatured])`) but no query ever filtered on it and the seed
+script never set it — the field was fully wired end-to-end except for
+one missing repository filter and the seed data to populate it.
+
+Functional Scope Implemented
+
+Homepage Featured Products now query the real Catalog
+(`listProducts(locale, { featuredOnly: true })`) instead of static mock
+data, and each card links to the SAME product details route the Shop
+page already uses (`/shop/${product.id}`) — extracted into one shared
+`productDetailsHref(id)` helper (`catalog/presentation/product-route.ts`,
+re-exported from `catalog/client.ts`) so `catalog-grid.tsx` and the new
+Homepage section build the identical href string from one definition,
+not two independently-maintained copies. If no product is currently
+marked featured, the section renders nothing (`return null`) rather than
+an empty grid under a heading. Product Details, not-found handling
+(`notFound()`), Add to Cart, and Cart → Checkout were all already
+correct and are unmodified.
+
+Product Identity
+
+The existing `id`-based route (`/shop/${id}`, resolved via
+`getProductById`) is reused exactly as-is — no new identifier, no slug
+migration, matching the convention `catalog-grid.tsx` already
+established.
+
+Database
+
+No schema or migration change: `Product.isFeatured` already existed.
+`ProductListFilter` (the repository abstraction) gained one optional
+field, `featuredOnly?: boolean`, applied in
+`prisma-product-repository.ts`'s existing `listActive` query alongside
+the pre-existing `categorySlug` filter — the same conditional-`where`
+pattern, not a new query shape. `prisma/seed.ts` was updated to mark
+four of the six existing demo products `isFeatured: true` (Studio Chair,
+Table Lamp, Wool Throw, Ceramic Vase — the same four names/badges the
+old mock data referenced) and re-run
+(`pnpm exec tsx prisma/seed.ts`, idempotent upsert by `id`) against the
+connected database so the slice is non-empty and manually testable, not
+only against a schema change with no corresponding data.
+
+i18n
+
+`FeaturedProducts.products.*` (the mock-product-keyed translation
+strings) removed — no longer referenced now that real `Product`
+translations supply name/meta/price, the same way `Catalog`/`ProductDetails`
+already do. `FeaturedProducts.eyebrow/title/subtitle/viewAll/newBadge/
+limitedBadge/imagePlaceholder` unchanged and still used.
+
+Architecture
+
+Reused: Catalog domain/repository/application/public-API layers,
+`ProductDetailsView`, `AddToCartButton`, Cart Context, existing
+server/client boundary conventions (`getLocale()`/`getTranslations()`
+server-side, `@/modules/catalog/client` for the one client-safe helper
+needed). No new route, no new API endpoint, no new cart mechanism, no
+new product model, no infrastructure. The only genuinely new production
+code is the ~15-line `productDetailsHref` helper (extracted to remove
+duplication this change itself introduced) and the `featuredOnly`
+repository filter.
+
+Tests
+
+4 new tests. `catalog-queries.test.ts`: `featuredOnly` passes through the
+application layer to the (fake) repository, mirroring the existing
+`categorySlug` passthrough test exactly. `prisma-product-repository.test.ts`:
+`featuredOnly` against the real, re-seeded database returns exactly the
+four newly-featured product ids. `product-route.test.ts` (new file):
+`productDetailsHref` builds the existing `/shop/:id` route verbatim from
+a product id — the one thing about "Featured Product routing/identity"
+testable without this project's absent JSX-rendering infrastructure.
+Full pre-existing suite (Catalog, Cart, Checkout, Order, Payment/Stripe
+series, Identity, storefront navigation) re-run and confirmed passing
+unmodified — zero regressions.
+
+Runtime Verification
+
+MANUAL/BROWSER VERIFICATION: NOT PERFORMED. The connected database was
+re-seeded (idempotent) so the deployed environment has non-empty
+Featured Products data once this deploys, but the actual click-through
+flow (Homepage → Featured Product → Product Details → Add to Cart →
+Cart → Checkout, desktop and mobile) has not been exercised in a
+browser as part of this implementation and requires the user's own
+manual verification, per this milestone's own Manual Testing
+Requirements.
+
+Validation Results
+
+`pnpm test`: 346 passing + 3 skipped (349 total), 29 test files, zero
+regressions in the pre-existing 342. `pnpm typecheck`: clean. `pnpm
+lint`: clean. `pnpm format:check`: limited to the same two pre-existing,
+unrelated warnings already noted for prior milestones (`next.config.ts`,
+`pnpm-workspace.yaml`). `pnpm build`: the full command did NOT complete
+in this environment — `next build`'s own compile/bundle step succeeded
+on every attempt ("Compiled successfully"), but its separate, redundant
+internal type-checking worker crashed with a V8 out-of-memory error on
+8 consecutive attempts, the same class of sandbox-level flakiness
+documented against multiple earlier milestones in this Roadmap.
+Substitute evidence: `pnpm typecheck` (clean, the same type validation
+that worker duplicates) and the compile step's own repeated success.
+
+What Is Deliberately Deferred
+
+No search, filtering, reviews, wishlist, recommendations, product image
+upload/gallery (still a placeholder icon, matching the pre-existing
+Product Details/Shop presentation exactly), customer profile changes,
+Order management, or payment UI — all explicitly out of scope per this
+milestone's own instructions and left to their own future milestones
+(IMP-038 Payment UI, per Section 16).
+
+14. Current Production State
 
 The following functionality is currently implemented:
 
@@ -1986,7 +2135,7 @@ Prisma
    ↓
 Neon PostgreSQL
 
-14. Known Limitations
+15. Known Limitations
 Product Details
 
 Product Details is dynamically rendered because database access must not be required during build.
@@ -2020,7 +2169,7 @@ The project currently has unit/integration tests but no dedicated browser E2E te
 
 Browser-level testing should be introduced when justified by upcoming user-critical flows.
 
-15. Development Strategy — Backend + Frontend Vertical Slices
+16. Development Strategy — Backend + Frontend Vertical Slices
 
 Why the strategy is changing
 
@@ -2060,7 +2209,7 @@ deployed storefront. Each customer-facing milestone should be able to
 answer: "What can the customer now do through the storefront that they
 could not do before?"
 
-For customer-facing milestones, QA (Section 20, "Local QA Policy") verifies both:
+For customer-facing milestones, QA (Section 21, "Local QA Policy") verifies both:
 
 1. Repository correctness (the existing automated-test/typecheck/lint/
    build verification this Roadmap already requires).
@@ -2114,7 +2263,7 @@ Login/Register/Account/My Orders/Checkout UI is available to a customer
 merely because the page file exists in the repository — availability
 requires it to be reachable through normal navigation.
 
-Planned Milestones (direction only — see Section 16, "Next Milestone";
+Planned Milestones (direction only — see Section 17, "Next Milestone";
 NOT YET APPROVED, and none of the following is to be treated as
 implemented or scheduled without explicit Architect approval)
 
@@ -2129,13 +2278,22 @@ Shop → Product → Cart → Checkout navigation; eliminating dead-end or
 hidden customer flows where the corresponding backend functionality
 already exists.
 
-IMP-037 — Checkout & Order Customer Flow. Expected direction: Shop →
-Product → Add to Cart → Cart → Checkout → Contact → Delivery → Order
-Summary → Place Order → Order Confirmation, making the existing
-checkout/order functionality fully usable through the storefront.
-Existing checkout/order defects discovered during implementation or QA
-are resolved as follow-up fix work, per Principle 8. Stripe payment UI is
+IMP-037 — Checkout & Order Customer Flow. Expected direction (as
+originally speculated when this section was written): Shop → Product →
+Add to Cart → Cart → Checkout → Contact → Delivery → Order Summary →
+Place Order → Order Confirmation, making the existing checkout/order
+functionality fully usable through the storefront. Existing
+checkout/order defects discovered during implementation or QA are
+resolved as follow-up fix work, per Principle 8. Stripe payment UI is
 not implemented in this milestone unless explicitly approved.
+
+SUPERSEDED: the Architect-approved IMP-037 ticket redefined this
+milestone's actual scope to "Product Discovery & Product Details
+Vertical Slice" (Section 13) instead — Homepage Featured Products →
+Product Details → Add to Cart → Cart → Checkout, not a Checkout/Order
+UX overhaul. The Checkout/Order-flow direction speculated above remains
+a legitimate future milestone if the Architect still wants it, under a
+different milestone number.
 
 IMP-038 — Payment UI & Stripe Customer Flow. Exposes the already-
 implemented `PaymentProvider`/Stripe backend (IMP-033–IMP-035-series)
@@ -2164,7 +2322,7 @@ the Payment domain (unchanged from IMP-033's original boundary). Prefer
 simple vertical slices over speculative abstraction. Keep customer-facing
 behavior manually testable, per the Manual Testing Principle above.
 
-16. Next Milestone
+17. Next Milestone
 
 Status
 
@@ -2172,7 +2330,7 @@ NOT YET APPROVED
 
 The next milestone after IMP-035 must be explicitly defined by the
 Architect before implementation begins. Per the Development Strategy
-(Section 15), the anticipated direction is IMP-036 — Storefront &
+(Section 16), the anticipated direction is IMP-036 — Storefront &
 Customer UX Foundation, the first of a planned IMP-036–IMP-039
 vertical-slice sequence bringing the storefront's actual navigation up to
 what the backend already supports. This is a documented DIRECTION, not an
@@ -2204,7 +2362,7 @@ or any other future subsystem.
 
 These require separate requirements and architectural decisions.
 
-17. Future Roadmap Areas
+18. Future Roadmap Areas
 
 The following are possible future areas and are NOT yet approved implementation milestones:
 
@@ -2225,7 +2383,7 @@ Order status history / audit log
 
 No item above should be implemented without explicit Architect approval.
 
-18. Implementation Process
+19. Implementation Process
 
 Every milestone follows this lifecycle:
 
@@ -2254,7 +2412,7 @@ Manual acceptance when required
 Architect approval
     ↓
 Next milestone
-19. Code Review Policy
+20. Code Review Policy
 
 Code Review is performed through:
 
@@ -2278,7 +2436,7 @@ scope compliance.
 
 Claude/local resources should not be used for the primary Code Review when GitHub access is available.
 
-20. Local QA Policy
+21. Local QA Policy
 
 Local QA is performed by Claude/local tooling when possible.
 
@@ -2297,7 +2455,7 @@ relevant performance behavior.
 
 If browser automation is unavailable, browser-only scenarios must be reported as NOT VERIFIED, not assumed to pass.
 
-21. Definition of Done
+22. Definition of Done
 
 A milestone is complete only when:
 
@@ -2311,7 +2469,7 @@ no unresolved P0/P1/P2 defects remain;
 scope has not expanded without approval;
 the milestone commit is traceable;
 this roadmap is updated.
-22. Milestone Summary
+23. Milestone Summary
 Milestone	Status
 IMP-021 — Catalog Persistence Foundation	COMPLETED
 IMP-021-FIX-001 — Public API + Prisma Build Generation	COMPLETED
@@ -2324,12 +2482,12 @@ IMP-032 — Payment Foundation	COMPLETED
 IMP-033 — Payment Provider Port	COMPLETED
 IMP-034 — Payment Processing Application Flow (incl. IMP-034-FIX / CR-034)	COMPLETED
 IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01, IMP-035-FIX-2 / CR-035-FIX-01, CR-035-FIX-02, IMP-035-FIX-3 / CR-035-FIX-03)	COMPLETED — real Stripe test-mode verification pending (see Section 12)
-IMP-036 — Storefront & Customer UX Foundation	PLANNED — direction only, NOT YET APPROVED (see Section 15/16)
-IMP-037 — Checkout & Order Customer Flow	PLANNED — direction only, NOT YET APPROVED (see Section 15/16)
-IMP-038 — Payment UI & Stripe Customer Flow	PLANNED — direction only, NOT YET APPROVED (see Section 15/16)
-IMP-039 — Asynchronous Payment Lifecycle	PLANNED — direction only, NOT YET APPROVED (see Section 15/16)
+IMP-036 — Storefront & Customer UX Foundation (incl. IMP-036-FIX-01)	COMPLETED — manual/browser verification of the deployed environment performed by the user
+IMP-037 — Product Discovery & Product Details Vertical Slice	COMPLETED — manual/browser verification NOT performed (see Section 13); supersedes the "Checkout & Order Customer Flow" direction originally speculated for IMP-037 in Section 16
+IMP-038 — Payment UI & Stripe Customer Flow	PLANNED — direction only, NOT YET APPROVED (see Section 16/17)
+IMP-039 — Asynchronous Payment Lifecycle	PLANNED — direction only, NOT YET APPROVED (see Section 16/17)
 Next milestone	NOT YET APPROVED
-23. Source of Truth
+24. Source of Truth
 
 This document is the authoritative roadmap for implementation milestones.
 

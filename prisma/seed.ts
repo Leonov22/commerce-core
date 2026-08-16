@@ -29,6 +29,7 @@ const products = [
     badge: ProductBadge.NEW,
     priceAmountMinor: 24000,
     sortOrder: 0,
+    isFeatured: true,
     name: "Studio Chair",
     meta: "Oak & linen",
     description:
@@ -43,6 +44,7 @@ const products = [
     badge: null,
     priceAmountMinor: 31000,
     sortOrder: 1,
+    isFeatured: false,
     name: "Lounge Chair",
     meta: "Bouclé & ash",
     description:
@@ -57,6 +59,7 @@ const products = [
     badge: ProductBadge.LIMITED,
     priceAmountMinor: 9600,
     sortOrder: 2,
+    isFeatured: true,
     name: "Table Lamp",
     meta: "Brushed brass",
     description:
@@ -71,6 +74,7 @@ const products = [
     badge: null,
     priceAmountMinor: 14500,
     sortOrder: 3,
+    isFeatured: false,
     name: "Pendant Light",
     meta: "Opal glass",
     description:
@@ -85,6 +89,7 @@ const products = [
     badge: null,
     priceAmountMinor: 12800,
     sortOrder: 4,
+    isFeatured: true,
     name: "Wool Throw",
     meta: "Undyed merino wool",
     description:
@@ -99,6 +104,7 @@ const products = [
     badge: null,
     priceAmountMinor: 8600,
     sortOrder: 5,
+    isFeatured: true,
     name: "Ceramic Vase",
     meta: "Handmade ceramic",
     description:
@@ -144,6 +150,7 @@ async function main() {
         categoryId,
         badge: product.badge,
         sortOrder: product.sortOrder,
+        isFeatured: product.isFeatured,
         publishedAt: new Date(),
       },
       create: {
@@ -155,6 +162,7 @@ async function main() {
         categoryId,
         badge: product.badge,
         sortOrder: product.sortOrder,
+        isFeatured: product.isFeatured,
         publishedAt: new Date(),
       },
     });

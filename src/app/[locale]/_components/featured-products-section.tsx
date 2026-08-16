@@ -1,32 +1,33 @@
-import { getTranslations } from "next-intl/server";
+import { getLocale, getTranslations } from "next-intl/server";
 import { ArrowRight } from "lucide-react";
 import { Link } from "@/core/i18n/navigation";
 import { Container } from "@/shared/components/layout/container";
 import { ProductCard } from "@/shared/components/product-card";
+import { listProducts } from "@/modules/catalog";
+import { formatProductPrice, productDetailsHref } from "@/modules/catalog/client";
 
 /**
- * Static mock data for visual composition only — not a Product entity.
- * Display strings (name/meta/price) live in the FeaturedProducts.products
- * translation namespace; this only references translation keys.
- * Real catalog data will replace this once the catalog module is implemented.
+ * IMP-037: previously rendered static mock data with no link — clicking a
+ * card did nothing. Now backed by the real Catalog (`Product.isFeatured`,
+ * already a domain field with its own index, just never queried before
+ * this milestone) and linked to the existing product details route
+ * (`/shop/${product.id}`) — the exact convention `catalog-grid.tsx` already
+ * established for the Shop listing, reused here rather than invented.
+ * Fetched server-side, same as `CatalogView`/`ProductDetailsView` — no
+ * client-side round trip for data the server already has at render time.
  */
-type MockProductTranslationKey = "studioChair" | "ceramicVase" | "woolThrow" | "tableLamp";
-
-type MockProduct = {
-  id: string;
-  translationKey: MockProductTranslationKey;
-  badge?: "New" | "Limited";
-};
-
-const mockProducts: MockProduct[] = [
-  { id: "1", translationKey: "studioChair", badge: "New" },
-  { id: "2", translationKey: "ceramicVase" },
-  { id: "3", translationKey: "woolThrow" },
-  { id: "4", translationKey: "tableLamp", badge: "Limited" },
-];
-
 export async function FeaturedProductsSection() {
+  const locale = await getLocale();
   const t = await getTranslations("FeaturedProducts");
+  const products = await listProducts(locale, { featuredOnly: true });
+
+  // Nothing curated yet — the section has nothing honest to show, so it
+  // simply doesn't render rather than displaying an empty grid under a
+  // heading (this is a homepage teaser, not the full Catalog page, which
+  // already has its own empty-state message for a genuinely empty result).
+  if (products.length === 0) {
+    return null;
+  }
 
   return (
     <section className="border-t border-border py-16 sm:py-24">
@@ -50,20 +51,21 @@ export async function FeaturedProductsSection() {
         </div>
 
         <div className="mt-12 grid grid-cols-2 gap-x-6 gap-y-10 lg:grid-cols-4">
-          {mockProducts.map((product) => (
+          {products.map((product) => (
             <ProductCard
               key={product.id}
-              name={t(`products.${product.translationKey}.name`)}
-              meta={t(`products.${product.translationKey}.meta`)}
-              price={t(`products.${product.translationKey}.price`)}
+              name={product.translation.name}
+              meta={product.translation.meta}
+              price={formatProductPrice(product.priceAmountMinor, product.currency, locale)}
               badge={
-                product.badge === "New"
+                product.badge === "NEW"
                   ? t("newBadge")
-                  : product.badge === "Limited"
+                  : product.badge === "LIMITED"
                     ? t("limitedBadge")
                     : undefined
               }
               imageLabel={t("imagePlaceholder")}
+              href={productDetailsHref(product.id)}
             />
           ))}
         </div>

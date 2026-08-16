@@ -3,6 +3,8 @@ import type { Category } from "@/modules/catalog/domain/category";
 
 export interface ProductListFilter {
   categorySlug?: string;
+  /** IMP-037: restricts to products with `isFeatured: true` — the Homepage's "Selected pieces" section. */
+  featuredOnly?: boolean;
 }
 
 /**

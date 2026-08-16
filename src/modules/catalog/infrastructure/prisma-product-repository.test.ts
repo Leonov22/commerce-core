@@ -116,6 +116,12 @@ describe("prismaProductRepository", () => {
       });
       expect(products.map((product) => product.id).sort()).toEqual(["3", "4"]);
     });
+
+    it("IMP-037: filters by featuredOnly, returning the seeded featured products", async () => {
+      const products = await prismaProductRepository.listActive("en", { featuredOnly: true });
+      expect(products.map((product) => product.id).sort()).toEqual(["1", "3", "5", "6"]);
+      expect(products.every((product) => product.isFeatured)).toBe(true);
+    });
   });
 
   describe("listCategories", () => {

@@ -1,6 +1,6 @@
 import { useLocale, useTranslations } from "next-intl";
 import { ProductCard } from "@/shared/components/product-card";
-import { formatProductPrice } from "@/modules/catalog/client";
+import { formatProductPrice, productDetailsHref } from "@/modules/catalog/client";
 import type { Product } from "@/modules/catalog";
 
 interface CatalogGridProps {
@@ -36,7 +36,7 @@ export function CatalogGrid({ products }: CatalogGridProps) {
                 : undefined
           }
           imageLabel={t("imagePlaceholder")}
-          href={`/shop/${product.id}`}
+          href={productDetailsHref(product.id)}
         />
       ))}
     </div>

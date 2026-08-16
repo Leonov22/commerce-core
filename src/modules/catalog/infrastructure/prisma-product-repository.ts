@@ -103,6 +103,7 @@ export const prismaProductRepository: ProductRepository = {
       where: {
         status: "ACTIVE",
         ...(filter?.categorySlug ? { category: { slug: filter.categorySlug } } : {}),
+        ...(filter?.featuredOnly ? { isFeatured: true } : {}),
       },
       include: PRODUCT_INCLUDE,
       orderBy: { sortOrder: "asc" },

@@ -59,9 +59,14 @@ function makeFakeRepository(products: Product[], categories: Category[]): Produc
       return products.filter((product) => ids.includes(product.id));
     },
     async listActive(_locale: string, filter?: ProductListFilter) {
-      return filter?.categorySlug
-        ? products.filter((product) => product.categorySlug === filter.categorySlug)
-        : products;
+      let result = products;
+      if (filter?.categorySlug) {
+        result = result.filter((product) => product.categorySlug === filter.categorySlug);
+      }
+      if (filter?.featuredOnly) {
+        result = result.filter((product) => product.isFeatured);
+      }
+      return result;
     },
     async listCategories() {
       return categories;
@@ -115,6 +120,15 @@ describe("catalog-queries", () => {
       );
       const products = await listProducts(repository, "en");
       expect(products).toHaveLength(2);
+    });
+
+    it("IMP-037: passes the featuredOnly filter through to the repository", async () => {
+      const repository = makeFakeRepository(
+        [makeProduct({ id: "1", isFeatured: true }), makeProduct({ id: "2", isFeatured: false })],
+        [],
+      );
+      const products = await listProducts(repository, "en", { featuredOnly: true });
+      expect(products.map((product) => product.id)).toEqual(["1"]);
     });
   });
 
