@@ -18,11 +18,21 @@
  * by never importing from `src/modules/catalog/infrastructure/prisma-client.ts`
  * either.
  *
+ * CR-037-FIX-01: `updateMany` can silently match fewer rows than
+ * `FEATURED_PRODUCT_IDS.length` (e.g. a configured id no longer exists)
+ * while still resolving without error. `evaluateFeaturedProvisioning`
+ * (imported — it has no `server-only`/Prisma dependency, so it's safe to
+ * import under plain `tsx`, unlike `feature-products.ts` above) is what
+ * turns that raw count into an actual pass/fail: this script now only
+ * reports success, and only exits 0, when EVERY configured id was
+ * actually updated — never merely because the query didn't error.
+ *
  * Run with: pnpm exec tsx prisma/set-featured-products.ts
  */
 import "dotenv/config";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/generated/prisma/client";
+import { evaluateFeaturedProvisioning } from "@/modules/catalog/infrastructure/featured-provisioning";
 
 /** The same four seeded demo products IMP-037 originally featured. */
 const FEATURED_PRODUCT_IDS = ["1", "3", "5", "6"];
@@ -35,7 +45,15 @@ async function main() {
     where: { id: { in: FEATURED_PRODUCT_IDS } },
     data: { isFeatured: true },
   });
-  console.log(`Marked ${result.count} product(s) as featured.`);
+
+  const outcome = evaluateFeaturedProvisioning(FEATURED_PRODUCT_IDS.length, result.count);
+  if (!outcome.ok) {
+    // Caught below: printed once via console.error, and the process
+    // exits non-zero — this must never be reported as a successful
+    // provisioning run.
+    throw new Error(outcome.message);
+  }
+  console.log(outcome.message);
 }
 
 main()

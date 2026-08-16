@@ -1946,7 +1946,7 @@ confirmation (most likely a webhook) into a real status transition, and
 for whatever recovery/reconciliation tooling a permanently-claimed,
 never-started Payment eventually needs.
 
-13. IMP-037 — Product Discovery & Product Details Vertical Slice (incl. IMP-037-FIX-01 / CR-037-01-SEED)
+13. IMP-037 — Product Discovery & Product Details Vertical Slice (incl. IMP-037-FIX-01 / CR-037-01-SEED, IMP-037-FIX-02 / CR-037-FIX-01)
 
 Status
 
@@ -1955,11 +1955,12 @@ COMPLETED
 Commit
 
 f80880f08b3f3eead34c57f300b94329ad74bcbd (initial IMP-037)
-IMP-037-FIX-01 pending — implementation and validation are complete but
+256cf0d58ad3aa01467dd2337f1425214979d657 (IMP-037-FIX-01 / CR-037-01-SEED)
+IMP-037-FIX-02 pending — implementation and validation are complete but
 not yet committed at the time this entry was written. Record the
 actual commit SHA through the normal follow-up documentation process
 once the commit exists; do not treat any SHA embedded in this entry
-before that point as authoritative for IMP-037-FIX-01.
+before that point as authoritative for IMP-037-FIX-02.
 
 Objective
 
@@ -2091,6 +2092,50 @@ entirely outside it, as an ops-time operation, the same way
 `prisma/seed.ts` itself was never part of the Catalog module's runtime
 architecture.
 
+CR-037-01-SEED: CLOSED. Not reopened or redesigned by IMP-037-FIX-02
+below — the seed guard, its confirmation value, and its independence
+from `NODE_ENV` are all unchanged.
+
+Code Review Findings and Fixes (IMP-037-FIX-02 / CR-037-FIX-01, ROADMAP-037-FIX-SHA)
+
+CR-037-FIX-01 (P2) — QA on IMP-037-FIX-01 found that
+`prisma/set-featured-products.ts` called `prisma.product.updateMany(...)`
+and logged whatever `result.count` it got back, then always exited 0.
+`updateMany` can silently match fewer rows than expected — zero, or a
+partial match — without erroring, if a configured id no longer exists
+in the target database; the script would still report success in that
+case. Root cause: the count returned by `updateMany` was never actually
+compared against `FEATURED_PRODUCT_IDS.length`, the number of rows the
+script expects to affect.
+
+Fix: `evaluateFeaturedProvisioning(expectedCount, actualCount)`, a new
+pure, Prisma-independent function
+(`src/modules/catalog/infrastructure/featured-provisioning.ts`),
+decides success/failure by exact equality — anything other than
+`actualCount === expectedCount` is a failure, with a message that
+distinguishes zero matches from a partial match. The script now throws
+when the outcome is not `ok`, which flows through its existing
+`.catch()` handler (`console.error` + `process.exitCode = 1` +
+`$disconnect()` in `.finally()`) — no new exit-handling logic was
+introduced, only a check inserted before the existing success path.
+Kept as a plain function (no Prisma, no `server-only`) specifically so
+it can be unit-tested without importing — and thereby accidentally
+executing — the provisioning script itself, which performs a real
+database operation as a side effect of module evaluation.
+
+ROADMAP-037-FIX-SHA (P3) — this Roadmap entry's Commit field
+previously read "IMP-037-FIX-01 pending" after that commit
+(`256cf0d58ad3aa01467dd2337f1425214979d657`) had already been created
+and pushed. Fixed above: the real SHA is now recorded, and this entry
+(IMP-037-FIX-02) is itself left as "pending" in the same way, per this
+Roadmap's established convention of never fabricating a commit's own
+SHA inside itself.
+
+Neither finding required any change to `prisma/seed.ts`, the
+`SEED_ALLOW_BROAD_WRITE` confirmation mechanism, `featuredOnly`,
+`ProductRepository`, Product Details, Cart, Checkout, or any other
+architecture CR-037-01-SEED already settled.
+
 i18n
 
 `FeaturedProducts.products.*` (the mock-product-keyed translation
@@ -2131,40 +2176,48 @@ repeated calls are idempotent (same count, same resulting state,
 `updatedAt` deliberately excluded from that comparison since Prisma
 legitimately advances it on every write); an empty id list is a no-op
 returning 0; a nonexistent id returns 0 without creating anything; an
-unrelated product is never affected. Full pre-existing suite (Catalog,
-Cart, Checkout, Order, Payment/Stripe series, Identity, storefront
-navigation) re-run and confirmed passing unmodified — zero regressions.
+unrelated product is never affected. IMP-037-FIX-02 adds 5 more:
+`featured-provisioning.test.ts` (new file) proves
+`evaluateFeaturedProvisioning` succeeds only on exact equality between
+expected and actual counts; fails on a partial match with wording that
+says so; fails on zero matches with distinct wording; fails even if the
+actual count exceeds the expected count (exact equality, not merely "at
+least"); and never includes anything resembling a connection string or
+`DATABASE_URL` in its message. Full pre-existing suite (Catalog, Cart,
+Checkout, Order, Payment/Stripe series, Identity, storefront
+navigation) re-run and confirmed passing unmodified — zero regressions
+across all three commits.
 
 Runtime Verification
 
-MANUAL/BROWSER VERIFICATION: NOT PERFORMED, for either the initial
-IMP-037 work or this fix. Neither `prisma/seed.ts` nor
-`prisma/set-featured-products.ts` was executed against the connected
-(shared/production) database as part of this fix — the `isFeatured`
-state IMP-037 already established via the (since-guarded) broad seed
-remains in place and was not touched again; verifying the new guard
-itself was done by running `pnpm exec tsx prisma/seed.ts` WITHOUT the
-confirmation variable set and confirming it refused immediately (exit
-code 1, no database interaction) before any Prisma client was
-constructed. The actual click-through flow (Homepage → Featured Product
-→ Product Details → Add to Cart → Cart → Checkout, desktop and mobile)
-still requires the user's own manual verification.
+MANUAL/BROWSER VERIFICATION: NOT PERFORMED, across the initial IMP-037
+work and both fixes. No script was executed against the connected
+(shared/production) database as part of IMP-037-FIX-02 — the correction
+is to `prisma/set-featured-products.ts`'s success/failure decision
+logic, verified entirely through the pure-function unit tests above,
+never by running the script itself against real data.
+IMP-037-FIX-01's guard verification (running the unconfirmed seed and
+observing it refuse) is unchanged and still holds. The actual
+click-through flow (Homepage → Featured Product → Product Details →
+Add to Cart → Cart → Checkout, desktop and mobile) still requires the
+user's own manual verification.
 
 Validation Results
 
 Initial IMP-037: `pnpm test` 346 passing + 3 skipped (349 total), 29
-test files. IMP-037-FIX-01: `pnpm test`: **355 passing + 3 skipped**
-(358 total), 31 test files, zero regressions in the pre-existing 346.
+test files. IMP-037-FIX-01: 355 passing + 3 skipped (358 total), 31
+test files. IMP-037-FIX-02: `pnpm test`: **360 passing + 3 skipped**
+(363 total), 32 test files, zero regressions in the pre-existing 355.
 `pnpm typecheck`: clean. `pnpm lint`: clean. `pnpm format:check`:
 limited to the same two pre-existing, unrelated warnings already noted
 for prior milestones (`next.config.ts`, `pnpm-workspace.yaml`). `pnpm
-build`: succeeded this time — all 15 routes compiled/prerendered. (The
-initial IMP-037 validation pass hit the same sandbox-level V8
-out-of-memory crash on `next build`'s internal type-checking worker
-documented against multiple earlier milestones, on 8 consecutive
-attempts, and used `pnpm typecheck` plus the compile step's own
-repeated success as substitute evidence at the time; it did not recur
-during this fix's validation.)
+build`: succeeded — all 15 routes compiled/prerendered, on the first
+attempt this time. (The initial IMP-037 validation pass hit the same
+sandbox-level V8 out-of-memory crash on `next build`'s internal
+type-checking worker documented against multiple earlier milestones, on
+8 consecutive attempts, and used `pnpm typecheck` plus the compile
+step's own repeated success as substitute evidence at the time; it has
+not recurred since.)
 
 What Is Deliberately Deferred
 
@@ -2563,7 +2616,7 @@ IMP-033 — Payment Provider Port	COMPLETED
 IMP-034 — Payment Processing Application Flow (incl. IMP-034-FIX / CR-034)	COMPLETED
 IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01, IMP-035-FIX-2 / CR-035-FIX-01, CR-035-FIX-02, IMP-035-FIX-3 / CR-035-FIX-03)	COMPLETED — real Stripe test-mode verification pending (see Section 12)
 IMP-036 — Storefront & Customer UX Foundation (incl. IMP-036-FIX-01)	COMPLETED — manual/browser verification of the deployed environment performed by the user
-IMP-037 — Product Discovery & Product Details Vertical Slice (incl. IMP-037-FIX-01 / CR-037-01-SEED)	COMPLETED — manual/browser verification NOT performed (see Section 13); supersedes the "Checkout & Order Customer Flow" direction originally speculated for IMP-037 in Section 16
+IMP-037 — Product Discovery & Product Details Vertical Slice (incl. IMP-037-FIX-01 / CR-037-01-SEED, IMP-037-FIX-02 / CR-037-FIX-01)	COMPLETED — manual/browser verification NOT performed (see Section 13); supersedes the "Checkout & Order Customer Flow" direction originally speculated for IMP-037 in Section 16
 IMP-038 — Payment UI & Stripe Customer Flow	PLANNED — direction only, NOT YET APPROVED (see Section 16/17)
 IMP-039 — Asynchronous Payment Lifecycle	PLANNED — direction only, NOT YET APPROVED (see Section 16/17)
 Next milestone	NOT YET APPROVED
