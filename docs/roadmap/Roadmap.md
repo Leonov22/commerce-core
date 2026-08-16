@@ -1946,7 +1946,7 @@ confirmation (most likely a webhook) into a real status transition, and
 for whatever recovery/reconciliation tooling a permanently-claimed,
 never-started Payment eventually needs.
 
-13. IMP-037 — Product Discovery & Product Details Vertical Slice
+13. IMP-037 — Product Discovery & Product Details Vertical Slice (incl. IMP-037-FIX-01 / CR-037-01-SEED)
 
 Status
 
@@ -1954,11 +1954,12 @@ COMPLETED
 
 Commit
 
-IMP-037 pending — implementation and validation are complete but not yet
-committed at the time this entry was written. Record the actual commit
-SHA through the normal follow-up documentation process once the commit
-exists; do not treat any SHA embedded in this entry before that point
-as authoritative for IMP-037.
+f80880f08b3f3eead34c57f300b94329ad74bcbd (initial IMP-037)
+IMP-037-FIX-01 pending — implementation and validation are complete but
+not yet committed at the time this entry was written. Record the
+actual commit SHA through the normal follow-up documentation process
+once the commit exists; do not treat any SHA embedded in this entry
+before that point as authoritative for IMP-037-FIX-01.
 
 Objective
 
@@ -2023,8 +2024,72 @@ four of the six existing demo products `isFeatured: true` (Studio Chair,
 Table Lamp, Wool Throw, Ceramic Vase — the same four names/badges the
 old mock data referenced) and re-run
 (`pnpm exec tsx prisma/seed.ts`, idempotent upsert by `id`) against the
-connected database so the slice is non-empty and manually testable, not
-only against a schema change with no corresponding data.
+connected database so the slice was non-empty and manually testable, not
+only correct against a schema with no corresponding data. Code Review
+correctly flagged this specific operational choice as CR-037-01-SEED
+(P1) — see the dedicated write-up immediately below; the Catalog
+architecture and query change described above were explicitly confirmed
+correct and required no change.
+
+Code Review Findings and Fixes (IMP-037-FIX-01 / CR-037-01-SEED)
+
+CR-037-01-SEED (P1) — `prisma/seed.ts` performs BROAD upserts of every
+product/translation field (price, status, category, badge, sort order,
+slug, publication date, all translation text), not merely `isFeatured`.
+The initial IMP-037 implementation report described running this script
+against "the connected database" to populate `isFeatured` — since that
+database is the same shared/production Neon instance this whole project
+uses, the broad seed was capable of silently overwriting legitimate
+production catalog data, not just adding the one field the milestone
+actually needed. This was a defect in HOW the data was provisioned, not
+in the Catalog implementation itself — Code Review explicitly confirmed
+`Product.isFeatured`, the `featuredOnly` repository filter, Product
+Details routing, Cart, and Checkout all remained correct and unchanged.
+
+Root cause: no operational separation existed between "development/test
+fixture data" (what `prisma/seed.ts` is actually for) and "a safe way to
+adjust one field on an existing, possibly-production catalog" — the
+broad seed was the only tool available, so it got used for both.
+
+Fix — two changes, chosen as the smallest solution that keeps the
+existing seed useful for development/test while making it structurally
+incapable of running unnoticed against a shared database:
+
+1. `prisma/seed.ts` now refuses to run at all unless
+   `SEED_ALLOW_BROAD_WRITE=yes-overwrite-demo-catalog` is explicitly set
+   in the environment — checked (`isBroadSeedConfirmed`, a plain,
+   dependency-free function so it can be imported both from this `tsx`
+   script and from its own Vitest test) BEFORE any Prisma client is
+   constructed or any query runs, so a rejected run touches the database
+   in zero ways. Deliberately NOT based on `NODE_ENV`: a standalone
+   `tsx` invocation has no reliable guarantee `NODE_ENV` reflects which
+   database `DATABASE_URL` actually points at, so that would have been a
+   false sense of safety rather than a real one.
+2. A new, narrowly-scoped, production-safe script,
+   `prisma/set-featured-products.ts`, replaces the broad seed as the
+   actual mechanism for populating `isFeatured` on an existing catalog.
+   Its single `prisma.product.updateMany({ where: { id: { in: [...] } },
+   data: { isFeatured: true } })` call has no field in its `data` object
+   capable of touching price, status, category, badge, sort order,
+   slug, publication date, or any translation — there is nothing else
+   there TO overwrite. It needs no confirmation guard because it is safe
+   by construction, not by a runtime check. The identical update logic
+   (proven by integration test against a real, disposable test product —
+   never the seeded demo catalog) also exists as
+   `markProductsFeatured` in
+   `src/modules/catalog/infrastructure/feature-products.ts`; the
+   standalone script duplicates its ~5-line body rather than importing
+   it, because that file has `import "server-only"`, which throws
+   unconditionally under plain `tsx` execution (outside the Next.js/
+   Vitest "react-server" resolution condition) — the same constraint
+   `prisma/seed.ts` itself already works around by never importing from
+   `src/modules/catalog/infrastructure/prisma-client.ts` either.
+
+No architecture change: `ProductRepository` remains the documented
+"read-only abstraction" it always was — the new write capability lives
+entirely outside it, as an ops-time operation, the same way
+`prisma/seed.ts` itself was never part of the Catalog module's runtime
+architecture.
 
 i18n
 
@@ -2048,43 +2113,58 @@ repository filter.
 
 Tests
 
-4 new tests. `catalog-queries.test.ts`: `featuredOnly` passes through the
-application layer to the (fake) repository, mirroring the existing
-`categorySlug` passthrough test exactly. `prisma-product-repository.test.ts`:
-`featuredOnly` against the real, re-seeded database returns exactly the
-four newly-featured product ids. `product-route.test.ts` (new file):
-`productDetailsHref` builds the existing `/shop/:id` route verbatim from
-a product id — the one thing about "Featured Product routing/identity"
-testable without this project's absent JSX-rendering infrastructure.
-Full pre-existing suite (Catalog, Cart, Checkout, Order, Payment/Stripe
-series, Identity, storefront navigation) re-run and confirmed passing
-unmodified — zero regressions.
+Initial IMP-037: 4 tests (`catalog-queries.test.ts`'s `featuredOnly`
+passthrough, `prisma-product-repository.test.ts`'s `featuredOnly`
+integration test, and `product-route.test.ts`'s `productDetailsHref`
+tests, new file). IMP-037-FIX-01 adds 9 more: `seed-guard.test.ts` (new
+file, 4 tests) proves `isBroadSeedConfirmed` refuses when unset, refuses
+for any value other than the exact confirmation string, and — the
+specific claim Code Review needed proven — refuses even when `NODE_ENV`
+claims `"development"` or `"test"`, confirming only the deliberate
+opt-in. `feature-products.test.ts` (new file, 5 tests, integration
+against real Postgres using a disposable test product created and
+deleted by the test itself, never the seeded demo catalog): marking a
+product featured changes ONLY `isFeatured` (every other field —
+slug/status/price/currency/category/badge/sortOrder/publishedAt/
+translations — snapshotted before and asserted unchanged after);
+repeated calls are idempotent (same count, same resulting state,
+`updatedAt` deliberately excluded from that comparison since Prisma
+legitimately advances it on every write); an empty id list is a no-op
+returning 0; a nonexistent id returns 0 without creating anything; an
+unrelated product is never affected. Full pre-existing suite (Catalog,
+Cart, Checkout, Order, Payment/Stripe series, Identity, storefront
+navigation) re-run and confirmed passing unmodified — zero regressions.
 
 Runtime Verification
 
-MANUAL/BROWSER VERIFICATION: NOT PERFORMED. The connected database was
-re-seeded (idempotent) so the deployed environment has non-empty
-Featured Products data once this deploys, but the actual click-through
-flow (Homepage → Featured Product → Product Details → Add to Cart →
-Cart → Checkout, desktop and mobile) has not been exercised in a
-browser as part of this implementation and requires the user's own
-manual verification, per this milestone's own Manual Testing
-Requirements.
+MANUAL/BROWSER VERIFICATION: NOT PERFORMED, for either the initial
+IMP-037 work or this fix. Neither `prisma/seed.ts` nor
+`prisma/set-featured-products.ts` was executed against the connected
+(shared/production) database as part of this fix — the `isFeatured`
+state IMP-037 already established via the (since-guarded) broad seed
+remains in place and was not touched again; verifying the new guard
+itself was done by running `pnpm exec tsx prisma/seed.ts` WITHOUT the
+confirmation variable set and confirming it refused immediately (exit
+code 1, no database interaction) before any Prisma client was
+constructed. The actual click-through flow (Homepage → Featured Product
+→ Product Details → Add to Cart → Cart → Checkout, desktop and mobile)
+still requires the user's own manual verification.
 
 Validation Results
 
-`pnpm test`: 346 passing + 3 skipped (349 total), 29 test files, zero
-regressions in the pre-existing 342. `pnpm typecheck`: clean. `pnpm
-lint`: clean. `pnpm format:check`: limited to the same two pre-existing,
-unrelated warnings already noted for prior milestones (`next.config.ts`,
-`pnpm-workspace.yaml`). `pnpm build`: the full command did NOT complete
-in this environment — `next build`'s own compile/bundle step succeeded
-on every attempt ("Compiled successfully"), but its separate, redundant
-internal type-checking worker crashed with a V8 out-of-memory error on
-8 consecutive attempts, the same class of sandbox-level flakiness
-documented against multiple earlier milestones in this Roadmap.
-Substitute evidence: `pnpm typecheck` (clean, the same type validation
-that worker duplicates) and the compile step's own repeated success.
+Initial IMP-037: `pnpm test` 346 passing + 3 skipped (349 total), 29
+test files. IMP-037-FIX-01: `pnpm test`: **355 passing + 3 skipped**
+(358 total), 31 test files, zero regressions in the pre-existing 346.
+`pnpm typecheck`: clean. `pnpm lint`: clean. `pnpm format:check`:
+limited to the same two pre-existing, unrelated warnings already noted
+for prior milestones (`next.config.ts`, `pnpm-workspace.yaml`). `pnpm
+build`: succeeded this time — all 15 routes compiled/prerendered. (The
+initial IMP-037 validation pass hit the same sandbox-level V8
+out-of-memory crash on `next build`'s internal type-checking worker
+documented against multiple earlier milestones, on 8 consecutive
+attempts, and used `pnpm typecheck` plus the compile step's own
+repeated success as substitute evidence at the time; it did not recur
+during this fix's validation.)
 
 What Is Deliberately Deferred
 
@@ -2483,7 +2563,7 @@ IMP-033 — Payment Provider Port	COMPLETED
 IMP-034 — Payment Processing Application Flow (incl. IMP-034-FIX / CR-034)	COMPLETED
 IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01, IMP-035-FIX-2 / CR-035-FIX-01, CR-035-FIX-02, IMP-035-FIX-3 / CR-035-FIX-03)	COMPLETED — real Stripe test-mode verification pending (see Section 12)
 IMP-036 — Storefront & Customer UX Foundation (incl. IMP-036-FIX-01)	COMPLETED — manual/browser verification of the deployed environment performed by the user
-IMP-037 — Product Discovery & Product Details Vertical Slice	COMPLETED — manual/browser verification NOT performed (see Section 13); supersedes the "Checkout & Order Customer Flow" direction originally speculated for IMP-037 in Section 16
+IMP-037 — Product Discovery & Product Details Vertical Slice (incl. IMP-037-FIX-01 / CR-037-01-SEED)	COMPLETED — manual/browser verification NOT performed (see Section 13); supersedes the "Checkout & Order Customer Flow" direction originally speculated for IMP-037 in Section 16
 IMP-038 — Payment UI & Stripe Customer Flow	PLANNED — direction only, NOT YET APPROVED (see Section 16/17)
 IMP-039 — Asynchronous Payment Lifecycle	PLANNED — direction only, NOT YET APPROVED (see Section 16/17)
 Next milestone	NOT YET APPROVED

@@ -6,10 +6,52 @@
  * Run with: pnpm exec tsx prisma/seed.ts
  * (tsx resolves the generated client's extensionless internal imports the
  * same way Next.js's bundler does; plain `node` cannot.)
+ *
+ * CR-037-01-SEED: this script performs BROAD upserts — it can overwrite
+ * an EXISTING product's price, status, category, badge, sort order,
+ * slug, publication date, and every translation field. It is
+ * development/test fixture data only, and running it against a shared
+ * or production database would silently clobber real catalog content.
+ * `assertBroadSeedIsConfirmed` below therefore refuses to proceed
+ * (before any Prisma client is even constructed, let alone any query
+ * runs) unless `SEED_ALLOW_BROAD_WRITE` is explicitly set to the exact
+ * confirmation value — see `isBroadSeedConfirmed`'s own doc comment for
+ * why this is deliberately not based on `NODE_ENV`. To populate
+ * `Product.isFeatured` on an existing (e.g. production) catalog without
+ * this risk, use `prisma/set-featured-products.ts` instead, which
+ * cannot overwrite anything else.
  */
 import "dotenv/config";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient, ProductStatus, ProductBadge } from "@/generated/prisma/client";
+import {
+  isBroadSeedConfirmed,
+  SEED_CONFIRMATION_ENV_VAR,
+  SEED_CONFIRMATION_VALUE,
+} from "@/modules/catalog/infrastructure/seed-guard";
+
+function assertBroadSeedIsConfirmed(): void {
+  if (isBroadSeedConfirmed(process.env)) {
+    return;
+  }
+  console.error(
+    "[prisma/seed.ts] Refused: this script performs BROAD upserts that can " +
+      "overwrite existing product/category data — price, status, category, " +
+      "badge, sort order, slug, publication date, and every translation " +
+      "field. It is development/test fixture data only and must never run " +
+      "against a shared or production database.\n\n" +
+      "To confirm the connected database is a development/test database " +
+      "and proceed anyway, set:\n" +
+      `  ${SEED_CONFIRMATION_ENV_VAR}=${SEED_CONFIRMATION_VALUE}\n\n` +
+      "in the environment before running this script.\n\n" +
+      "To populate Product.isFeatured on an existing catalog (including " +
+      "production) instead, run prisma/set-featured-products.ts, which " +
+      "cannot overwrite anything else.",
+  );
+  process.exit(1);
+}
+
+assertBroadSeedIsConfirmed();
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
 const prisma = new PrismaClient({ adapter });
