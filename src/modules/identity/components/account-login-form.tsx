@@ -35,7 +35,18 @@ export function AccountLoginForm() {
         return;
       }
 
+      // IMP-038: `signIn(..., { redirect: false })` sets the session
+      // cookie via a plain fetch, but a client-side `router.push()` alone
+      // reuses the App Router's cached Server Component output for
+      // shared segments (notably the root `[locale]/layout.tsx`, which
+      // resolves `getCurrentUser()`) — so the header would keep showing
+      // guest navigation until a manual refresh. `router.refresh()` is
+      // the framework-native way to invalidate that cache and force
+      // `getCurrentUser()` to be re-evaluated for the destination route,
+      // without a full page reload and without a second source of
+      // authentication truth.
       router.push("/account");
+      router.refresh();
     } catch {
       setHasError(true);
     } finally {

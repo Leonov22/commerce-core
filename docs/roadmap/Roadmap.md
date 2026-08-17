@@ -2436,6 +2436,13 @@ Stripe-specific dependencies remain isolated to the appropriate
 adapter/application boundary, exactly as IMP-035's own architecture
 already requires.
 
+SUPERSEDED: the Architect-approved IMP-038 ticket redefined this
+milestone's actual scope to "Customer Authentication Completion"
+(Section 25) instead — fixing stale post-login/post-registration
+navigation, not Payment UI. The Payment UI / Stripe customer-flow
+direction speculated above remains a legitimate future milestone if the
+Architect still wants it, under a different milestone number.
+
 IMP-039 — Asynchronous Payment Lifecycle. Future milestone for Stripe
 webhook/event processing, asynchronous payment state changes, Payment
 state synchronization, Order/payment lifecycle integration, and
@@ -2617,11 +2624,188 @@ IMP-034 — Payment Processing Application Flow (incl. IMP-034-FIX / CR-034)	COM
 IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01, IMP-035-FIX-2 / CR-035-FIX-01, CR-035-FIX-02, IMP-035-FIX-3 / CR-035-FIX-03)	COMPLETED — real Stripe test-mode verification pending (see Section 12)
 IMP-036 — Storefront & Customer UX Foundation (incl. IMP-036-FIX-01)	COMPLETED — manual/browser verification of the deployed environment performed by the user
 IMP-037 — Product Discovery & Product Details Vertical Slice (incl. IMP-037-FIX-01 / CR-037-01-SEED, IMP-037-FIX-02 / CR-037-FIX-01)	COMPLETED — manual/browser verification NOT performed (see Section 13); supersedes the "Checkout & Order Customer Flow" direction originally speculated for IMP-037 in Section 16
-IMP-038 — Payment UI & Stripe Customer Flow	PLANNED — direction only, NOT YET APPROVED (see Section 16/17)
+IMP-038 — Customer Authentication Completion (real scope; supersedes the "Payment UI & Stripe Customer Flow" direction originally speculated for IMP-038 in Section 16 — see Section 25)	IMPLEMENTATION COMPLETE, NOT YET COMMITTED — awaiting Code Review; no commit was created for this ticket by explicit instruction (Section 25)
 IMP-039 — Asynchronous Payment Lifecycle	PLANNED — direction only, NOT YET APPROVED (see Section 16/17)
+Payment UI & Stripe Customer Flow (originally speculated as IMP-038, superseded — see Section 16)	PLANNED — direction only, unassigned milestone number, NOT YET APPROVED
 Next milestone	NOT YET APPROVED
 24. Source of Truth
 
 This document is the authoritative roadmap for implementation milestones.
 
 If another document, chat message, implementation report, or local note conflicts with this roadmap, the conflict must be resolved by the Architect before implementation continues.
+
+25. IMP-038 — Customer Authentication Completion
+
+Status
+
+IMPLEMENTATION COMPLETE, NOT YET COMMITTED. Per this ticket's own
+explicit instruction, the Implementation Engineer did not commit or push
+this change — the repository is left ready for Code Review with the
+change present only in the working tree. Do not treat any commit SHA as
+existing for this milestone until a follow-up documentation update
+records one after Code Review approves it and a commit is actually
+created.
+
+Objective
+
+After a customer successfully logs in or registers, the server-rendered
+header/navigation kept showing guest state ("Log in" / "Register") until
+a manual browser refresh (F5), even though the session was already valid
+— `/account` was reachable and worked. Fix the stale navigation without
+introducing any second source of authentication truth; `getCurrentUser()`
+(Identity's existing, `server-only` session resolver) must remain the
+only authority on whether a request is authenticated.
+
+Root Cause
+
+Both `AccountLoginForm` and `AccountRegisterForm` call
+`signIn("credentials", { ..., redirect: false })` — `redirect: false` is
+required so each form can show an inline error instead of a hard
+navigation on failure. On success, each form then calls a plain
+`router.push("/account")` (a Next.js App Router client-side/soft
+navigation). Auth.js's `signIn()` sets the session cookie via a plain
+`fetch()` call the router has no visibility into. Next.js's App Router
+Cache reuses the previously-rendered Server Component output for shared
+layout segments — notably `src/app/[locale]/layout.tsx`, which resolves
+`getCurrentUser()` and derives `isAuthenticated` — across a `router.push()`
+between sibling routes in the same layout group. The cookie was correct;
+the cached layout output was stale. `AccountLogoutButton`'s existing
+`signOut({ callbackUrl: "/" })` call was inspected directly in
+`node_modules/next-auth/react.js` and confirmed to already perform a hard
+`window.location.href` navigation by default (no `redirect: false`
+override there) — so logout already forced a fresh server render and
+required no fix.
+
+Chosen Solution
+
+One line added to each form's existing success path, immediately after
+the existing `router.push("/account")`: `router.refresh()` — the
+framework-native, Next.js App Router API (`next/navigation`'s
+`useRouter()`, also present on the project's `next-intl`-derived
+`useRouter()` from `@/core/i18n/navigation`, confirmed via
+`node_modules/next-intl/dist/types/navigation/react-client/createNavigation.d.ts`)
+that invalidates the Router Cache and forces Server Components for the
+current route — including the shared layout — to re-render with fresh
+data, without a full page reload. `getCurrentUser()` is re-invoked as
+part of that re-render, so the header reflects the real session
+immediately. No new state store, no polling, no timeout, no manual
+cookie/JWT handling, no second session API.
+
+Files Changed
+
+`src/modules/identity/components/account-login-form.tsx` — one line
+(`router.refresh();`) added after the existing `router.push("/account");`
+in the success branch of `handleSubmit`.
+`src/modules/identity/components/account-register-form.tsx` — the same
+one-line addition, in the same position, after the existing
+`signIn()`-then-`router.push("/account")` success path (registration's
+existing auto-sign-in-then-redirect contract is otherwise unchanged).
+
+Architecture Impact
+
+None. `getCurrentUser()`/Auth.js remain the sole authentication authority;
+`src/app/[locale]/layout.tsx` (already correct since IMP-036) is
+unmodified — it simply needed to be told to re-run, which
+`router.refresh()` does through the framework's own cache-invalidation
+mechanism rather than a second state source. No Zustand/Redux/Context, no
+client-side JWT/cookie parsing, no new session API, no new auth provider,
+no polling, no `setTimeout`, no `window.location.reload()`/`window.location.href
+= window.location.href`, no `localStorage` auth flag. `AccountLogoutButton`
+and `signOut()` are reused exactly as-is. `/account` and
+`/account/orders` access control is unchanged. CR-037-01-SEED's seed
+guard (`prisma/seed.ts`, `seed-guard.ts`,
+`SEED_ALLOW_BROAD_WRITE=yes-overwrite-demo-catalog`, independent of
+`NODE_ENV`) was not touched — no IMP-038 regression against it was found.
+
+Tests
+
+No new automated test file was added. Existing coverage already exercises
+the two behavioral guarantees this milestone must not regress at the
+correct architectural boundary: `verify-credentials.test.ts` (failed
+login never succeeds, and an unregistered email produces the same
+`INVALID_CREDENTIALS` outcome as a wrong password — no enumeration signal)
+and `current-user.test.ts` (`getCurrentUser`/`requireAuthenticatedUser`
+resolve strictly from the session, returning `null`/throwing for every
+no-session or stale-session case). Both were re-run unmodified and still
+pass. A new test was deliberately NOT written for the `router.refresh()`
+call itself: the project has no JSX-rendering test infrastructure
+(`vitest.config.ts` only includes `src/**/*.test.ts`; no jsdom/happy-dom,
+no `@testing-library/react`), and the two-line fix has no branching or
+computation to extract into a pure, independently-testable function the
+way `isBroadSeedConfirmed`/`evaluateFeaturedProvisioning` were for earlier
+milestones — a test asserting the literal presence of a `router.refresh()`
+call would be exactly the brittle, implementation-detail test this
+ticket's own instructions warned against, not a test of observable
+behavior. `pnpm test`: 360 passing + 3 skipped (363 total), 32 test
+files — identical to the pre-existing IMP-037-FIX-02 baseline, zero
+regressions.
+
+Validation Results
+
+`pnpm typecheck`: clean. `pnpm lint`: clean. `pnpm exec prettier --check`
+on both changed files: clean. `pnpm test`: 360 passing + 3 skipped, 32
+files, unchanged from baseline. `pnpm build`: NOT completed — the
+sandbox's recurring V8 out-of-memory crash in `next build`'s internal
+type-checking worker (documented against multiple earlier milestones in
+this roadmap) recurred on 3 consecutive attempts; the compile step itself
+("Compiled successfully") succeeded on all 3 attempts. `pnpm typecheck`'s
+clean result plus the compile step's repeated success are used as
+substitute evidence, consistent with how this same sandbox limitation was
+handled and disclosed for earlier milestones — this was not reported as a
+full build pass.
+
+Runtime Verification
+
+MANUAL/BROWSER VERIFICATION: NOT PERFORMED. Consistent with this
+project's repeated, disclosed sandbox limitations (`next dev` has
+previously crashed with the same V8 out-of-memory pattern, and no
+`chromium-cli` is available in this environment), the 8 acceptance flows
+this ticket specifies (login updates navigation without F5; register
+updates navigation without F5; logout updates navigation; failed login
+shows only guest navigation; refresh preserves authenticated session;
+`/account` and `/account/orders` remain reachable only when authenticated;
+guest and authenticated navigation sets remain mutually exclusive; no
+console errors/polling/loops) were NOT executed in a browser and are not
+claimed as passing. The fix is instead justified by direct source
+inspection of Next.js's and next-auth's actual runtime behavior (cited
+above) plus the existing, passing application-layer tests. This
+limitation should be verified by the user or in Code Review's own
+environment before this milestone is considered fully done.
+
+Regression Verification
+
+Catalog, Cart, Checkout, Order, and Payment/Stripe modules were not
+touched — no file under `src/modules/catalog`, `src/modules/cart`,
+`src/modules/checkout`, `src/modules/order`, or `src/modules/payment` was
+modified. Identity was touched only in the two client components listed
+above; `src/modules/identity/application/*`,
+`src/modules/identity/repositories/*`, and
+`src/core/auth/*` are unmodified. `prisma/seed.ts` and
+`prisma/set-featured-products.ts` are unmodified — CR-037-01-SEED remains
+CLOSED. Full pre-existing test suite re-run and confirmed passing
+unmodified.
+
+What Is Deliberately Deferred
+
+Password reset, email verification, MFA, OAuth providers, profile
+editing, account deletion, address book, payment methods, admin auth, and
+RBAC remain out of scope, per this milestone's own instructions — none of
+this was touched.
+
+Roadmap Update Explanation
+
+This section was added, rather than inserted as a new numbered section
+between the existing Section 13 and Section 14, specifically to avoid
+renumbering every subsequent section (14 through 24) and the many
+cross-references to those section numbers elsewhere in this document —
+a mechanical, error-prone change disproportionate to what this milestone
+actually requires, and outside an Implementation Engineer's mandate to
+leave unrelated content unmodified. Section 16's "IMP-038 — Payment UI &
+Stripe Customer Flow" speculative direction paragraph and the Section 23
+Milestone Summary table were both updated to correct the record — the
+real, Architect-approved IMP-038 ticket is "Customer Authentication
+Completion," not Payment UI — using the same SUPERSEDED-note pattern
+Section 16 already used for IMP-037. No commit SHA is recorded anywhere
+in this entry, consistent with this document's established convention of
+never fabricating a commit's own SHA before the commit exists — here,
+no commit exists at all yet by explicit instruction.

@@ -64,7 +64,13 @@ export function AccountRegisterForm() {
         return;
       }
 
+      // IMP-038: same reasoning as `account-login-form.tsx` — a bare
+      // `router.push()` after a `redirect: false` `signIn()` would reuse
+      // the App Router's cached layout output (guest navigation) instead
+      // of re-evaluating `getCurrentUser()` for the newly authenticated
+      // session. `router.refresh()` forces that re-evaluation.
       router.push("/account");
+      router.refresh();
     } catch {
       setErrorMessage(t(ERROR_MESSAGE_KEYS.INTERNAL_ERROR));
     } finally {
