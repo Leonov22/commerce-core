@@ -2625,7 +2625,7 @@ IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01, IMP-
 IMP-036 — Storefront & Customer UX Foundation (incl. IMP-036-FIX-01)	COMPLETED — manual/browser verification of the deployed environment performed by the user
 IMP-037 — Product Discovery & Product Details Vertical Slice (incl. IMP-037-FIX-01 / CR-037-01-SEED, IMP-037-FIX-02 / CR-037-FIX-01)	COMPLETED — manual/browser verification NOT performed (see Section 13); supersedes the "Checkout & Order Customer Flow" direction originally speculated for IMP-037 in Section 16
 IMP-038 — Customer Authentication Completion (real scope; supersedes the "Payment UI & Stripe Customer Flow" direction originally speculated for IMP-038 in Section 16 — see Section 25)	COMPLETED — commit e49e3dadcc0d03be084c182cadcd3ca1748f06ff (parent 5401ace68856bdafa67d172b56c628da15529499); manual/browser verification NOT performed (see Section 25)
-IMP-039 — Asynchronous Payment Lifecycle	PLANNED — direction only, NOT YET APPROVED (see Section 16/17)
+IMP-039 — Asynchronous Payment Lifecycle (Stripe webhook processing — see Section 26)	COMPLETED — real Stripe verification NOT performed, no STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET configured in this environment (see Section 26)
 Payment UI & Stripe Customer Flow (originally speculated as IMP-038, superseded — see Section 16)	PLANNED — direction only, unassigned milestone number, NOT YET APPROVED
 Next milestone	NOT YET APPROVED
 24. Source of Truth
@@ -2821,3 +2821,270 @@ real, now-existing SHA once the commit was authorized, created, and
 pushed — the same "record the actual SHA in a follow-up update" pattern
 already used for the IMP-035-series and IMP-037-FIX-01 entries elsewhere
 in this document.
+
+26. IMP-039 — Asynchronous Payment Lifecycle
+
+Status
+
+COMPLETED, pending Code Review. Commit SHA recorded once created — see
+this milestone's own Final Report for the actual value at implementation
+time; do not treat any SHA embedded in this entry before a follow-up
+update confirms it as authoritative, per this document's established
+convention.
+
+Objective
+
+Connect the existing Payment + Stripe architecture (IMP-032–IMP-035) to
+Stripe's asynchronous webhook lifecycle: PaymentIntent → Stripe Webhook →
+signature verification → idempotent event processing → Payment state
+transition → Order state transition → customer-visible status — the exact
+seam `processPayment`'s own doc comment (IMP-034) already named as future
+work: "Only a future milestone, once a provider genuinely reports a final
+result (e.g. via a webhook), is responsible for the actual status
+transition."
+
+Discovery (repository inspection performed before any change)
+
+`PaymentRepository.updateStatusIfCurrent` (IMP-032) and
+`isValidPaymentStatusTransition` (PENDING → SUCCEEDED/FAILED/CANCELLED,
+mirroring Order's own transition policy exactly) already existed with
+zero production callers — established ahead of time for exactly this
+milestone, per IMP-032/034/035's own "What Is Deliberately Deferred"
+notes. `changeOrderStatus` (IMP-030) was equally ready and equally
+uncalled. No new `PaymentStatus` value was needed or added — the four
+existing values were already sufficient for every event this milestone
+supports. `Payment.providerReference` had no lookup index; no webhook
+dedup table existed; no `STRIPE_WEBHOOK_SECRET` convention existed. No
+existing route ran without a customer session — the webhook route is the
+first deliberately-unauthenticated transport in this codebase, trusting
+Stripe's signature instead.
+
+Functional Scope Implemented
+
+`POST /api/webhooks/stripe` verifies the raw request body against
+`Stripe-Signature` using Stripe's own `Stripe.webhooks.constructEvent`
+(no hand-rolled cryptography), maps exactly three supported event types —
+`payment_intent.succeeded` / `.payment_failed` / `.canceled` — onto the
+three existing terminal `PaymentStatus` values (SUCCEEDED/FAILED/
+CANCELLED), and delegates all business processing to
+`@/modules/payment`'s new `processStripeWebhookEvent`. Every other Stripe
+event type is safely ignored (acknowledged, no processing). A `SUCCEEDED`
+transition additionally synchronizes the Order to `PAID` via the
+existing, unmodified `changeOrderStatus`; `FAILED`/`CANCELLED` do not
+touch the Order (see "Payment → Order synchronization" below).
+
+Database
+
+One new table, `PaymentWebhookEvent` (`payment_webhook_events`):
+`id`, `provider`, `providerEventId`, `eventType`, `paymentId` (nullable,
+no foreign key — Stripe event identity is provider-level, not owned by
+the Payment it resolves to), `createdAt`, `processedAt`. Unique
+constraint on `(provider, providerEventId)` — the sole durable dedup
+mechanism Postgres enforces, never a "SELECT then INSERT" sequence. One
+new index, `Payment.providerReference` (plain index, not a uniqueness
+constraint — the column was already nullable and provider-supplied
+uniqueness was not this milestone's invariant to assert) — the lookup a
+webhook needs to resolve a Stripe PaymentIntent id back to an internal
+Payment. Migration:
+`prisma/migrations/20260817195924_add_payment_webhook_events/`.
+
+API
+
+`POST /api/webhooks/stripe` — header `Stripe-Signature` required;
+authentication is signature verification only, never a customer session
+(no `getCurrentUser()` call anywhere in this route's dependency graph).
+Raw body read via `request.text()`, never `request.json()` — parsing
+first would invalidate Stripe's signature. Responses: 400
+`MISSING_SIGNATURE`/`INVALID_SIGNATURE` (malformed/unsigned/tampered);
+200 `{ received: true }` for every acknowledged outcome (ignored,
+unknown-Payment, conflict, applied, already-at-target — Stripe must not
+retry any of these); 500 `INTERNAL_ERROR` only for a genuine thrown
+exception (e.g. a database failure), which is the deliberate signal for
+Stripe's own automatic retry.
+
+Payment Lifecycle
+
+```
+payment_intent.succeeded      -> Payment PENDING -> SUCCEEDED -> Order PENDING -> PAID
+payment_intent.payment_failed -> Payment PENDING -> FAILED    -> Order untouched
+payment_intent.canceled       -> Payment PENDING -> CANCELLED -> Order untouched
+any other Stripe event type   -> ignored (acknowledged, no transition)
+```
+
+FAILED/CANCELLED deliberately do not cancel the Order — there is no
+existing business rule anywhere in this codebase for "payment failure
+cancels the order" (Order's own CANCELLED transition has no established
+trigger yet), and inventing one would have been exactly the kind of
+unsupported business behavior this milestone's own instructions
+forbade. The Order stays `PENDING`, available for a future
+retry-payment milestone (explicitly out of scope here — no
+`PaymentAttempt`/retry infrastructure was added) to decide what happens
+next.
+
+Idempotency
+
+Two independent, complementary mechanisms, neither alone sufficient:
+
+1. `PaymentWebhookEventRepository.recordIfNew` — a single `INSERT`
+   against `(provider, providerEventId)`'s unique constraint, mirroring
+   `PaymentRepository.create`'s proven "one INSERT, catch the constraint
+   violation" pattern exactly. Recorded for every event resolved to a
+   Payment (or explicitly to no Payment), for durable audit/dedup
+   identity — but its result is deliberately NOT the sole gate for
+   correctness (see "Concurrency & Transaction Boundary" below).
+2. `settlePaymentTransition` (in `process-stripe-webhook-event.ts`)
+   always re-derives what remains to be done from Payment's own CURRENT
+   persisted status, not from whether this exact event was seen before:
+   already-at-target is treated as a safe no-op (with the Order sync
+   still re-attempted for `SUCCEEDED`, so a partial failure from a prior
+   delivery self-heals on retry); a DIFFERENT terminal status is a
+   `conflict`, logged, never forced.
+
+Concurrency & Transaction Boundary (Architectural Decision — flagged for review)
+
+Payment and Order are separate modules, each owning its own
+`PrismaClient` instance (`infrastructure/prisma-client.ts` in both) —
+there is no existing abstraction letting one database transaction span
+both without either leaking Prisma into an application layer or
+introducing a new cross-module transaction primitive. Per this
+milestone's own governing instruction ("prefer a single database
+transaction if it provides atomicity without violating module
+boundaries... if the current repository abstractions cannot support the
+required transaction safely, stop and report the architectural
+limitation before inventing a new abstraction"), no such transaction was
+introduced. Instead: every step is independently safe to (re)attempt
+from its own entity's current persisted state, using each entity's
+already-atomic `updateStatusIfCurrent` (Payment's, established since
+IMP-032; Order's, established since IMP-030) as the actual concurrency
+guarantee, proven under genuine `Promise.all` concurrency in
+`process-stripe-webhook-event.test.ts`'s real-repository section
+(exactly one Payment transition, exactly one Order transition, exactly
+one `PaymentWebhookEvent` row). The accepted trade-off: between the
+Payment write committing and the Order write committing, there is a
+brief window where a genuine infrastructure failure (not a logical
+conflict) could leave Payment SUCCEEDED and Order still PENDING,
+durably visible until Stripe's own automatic webhook retry (on this
+route's 5xx) delivers the same event again — which safely resumes
+exactly at the Order sync step, never re-applying the Payment
+transition. This is reported here explicitly, as instructed, rather
+than silently treated as a routine implementation detail — the
+Architect may prefer a different resolution (e.g. a shared
+cross-module transaction primitive) for a future milestone.
+
+Payment → Order Synchronization
+
+Only `SUCCEEDED` synchronizes to Order (`PENDING` → `PAID`), via the
+existing, completely unmodified `changeOrderStatus` — never a direct
+Prisma mutation of `Order.status`. A non-`ok` result from
+`changeOrderStatus` (Order already `PAID`, or `INVALID_STATUS_TRANSITION`
+against some other terminal state) is logged and never forced — Order's
+own terminal-state guarantee is preserved exactly as Order's own
+existing tests already established.
+
+Frontend
+
+No frontend file was changed. `Order.status` was already rendered,
+unmodified, on the existing Account Orders list and Order Details pages
+(`customer-order-list-view.tsx`, `customer-order-detail-view.tsx`,
+both established since IMP-029) — once this milestone's webhook flips an
+Order to `PAID`, the existing "PAID" status text is already correct on
+the next normal page render, with no polling, no WebSocket, and no new
+dashboard. `Payment.status` itself remains unexposed to the customer,
+consistent with "expose only the minimum required customer-facing
+status."
+
+Security
+
+Trust boundary is the Stripe signature alone (`Stripe.webhooks.constructEvent`
+against `STRIPE_WEBHOOK_SECRET`, read lazily, never at import time,
+mirroring `getStripePaymentProvider`'s existing convention for
+`STRIPE_SECRET_KEY`) — no customer session, no client-controllable input
+of any kind reaches Payment/Order state. `amountMinor`/`currency` are
+never read from a Stripe event at all (the event mapper only extracts an
+id, event type, PaymentIntent id, and outcome) — proven by an explicit
+test asserting these fields are byte-identical before and after
+processing. No secret, signature, or raw payload is logged;
+`console.error`/`console.warn` calls carry only ids/event types/status
+values. Existing Order ownership protections (`findByIdForUser`) are
+completely untouched — this milestone never introduces a new way for a
+customer to reach another customer's Order.
+
+Tests
+
+`payment-status.test.ts` (new, mirrors `order-status.test.ts`): every
+valid/invalid `changePaymentStatus` transition, `PAYMENT_NOT_FOUND`,
+`PAYMENT_STATUS_CHANGED` race simulation. `stripe-webhook.test.ts` (new):
+valid signature accepted for all three supported event types; unsupported
+event type safely ignored; wrong secret/missing/malformed/tampered
+signature all rejected; the webhook secret never appears in a logged
+error. `process-stripe-webhook-event.test.ts` (new): every outcome branch
+against mocked dependencies (invalid signature, ignored, unknown Payment,
+applied for each of the three outcomes, already-at-target self-healing
+for SUCCEEDED and non-self-healing for FAILED, conflict against a
+different terminal status, amount/currency never touched, an Order-sync
+exception propagates rather than being swallowed, a benign Order-sync
+non-ok result does not fail the webhook) plus a real-repository
+`Promise.all` concurrency section against genuine Postgres. Additions to
+`prisma-payment-repository.test.ts` (`findByProviderReference`, found and
+not-found) and a new `prisma-payment-webhook-event-repository.test.ts`
+(sequential duplicate detection, cross-provider non-collision, and a
+genuine 3-way concurrent `Promise.all` proving exactly one row persists).
+`route.test.ts` (new, mirrors `api/orders/route.test.ts`'s `vi.mock`
+pattern for the same JSX-barrel-import limitation): missing-signature
+400, raw body/header passthrough, every outcome's HTTP status, error
+never leaked on a thrown exception, no `getCurrentUser` in the route's
+dependency graph. Full pre-existing suite re-run and confirmed passing
+unmodified.
+
+Validation Results
+
+`pnpm test`: 406 passing + 3 skipped (409 total), 37 test files — up
+from the pre-existing 360 passing + 3 skipped (363), 32 files; zero
+regressions. `pnpm typecheck`: clean. `pnpm lint`: clean. `pnpm
+format:check`: limited to the same two pre-existing, unrelated warnings
+already noted for prior milestones (`next.config.ts`,
+`pnpm-workspace.yaml`). `pnpm build`: NOT completed — the sandbox's
+recurring V8 out-of-memory crash in `next build`'s internal
+type-checking worker (documented against multiple earlier milestones in
+this document) recurred on 3 consecutive attempts; the compile step
+itself ("Compiled successfully") succeeded on the first attempt.
+`pnpm typecheck`'s clean result plus that compile success are used as
+substitute evidence, consistent with how this same sandbox limitation
+was handled and disclosed for every prior milestone that hit it.
+
+Real Stripe Verification
+
+REAL STRIPE VERIFICATION: NOT PERFORMED. Neither `STRIPE_SECRET_KEY` nor
+`STRIPE_WEBHOOK_SECRET` is configured in this environment — confirmed by
+inspecting the process environment and `.env.local` (absent) before
+claiming this. The automated fake/contract tests (signature verification
+against genuinely SDK-generated test signatures, event mapping, and the
+real-Postgres concurrency section) all ran and passed regardless, per
+this milestone's own instruction not to let an absent credential block
+automated coverage.
+
+Manual/Browser Verification
+
+MANUAL/BROWSER VERIFICATION: NOT PERFORMED, for the same disclosed
+sandbox limitations noted against prior milestones (`next dev` has
+previously crashed with the same V8 out-of-memory pattern; no
+`chromium-cli` is available). What WAS genuinely verified, against real
+Postgres (not mocked): a real Order and Payment created, a real
+`providerReference` attached, `processStripeWebhookEvent` invoked with a
+real injected event and Order's own real `changeOrderStatus` — resulting
+in the Payment row reading `SUCCEEDED` and the Order row reading `PAID`
+on re-fetch, and exactly one `PaymentWebhookEvent` row surviving genuine
+`Promise.all` concurrency. The remaining, NOT-verified pieces are: the
+actual HTTP route reachable through a running server; delivery via the
+real Stripe CLI/dashboard; and the customer observing "PAID" in an
+actual browser session.
+
+What Is Deliberately Deferred
+
+Refunds, chargebacks, subscriptions, recurring billing, payment-method
+management, a second payment provider, Inventory, admin payment UI,
+payment analytics, a generic event bus, `PaymentAttempt`/retry
+infrastructure, Redis/Kafka/RabbitMQ, CQRS, WebSockets, polling, a new
+authentication system, and a generic webhook framework — none of this
+was introduced. No new `PaymentStatus` value was added. No unrelated
+Catalog/Cart/Checkout/Identity file was modified.

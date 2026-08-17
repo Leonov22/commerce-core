@@ -145,6 +145,16 @@ export const prismaPaymentRepository: PaymentRepository = {
     return row ? toDomainPayment(row) : null;
   },
 
+  async findByProviderReference(providerReference: string): Promise<Payment | null> {
+    // `providerReference` has no uniqueness constraint at the database
+    // level (see schema.prisma) — a provider's own identifier scheme is
+    // trusted to keep it unique in practice, but this query does not
+    // itself assert that. `findFirst` (not `findUnique`) reflects that
+    // honestly.
+    const row = await prisma.payment.findFirst({ where: { providerReference } });
+    return row ? toDomainPayment(row) : null;
+  },
+
   async claimProviderStartAttempt(paymentId: string): Promise<Payment | null> {
     // IMP-035-FIX-2: attempt the atomic claim — a no-op if
     // `providerStartAttemptedAt` is already set (by this Payment's own

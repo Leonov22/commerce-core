@@ -105,6 +105,9 @@ function makeFakePaymentRepository(
       }
       return current;
     },
+    async findByProviderReference() {
+      throw new Error("not used by these tests");
+    },
   };
 
   return { repository, setProviderReferenceCalls, claimProviderStartAttemptCalls };
