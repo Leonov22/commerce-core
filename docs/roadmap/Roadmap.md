@@ -2624,7 +2624,7 @@ IMP-034 — Payment Processing Application Flow (incl. IMP-034-FIX / CR-034)	COM
 IMP-035 — Stripe Payment Provider Adapter (incl. IMP-035-FIX / CR-035-01, IMP-035-FIX-2 / CR-035-FIX-01, CR-035-FIX-02, IMP-035-FIX-3 / CR-035-FIX-03)	COMPLETED — real Stripe test-mode verification pending (see Section 12)
 IMP-036 — Storefront & Customer UX Foundation (incl. IMP-036-FIX-01)	COMPLETED — manual/browser verification of the deployed environment performed by the user
 IMP-037 — Product Discovery & Product Details Vertical Slice (incl. IMP-037-FIX-01 / CR-037-01-SEED, IMP-037-FIX-02 / CR-037-FIX-01)	COMPLETED — manual/browser verification NOT performed (see Section 13); supersedes the "Checkout & Order Customer Flow" direction originally speculated for IMP-037 in Section 16
-IMP-038 — Customer Authentication Completion (real scope; supersedes the "Payment UI & Stripe Customer Flow" direction originally speculated for IMP-038 in Section 16 — see Section 25)	IMPLEMENTATION COMPLETE, NOT YET COMMITTED — awaiting Code Review; no commit was created for this ticket by explicit instruction (Section 25)
+IMP-038 — Customer Authentication Completion (real scope; supersedes the "Payment UI & Stripe Customer Flow" direction originally speculated for IMP-038 in Section 16 — see Section 25)	COMPLETED — commit e49e3dadcc0d03be084c182cadcd3ca1748f06ff (parent 5401ace68856bdafa67d172b56c628da15529499); manual/browser verification NOT performed (see Section 25)
 IMP-039 — Asynchronous Payment Lifecycle	PLANNED — direction only, NOT YET APPROVED (see Section 16/17)
 Payment UI & Stripe Customer Flow (originally speculated as IMP-038, superseded — see Section 16)	PLANNED — direction only, unassigned milestone number, NOT YET APPROVED
 Next milestone	NOT YET APPROVED
@@ -2638,13 +2638,20 @@ If another document, chat message, implementation report, or local note conflict
 
 Status
 
-IMPLEMENTATION COMPLETE, NOT YET COMMITTED. Per this ticket's own
-explicit instruction, the Implementation Engineer did not commit or push
-this change — the repository is left ready for Code Review with the
-change present only in the working tree. Do not treat any commit SHA as
-existing for this milestone until a follow-up documentation update
-records one after Code Review approves it and a commit is actually
-created.
+COMPLETED.
+
+Commit
+
+e49e3dadcc0d03be084c182cadcd3ca1748f06ff (parent
+5401ace68856bdafa67d172b56c628da15529499). Per Code Review finding
+CR-038-ROADMAP-01 (P2, documentation consistency): the implementation
+was originally left uncommitted per this ticket's own initial
+instruction, with this section recording "IMPLEMENTATION COMPLETE, NOT
+YET COMMITTED" at that time; a follow-up instruction explicitly
+authorized creating the commit, which was then pushed to
+`origin/main` (`5401ace..e49e3da`). This Status/Commit block is that
+follow-up documentation update, recording the real SHA per this
+document's established convention.
 
 Objective
 
@@ -2805,7 +2812,12 @@ Stripe Customer Flow" speculative direction paragraph and the Section 23
 Milestone Summary table were both updated to correct the record — the
 real, Architect-approved IMP-038 ticket is "Customer Authentication
 Completion," not Payment UI — using the same SUPERSEDED-note pattern
-Section 16 already used for IMP-037. No commit SHA is recorded anywhere
-in this entry, consistent with this document's established convention of
-never fabricating a commit's own SHA before the commit exists — here,
-no commit exists at all yet by explicit instruction.
+Section 16 already used for IMP-037. This entry originally recorded no
+commit SHA, consistent with this document's established convention of
+never fabricating a commit's own SHA before the commit exists — at that
+time none existed yet, by explicit instruction. CR-038-ROADMAP-01 (P2)
+is the follow-up fix that replaces that placeholder wording with the
+real, now-existing SHA once the commit was authorized, created, and
+pushed — the same "record the actual SHA in a follow-up update" pattern
+already used for the IMP-035-series and IMP-037-FIX-01 entries elsewhere
+in this document.
