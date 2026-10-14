@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { getTranslations } from "next-intl/server";
 import { getCurrentUser, resolveProtectedPageRedirect } from "@/modules/identity";
 import { getCustomerOrder, CustomerOrderDetailView } from "@/modules/order";
+import { OrderPaymentPanel } from "@/modules/payment";
 import { redirect } from "@/core/i18n/navigation";
 
 type Props = PageProps<"/[locale]/account/orders/[id]">;
@@ -34,5 +35,12 @@ export default async function AccountOrderDetail({ params }: Props) {
     notFound();
   }
 
-  return <CustomerOrderDetailView order={order} />;
+  // IMP-040: only an Order still PENDING is eligible for payment — an
+  // already-PAID/CANCELLED Order gets no payment slot at all, the same
+  // "ineligible" boundary `initializePayment` itself already enforces
+  // server-side (this is a presentation-layer shortcut, not the actual
+  // authorization: the API route re-checks eligibility independently).
+  const paymentSlot = order.status === "PENDING" ? <OrderPaymentPanel orderId={order.id} /> : null;
+
+  return <CustomerOrderDetailView order={order} paymentSlot={paymentSlot} />;
 }

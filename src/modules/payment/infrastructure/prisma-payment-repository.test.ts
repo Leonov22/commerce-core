@@ -331,4 +331,31 @@ describe("prismaPaymentRepository", () => {
     const refetched = await prismaPaymentRepository.findById(created.payment.id);
     expect(refetched?.providerReference).toBe(winningReference);
   });
+
+  it("IMP-039: findByProviderReference resolves the Payment matching a set provider reference", async () => {
+    const order = await createTestOrder();
+    const created = await prismaPaymentRepository.create({
+      orderId: order.id,
+      amountMinor: order.totalAmountMinor,
+      currency: order.currency,
+    });
+    expect(created.outcome).toBe("created");
+    if (created.outcome !== "created") return;
+    paymentIds.push(created.payment.id);
+
+    await prismaPaymentRepository.setProviderReferenceIfPending(
+      created.payment.id,
+      "pi_lookup_test",
+    );
+
+    const resolved = await prismaPaymentRepository.findByProviderReference("pi_lookup_test");
+    expect(resolved?.id).toBe(created.payment.id);
+  });
+
+  it("IMP-039: findByProviderReference returns null for a reference no Payment has", async () => {
+    const resolved = await prismaPaymentRepository.findByProviderReference(
+      "pi_nonexistent_reference",
+    );
+    expect(resolved).toBeNull();
+  });
 });

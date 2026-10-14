@@ -2,7 +2,11 @@ import { getTranslations } from "next-intl/server";
 import { Container } from "@/shared/components/layout/container";
 import { CheckoutForm } from "@/modules/checkout/components/checkout-form";
 
-export async function CheckoutView() {
+interface CheckoutViewProps {
+  isAuthenticated: boolean;
+}
+
+export async function CheckoutView({ isAuthenticated }: CheckoutViewProps) {
   const t = await getTranslations("Checkout");
 
   return (
@@ -13,7 +17,7 @@ export async function CheckoutView() {
         <p className="mt-2 text-sm text-muted-foreground">{t("guestNotice")}</p>
 
         <div className="mt-10">
-          <CheckoutForm />
+          <CheckoutForm isAuthenticated={isAuthenticated} />
         </div>
       </Container>
     </section>

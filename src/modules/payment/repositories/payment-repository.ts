@@ -109,6 +109,16 @@ export interface PaymentRepository {
   ): Promise<Payment | null>;
 
   /**
+   * Resolves the Payment a provider's opaque reference belongs to (IMP-039)
+   * — the lookup a webhook handler needs, since a provider event only ever
+   * carries its own reference (e.g. a Stripe PaymentIntent id), never an
+   * internal Payment id. `providerReference` is unset (`null`) until
+   * `setProviderReferenceIfPending` attaches one, so this can only ever
+   * resolve a Payment that has already had a provider start attempted.
+   */
+  findByProviderReference(providerReference: string): Promise<Payment | null>;
+
+  /**
    * Atomically durably marks that a provider-start attempt is being made
    * for this Payment (IMP-035-FIX-2), if none has been marked yet —
    * `WHERE id = ? AND status = 'PENDING' AND providerStartAttemptedAt IS NULL`,

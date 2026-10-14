@@ -286,7 +286,42 @@ model Payment {
   updatedAt DateTime @updatedAt
 
   @@index([status])
+  // IMP-039: the webhook path looks up a Payment by the provider's opaque
+  // reference (e.g. a Stripe PaymentIntent id) — a plain lookup index, not a
+  // uniqueness constraint: uniqueness is already guaranteed in practice by
+  // the provider itself (each `startPayment` call produces its own distinct
+  // reference), and this column was already nullable long before any
+  // webhook existed, so asserting a new invariant here is not this
+  // milestone's job.
+  @@index([providerReference])
   @@map("payments")
+}
+
+// IMP-039: durable webhook deduplication/processing identity — NOT an
+// event-sourcing log. `(provider, providerEventId)` is the uniqueness
+// Postgres enforces: an at-least-once-delivering provider (Stripe
+// explicitly documents webhooks this way) can redeliver the exact same
+// event, and this constraint is what makes a redelivery a detectable no-op
+// rather than a risk of double-processing. `paymentId` is a plain nullable
+// reference (no foreign key) — deliberately: Stripe event identity is
+// provider-level, not owned by the Payment it happens to resolve to, and an
+// event that never resolves to a known Payment (e.g. a stray/unexpected
+// event) must still be recordable.
+model PaymentWebhookEvent {
+  id String @id @default(cuid())
+
+  provider        String
+  providerEventId String
+
+  eventType String
+
+  paymentId String?
+
+  createdAt   DateTime @default(now())
+  processedAt DateTime @default(now())
+
+  @@unique([provider, providerEventId])
+  @@map("payment_webhook_events")
 }
 
 // =============================================================================

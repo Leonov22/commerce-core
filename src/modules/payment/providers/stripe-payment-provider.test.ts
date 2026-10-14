@@ -10,7 +10,20 @@ import {
 } from "@/modules/payment/providers/stripe-payment-provider";
 import type { StartPaymentInput } from "@/modules/payment/providers/payment-provider";
 
-type FakePaymentIntent = { id: string; amount: number; currency: string; status: string };
+type FakePaymentIntent = {
+  id: string;
+  amount: number;
+  currency: string;
+  status: string;
+  /** IMP-040: optional in fixtures — `resolveClientSecret` below fills in a deterministic default when omitted, so existing fixtures that predate `client_secret` don't all need updating. */
+  client_secret?: string | null;
+};
+
+function resolveClientSecret(paymentIntent: FakePaymentIntent): string | null {
+  return paymentIntent.client_secret === undefined
+    ? `${paymentIntent.id}_secret`
+    : paymentIntent.client_secret;
+}
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
 /** Comfortably inside the adapter's native-idempotency safe window. */
@@ -77,7 +90,13 @@ function makeFakeStripeClient(): {
       async search(params) {
         searchCalls.push(params);
         if (searchThrows) throw searchThrows;
-        return { data: searchResults, has_more: searchHasMore };
+        return {
+          data: searchResults.map((paymentIntent) => ({
+            ...paymentIntent,
+            client_secret: resolveClientSecret(paymentIntent),
+          })),
+          has_more: searchHasMore,
+        };
       },
       async retrieve(id) {
         retrieveCalls.push(id);
@@ -89,6 +108,7 @@ function makeFakeStripeClient(): {
           amount: paymentIntent.amount,
           currency: paymentIntent.currency,
           status: paymentIntent.status,
+          client_secret: resolveClientSecret(paymentIntent),
         };
       },
       async create(params, requestOptions) {
@@ -99,8 +119,11 @@ function makeFakeStripeClient(): {
           // Real Stripe behavior: a repeated call with a still-remembered
           // idempotency key replays the ORIGINAL response body verbatim —
           // it does not reflect anything that has happened to the object
-          // since (e.g. a later cancellation).
-          return { id: existingId };
+          // since (e.g. a later cancellation). `client_secret` is part of
+          // that same original body, so the replay must return the SAME
+          // one — never regenerate.
+          const existing = paymentIntentsById.get(existingId);
+          return { id: existingId, client_secret: existing ? resolveClientSecret(existing) : null };
         }
         nextId += 1;
         const created: FakePaymentIntent = {
@@ -111,7 +134,7 @@ function makeFakeStripeClient(): {
         };
         paymentIntentIdByIdempotencyKey.set(requestOptions.idempotencyKey, created.id);
         paymentIntentsById.set(created.id, created);
-        return { id: created.id };
+        return { id: created.id, client_secret: resolveClientSecret(created) };
       },
     },
   };
@@ -278,7 +301,7 @@ describe("Stripe PaymentProvider adapter — contract (IMP-035)", () => {
     );
   });
 
-  it("the successful result carries no Stripe-specific field beyond the opaque providerReference", async () => {
+  it("the successful result carries no Stripe-specific field beyond the port's own opaque providerReference/clientSecret", async () => {
     const { client } = makeFakeStripeClient();
     const provider = createStripePaymentProvider(client);
 
@@ -286,7 +309,12 @@ describe("Stripe PaymentProvider adapter — contract (IMP-035)", () => {
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(Object.keys(result).sort()).toEqual(["ok", "providerReference"]);
+    // IMP-040: `clientSecret` is part of `StartPaymentResult`'s own
+    // provider-neutral contract (see `payment-provider.ts`), not a
+    // Stripe-specific leak — this still proves no OTHER Stripe concept
+    // (e.g. a raw `Stripe.PaymentIntent`, its `status`, or any field this
+    // port never declared) escapes through the result.
+    expect(Object.keys(result).sort()).toEqual(["clientSecret", "ok", "providerReference"]);
   });
 
   it("getStripePaymentProvider() throws a clear configuration error rather than silently using an invalid key when STRIPE_SECRET_KEY is unset", () => {
@@ -398,7 +426,11 @@ describe("Stripe PaymentProvider adapter — safety over liveness (IMP-035-FIX-2
 
     const result = await provider.startPayment(staleInput());
 
-    expect(result).toEqual({ ok: true, providerReference: "pi_existing_1" });
+    expect(result).toEqual({
+      ok: true,
+      providerReference: "pi_existing_1",
+      clientSecret: "pi_existing_1_secret",
+    });
     expect(createCalls).toHaveLength(0);
   });
 
@@ -520,7 +552,11 @@ describe("Stripe PaymentProvider adapter — canceled PaymentIntent semantics (C
 
     const result = await provider.startPayment(staleInput());
 
-    expect(result).toEqual({ ok: true, providerReference: "pi_live" });
+    expect(result).toEqual({
+      ok: true,
+      providerReference: "pi_live",
+      clientSecret: "pi_live_secret",
+    });
     expect(createCalls).toHaveLength(0);
   });
 
@@ -622,7 +658,11 @@ describe("Stripe PaymentProvider adapter — PaymentIntent integrity, create/ret
     const matching = await provider.startPayment(
       staleInput({ amountMinor: 24800, currency: "USD" }),
     );
-    expect(matching).toEqual({ ok: true, providerReference: "pi_search_match" });
+    expect(matching).toEqual({
+      ok: true,
+      providerReference: "pi_search_match",
+      clientSecret: "pi_search_match_secret",
+    });
 
     const amountMismatch = await provider.startPayment(
       staleInput({ amountMinor: 999, currency: "USD" }),

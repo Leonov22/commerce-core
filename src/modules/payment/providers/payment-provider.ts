@@ -121,9 +121,23 @@ export interface StartPaymentInput {
  *
  * Deliberately never carries authoritative `amountMinor`, `currency`,
  * Payment status, or Order status — the Payment remains authoritative
- * locally; nothing about this result can influence any of those. The
- * only thing a caller may ever do with a successful result is attempt to
- * record `providerReference` via `PaymentRepository.setProviderReferenceIfPending`.
+ * locally; nothing about this result can influence any of those. A caller
+ * may record `providerReference` via
+ * `PaymentRepository.setProviderReferenceIfPending`, and — IMP-040 — pass
+ * `clientSecret` to a customer-facing client-side payment UI; neither
+ * field is ever persisted back onto `Payment` itself (see
+ * `process-payment.ts`'s doc comment on why `clientSecret` deliberately
+ * has no repository/database counterpart).
+ *
+ * `clientSecret` (IMP-040) is the opaque token a provider's client-side SDK
+ * needs to actually collect payment details for THIS specific operation —
+ * without it, a provider-neutral "start a payment" capability is complete
+ * on the server but unusable from a browser. Provider-neutral by name
+ * only: this port has no opinion on its format, only that a compliant
+ * provider's client-side SDK can consume it, and that (per the same
+ * idempotency invariant `providerReference` already follows) every call
+ * sharing the same `paymentId` resolves to a `clientSecret` usable for the
+ * SAME external operation — never a secret for a different one.
  *
  * Failure is collapsed to a single `PROVIDER_ERROR` rather than an
  * open-ended set of provider-specific failure codes (a declined card, an
@@ -133,7 +147,8 @@ export interface StartPaymentInput {
  * a real provider exists to observe.
  */
 export type StartPaymentResult =
-  { ok: true; providerReference: string } | { ok: false; error: "PROVIDER_ERROR" };
+  | { ok: true; providerReference: string; clientSecret: string }
+  | { ok: false; error: "PROVIDER_ERROR" };
 
 /**
  * A single capability: start a payment, idempotently by `paymentId`, and

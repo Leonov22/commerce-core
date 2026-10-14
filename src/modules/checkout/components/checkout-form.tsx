@@ -30,7 +30,11 @@ interface CreatedOrder {
   id: string;
 }
 
-export function CheckoutForm() {
+interface CheckoutFormProps {
+  isAuthenticated: boolean;
+}
+
+export function CheckoutForm({ isAuthenticated }: CheckoutFormProps) {
   const t = useTranslations("Checkout");
   const locale = useLocale();
   const { items, clearCart } = useCart();
@@ -61,7 +65,7 @@ export function CheckoutForm() {
   // through to the empty-cart branch below and hide the confirmation the
   // user is meant to see — so this check comes first.
   if (createdOrder) {
-    return <CheckoutSuccess orderId={createdOrder.id} />;
+    return <CheckoutSuccess orderId={createdOrder.id} isAuthenticated={isAuthenticated} />;
   }
 
   if (items.length === 0) {

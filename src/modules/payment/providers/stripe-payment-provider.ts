@@ -25,16 +25,37 @@ import type {
  * `currency` (already present on every real Stripe PaymentIntent, exactly
  * like `search`'s results) so the create/retrieve path can apply the same
  * integrity check `search` already did.
+ *
+ * IMP-040: every shape below also carries `client_secret` — already
+ * present on every real Stripe PaymentIntent response (the narrow
+ * `StripePaymentIntentsClient` interface was simply never widened to
+ * declare it, since nothing read it before this milestone). It is
+ * client-facing by design (a Payment Element/Stripe.js client needs it to
+ * collect payment details for this exact PaymentIntent) — never a secret
+ * in the `STRIPE_SECRET_KEY` sense; see `payment-provider.ts`'s
+ * `StartPaymentResult.clientSecret` doc comment.
  */
 export interface StripePaymentIntentsClient {
   paymentIntents: {
     create(
       params: { amount: number; currency: string; metadata: Record<string, string> },
       options: { idempotencyKey: string },
-    ): Promise<{ id: string }>;
-    retrieve(id: string): Promise<{ id: string; amount: number; currency: string; status: string }>;
+    ): Promise<{ id: string; client_secret: string | null }>;
+    retrieve(id: string): Promise<{
+      id: string;
+      amount: number;
+      currency: string;
+      status: string;
+      client_secret: string | null;
+    }>;
     search(params: { query: string }): Promise<{
-      data: { id: string; amount: number; currency: string; status: string }[];
+      data: {
+        id: string;
+        amount: number;
+        currency: string;
+        status: string;
+        client_secret: string | null;
+      }[];
       has_more: boolean;
     }>;
   };
@@ -127,7 +148,13 @@ async function reconcileExistingPaymentIntent(
   | { outcome: "none" }
   | {
       outcome: "found";
-      paymentIntent: { id: string; amount: number; currency: string; status: string };
+      paymentIntent: {
+        id: string;
+        amount: number;
+        currency: string;
+        status: string;
+        client_secret: string | null;
+      };
     }
   | { outcome: "ambiguous" }
 > {
@@ -162,7 +189,13 @@ async function reconcileExistingPaymentIntent(
  * substituted in.
  */
 function toValidatedResult(
-  paymentIntent: { id: string; amount: number; currency: string; status: string },
+  paymentIntent: {
+    id: string;
+    amount: number;
+    currency: string;
+    status: string;
+    client_secret: string | null;
+  },
   authoritative: { amountMinor: number; currency: string },
 ): StartPaymentResult {
   if (paymentIntent.status === "canceled") {
@@ -182,7 +215,21 @@ function toValidatedResult(
     );
     return { ok: false, error: "PROVIDER_ERROR" };
   }
-  return { ok: true, providerReference: paymentIntent.id };
+  if (!paymentIntent.client_secret) {
+    // IMP-040: a PaymentIntent without a usable client_secret cannot back
+    // a client-side payment UI at all — treated the same as any other
+    // "cannot safely proceed" case this adapter already fails closed on.
+    console.error(
+      "[payment/stripe-payment-provider] resolved Stripe PaymentIntent has no client_secret; refusing to treat it as a valid provider start",
+      { paymentIntentId: paymentIntent.id },
+    );
+    return { ok: false, error: "PROVIDER_ERROR" };
+  }
+  return {
+    ok: true,
+    providerReference: paymentIntent.id,
+    clientSecret: paymentIntent.client_secret,
+  };
 }
 
 /**
