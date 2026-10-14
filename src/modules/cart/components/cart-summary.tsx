@@ -19,8 +19,12 @@ export function CartSummary({ items, productsById, isLoading }: CartSummaryProps
 
   // Presentation-only calculation from currently-resolved catalog prices.
   // Checkout must recalculate authoritative prices server-side.
+  // EUR is this store's default/only currency (business decision) — this
+  // initial value is only ever shown if the cart has no resolved products
+  // at all, since the loop below always overwrites it with the real
+  // product currency once one resolves.
   let subtotalAmountMinor = 0;
-  let currency = "USD";
+  let currency = "EUR";
   for (const item of items) {
     const product = productsById.get(item.productId);
     if (product) {

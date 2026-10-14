@@ -131,7 +131,11 @@ export function resolveCheckoutSummary(
   }
 
   const subtotalAmountMinor = lines.reduce((sum, line) => sum + line.lineTotalAmountMinor, 0);
-  const currency = lines[0]?.product.currency ?? "USD";
+  // EUR is this store's default/only currency (business decision) — this
+  // fallback is reached only when no cart line resolved to a real product
+  // yet (e.g. a genuinely empty cart), so there is nothing to read a
+  // currency FROM; it never overrides a resolved product's own currency.
+  const currency = lines[0]?.product.currency ?? "EUR";
 
   return { status: "ready", lines, unresolvedCount, subtotalAmountMinor, currency };
 }

@@ -47,14 +47,14 @@ describe("resolveCheckoutSummary", () => {
     expect(result).toEqual({ status: "loading" });
   });
 
-  it("returns an empty, ready summary for an empty cart", () => {
+  it("returns an empty, ready summary for an empty cart, defaulting currency to EUR (this store's default/only currency)", () => {
     const result = resolveCheckoutSummary([], new Map(), false);
     expect(result).toEqual({
       status: "ready",
       lines: [],
       unresolvedCount: 0,
       subtotalAmountMinor: 0,
-      currency: "USD",
+      currency: "EUR",
     });
   });
 

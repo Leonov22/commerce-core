@@ -92,8 +92,12 @@ export function CheckoutDelivery({
                 </span>
               </span>
               <span className="text-sm text-muted-foreground">
+                {/* EUR is this store's default/only currency (business
+                    decision) — delivery options carry no currency field of
+                    their own (see DELIVERY_OPTIONS), so this is the store's
+                    single currency, not a per-order value. */}
                 {t("summary.amount", {
-                  amount: formatProductPrice(option.priceAmountMinor, "USD", locale),
+                  amount: formatProductPrice(option.priceAmountMinor, "EUR", locale),
                 })}
               </span>
             </label>
