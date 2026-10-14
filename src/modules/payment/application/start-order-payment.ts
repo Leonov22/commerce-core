@@ -17,11 +17,13 @@ export type StartOrderPaymentResult =
    * The Payment already reached a terminal status (`SUCCEEDED`/`FAILED`/
    * `CANCELLED`) — most likely the IMP-039 webhook settled it before this
    * call, possibly before `Order.status` itself caught up (see IMP-039's
-   * own documented consistency window). There is nothing left to start;
-   * the caller should re-fetch current status (e.g. the same route's
-   * `GET`) rather than retry this operation.
+   * own documented consistency window). There is nothing left to start.
+   * `payment` carries the current (terminal) row so a caller can tell
+   * "already succeeded" apart from "already failed/cancelled" — without
+   * it, a customer whose payment actually SUCCEEDED during this window
+   * would see a generic "unavailable" message instead of confirmation.
    */
-  | { ok: false; error: "PAYMENT_NOT_PENDING" }
+  | { ok: false; error: "PAYMENT_NOT_PENDING"; payment: Payment }
   | { ok: false; error: "PROVIDER_ERROR" };
 
 /**

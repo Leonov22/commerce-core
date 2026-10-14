@@ -343,7 +343,11 @@ describe("processPayment", () => {
 
         const result = await processPayment(repository, provider, payment.id);
 
-        expect(result).toEqual({ ok: false, error: "PAYMENT_NOT_PENDING" });
+        expect(result).toEqual({
+          ok: false,
+          error: "PAYMENT_NOT_PENDING",
+          payment: expect.objectContaining({ status }),
+        });
         expect(calls).toHaveLength(0);
       });
     }

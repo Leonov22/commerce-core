@@ -19,6 +19,14 @@ interface InitResponse {
 
 interface InitErrorResponse {
   error: string;
+  /**
+   * IMP-041: present specifically for `error: "PAYMENT_NOT_PENDING"` — the
+   * current, already-terminal Payment status, needed to distinguish
+   * "already succeeded" (show confirmation) from "already failed/
+   * canceled" (show a failure message) rather than a generic
+   * "unavailable" either way. See the route's own doc comment.
+   */
+  paymentStatus?: string;
 }
 
 interface StatusResponse {
@@ -98,6 +106,14 @@ export function OrderPaymentPanel({ orderId }: OrderPaymentPanelProps) {
         const data: InitResponse | InitErrorResponse = await response.json();
         if (cancelled) return;
         if (!response.ok || !("clientSecret" in data)) {
+          // IMP-041: PAYMENT_NOT_PENDING with paymentStatus "SUCCEEDED"
+          // means the IMP-039 webhook already settled this Payment before
+          // Order.status caught up — show confirmation, not a generic
+          // "unavailable" message, for a payment that actually succeeded.
+          if ("paymentStatus" in data && data.paymentStatus === "SUCCEEDED") {
+            setState({ phase: "paid" });
+            return;
+          }
           const reason = "error" in data ? data.error : "UNKNOWN_ERROR";
           setState({ phase: "unavailable", reason });
           return;

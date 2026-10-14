@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import "dotenv/config";
+import { afterAll, describe, expect, it } from "vitest";
 import { startOrderPayment } from "@/modules/payment/application/start-order-payment";
 import type { GetOrderById } from "@/modules/payment/application/initialize-payment";
 import type { PaymentRepository } from "@/modules/payment/repositories/payment-repository";
@@ -8,6 +9,13 @@ import type {
 } from "@/modules/payment/providers/payment-provider";
 import type { Payment, PaymentStatus } from "@/modules/payment/domain/payment";
 import type { Order } from "@/modules/order/domain/order";
+import { prismaPaymentRepository } from "@/modules/payment/infrastructure/prisma-payment-repository";
+import { prisma as paymentPrisma } from "@/modules/payment/infrastructure/prisma-client";
+import { createOrder as createOrderCommand } from "@/modules/order/application/order-commands";
+import { getOrderById as getOrderByIdCommand } from "@/modules/order/application/get-order";
+import { prismaOrderRepository } from "@/modules/order/infrastructure/prisma-order-repository";
+import { prisma as orderPrisma } from "@/modules/order/infrastructure/prisma-client";
+import type { NewOrderInput } from "@/modules/order/repositories/order-repository";
 
 /**
  * Pure application-layer tests: `PaymentRepository`, `PaymentProvider`,
@@ -234,7 +242,36 @@ describe("startOrderPayment", () => {
       order.id,
     );
 
-    expect(result).toEqual({ ok: false, error: "PAYMENT_NOT_PENDING" });
+    expect(result).toEqual({
+      ok: false,
+      error: "PAYMENT_NOT_PENDING",
+      payment: expect.objectContaining({ status: "SUCCEEDED" }),
+    });
+  });
+
+  it("IMP-041: PAYMENT_NOT_PENDING distinguishes a FAILED Payment from a SUCCEEDED one via the returned payment", async () => {
+    const order = makeOrder();
+    const { repository } = makeFakePaymentRepository();
+    const { provider: firstProvider } = makeFakeProvider();
+    const first = await startOrderPayment(repository, firstProvider, makeGetOrder(order), order.id);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    await repository.updateStatusIfCurrent(first.payment.id, "PENDING", "FAILED");
+
+    const { provider: secondProvider } = makeFakeProvider();
+    const result = await startOrderPayment(
+      repository,
+      secondProvider,
+      makeGetOrder(order),
+      order.id,
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      error: "PAYMENT_NOT_PENDING",
+      payment: expect.objectContaining({ status: "FAILED" }),
+    });
   });
 
   it("propagates PROVIDER_ERROR when the provider fails, and persists nothing", async () => {
@@ -247,5 +284,115 @@ describe("startOrderPayment", () => {
     expect(result).toEqual({ ok: false, error: "PROVIDER_ERROR" });
     const payment = await repository.findByOrderId(order.id);
     expect(payment?.providerReference).toBeNull();
+  });
+});
+
+/**
+ * Real repository + real concurrency (IMP-041), mirroring
+ * `process-payment.test.ts`'s own "real repository + real concurrency"
+ * section: `startOrderPayment` itself introduces no new persistence, but
+ * this is the explicit verification requirement IMP-041 asks for
+ * ("Payment initialization is safe under retries and concurrent
+ * requests") exercised through the actual customer-facing combinator —
+ * not just its underlying primitives in isolation.
+ */
+describe("startOrderPayment — real repository + real concurrency (IMP-041)", () => {
+  const orderIds: string[] = [];
+
+  afterAll(async () => {
+    if (orderIds.length > 0) {
+      await paymentPrisma.payment.deleteMany({ where: { orderId: { in: orderIds } } });
+      await orderPrisma.order.deleteMany({ where: { id: { in: orderIds } } });
+    }
+    await paymentPrisma.$disconnect();
+    await orderPrisma.$disconnect();
+  });
+
+  function baseOrderInput(overrides: Partial<NewOrderInput> = {}): NewOrderInput {
+    return {
+      firstName: "Start",
+      lastName: "Payment",
+      email: `start-order-payment-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`,
+      phone: "+421900123456",
+      userId: null,
+      subtotalAmountMinor: 24000,
+      deliveryAmountMinor: 800,
+      totalAmountMinor: 24800,
+      currency: "USD",
+      items: [
+        {
+          productId: "1",
+          productName: "Studio Chair",
+          unitPriceAmountMinor: 24000,
+          quantity: 1,
+          lineTotalAmountMinor: 24000,
+          currency: "USD",
+        },
+      ],
+      ...overrides,
+    };
+  }
+
+  const realGetOrder: GetOrderById = (orderId) =>
+    getOrderByIdCommand(prismaOrderRepository, orderId);
+
+  it("two genuinely concurrent startOrderPayment calls for a brand-new Order produce exactly one Payment and one persisted provider reference", async () => {
+    const order = await createOrderCommand(prismaOrderRepository, baseOrderInput());
+    orderIds.push(order.id);
+    const { provider: providerA } = makeFakeProvider();
+    const { provider: providerB } = makeFakeProvider();
+
+    const [a, b] = await Promise.all([
+      startOrderPayment(prismaPaymentRepository, providerA, realGetOrder, order.id),
+      startOrderPayment(prismaPaymentRepository, providerB, realGetOrder, order.id),
+    ]);
+
+    expect(a.ok).toBe(true);
+    expect(b.ok).toBe(true);
+    if (!a.ok || !b.ok) return;
+    // Both calls resolved to the SAME Payment — never a second one for
+    // the same Order (Postgres's own unique constraint on
+    // `Payment.orderId`, exercised through the actual customer-facing
+    // combinator, not just `initializePayment` in isolation).
+    expect(a.payment.id).toBe(b.payment.id);
+
+    const persisted = await prismaPaymentRepository.findByOrderId(order.id);
+    expect(persisted?.status).toBe("PENDING");
+    expect(persisted?.providerReference).not.toBeNull();
+  });
+
+  it("repeated startOrderPayment calls for the same Order never create a second Payment or duplicate charge", async () => {
+    const order = await createOrderCommand(prismaOrderRepository, baseOrderInput());
+    orderIds.push(order.id);
+    const { provider } = makeFakeProvider();
+
+    const first = await startOrderPayment(
+      prismaPaymentRepository,
+      provider,
+      realGetOrder,
+      order.id,
+    );
+    const second = await startOrderPayment(
+      prismaPaymentRepository,
+      provider,
+      realGetOrder,
+      order.id,
+    );
+    const third = await startOrderPayment(
+      prismaPaymentRepository,
+      provider,
+      realGetOrder,
+      order.id,
+    );
+
+    expect(first.ok && second.ok && third.ok).toBe(true);
+    if (!first.ok || !second.ok || !third.ok) return;
+    expect(second.payment.id).toBe(first.payment.id);
+    expect(third.payment.id).toBe(first.payment.id);
+
+    const allPaymentsForOrder = await paymentPrisma.payment.findMany({
+      where: { orderId: order.id },
+    });
+    expect(allPaymentsForOrder).toHaveLength(1);
   });
 });

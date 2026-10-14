@@ -172,7 +172,6 @@ describe("POST /api/orders/[id]/payment", () => {
   it.each([
     ["ORDER_ALREADY_PAID", 409],
     ["ORDER_CANCELLED", 409],
-    ["PAYMENT_NOT_PENDING", 409],
     ["PROVIDER_ERROR", 502],
   ] as const)("maps %s to HTTP %i without leaking internals", async (error, expectedStatus) => {
     resetMocks();
@@ -185,6 +184,28 @@ describe("POST /api/orders/[id]/payment", () => {
     expect(response.status).toBe(expectedStatus);
     expect(await response.json()).toEqual({ error });
   });
+
+  it.each(["SUCCEEDED", "FAILED", "CANCELLED"] as const)(
+    "IMP-041: maps PAYMENT_NOT_PENDING to HTTP 409 including the current paymentStatus (%s), so the client can distinguish already-paid from already-failed",
+    async (paymentStatus) => {
+      resetMocks();
+      mockGetCurrentUser.mockResolvedValueOnce({ id: "user-1" });
+      mockGetCustomerOrder.mockResolvedValueOnce(fakeOrder);
+      mockStartOrderPayment.mockResolvedValueOnce({
+        ok: false,
+        error: "PAYMENT_NOT_PENDING",
+        payment: { ...fakePayment, status: paymentStatus },
+      });
+
+      const response = await POST(makeRequest("POST"), routeContext());
+
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({
+        error: "PAYMENT_NOT_PENDING",
+        paymentStatus,
+      });
+    },
+  );
 
   it("returns 500 INTERNAL_ERROR and never leaks the underlying error when startOrderPayment throws", async () => {
     resetMocks();

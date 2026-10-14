@@ -89,11 +89,22 @@ export async function POST(_request: Request, { params }: RouteParams) {
         return NextResponse.json({ error: "ORDER_NOT_FOUND" }, { status: 404 });
       case "ORDER_ALREADY_PAID":
       case "ORDER_CANCELLED":
-      case "PAYMENT_NOT_PENDING":
-        // All three are "nothing to start" conflicts, never a reason for
-        // Stripe-style retry logic — the caller should re-fetch status
-        // (GET above) rather than resubmit.
+        // Never a reason for Stripe-style retry logic — the caller should
+        // re-fetch status (GET above) rather than resubmit.
         return NextResponse.json({ error: result.error }, { status: 409 });
+      case "PAYMENT_NOT_PENDING":
+        // IMP-041: the Payment already reached a terminal status — most
+        // likely the IMP-039 webhook settled it before Order.status
+        // itself caught up (see that milestone's own documented
+        // consistency window). Without `paymentStatus` here, a customer
+        // whose payment actually SUCCEEDED during this window would see
+        // nothing but a generic 409 — the client needs to tell "already
+        // paid" apart from "already failed/cancelled" to display the
+        // correct final state.
+        return NextResponse.json(
+          { error: "PAYMENT_NOT_PENDING", paymentStatus: result.payment.status },
+          { status: 409 },
+        );
       case "PROVIDER_ERROR":
         // The upstream provider call itself failed — distinct from this
         // route's own failure, hence 502 rather than 500.

@@ -2626,7 +2626,8 @@ IMP-036 — Storefront & Customer UX Foundation (incl. IMP-036-FIX-01)	COMPLETED
 IMP-037 — Product Discovery & Product Details Vertical Slice (incl. IMP-037-FIX-01 / CR-037-01-SEED, IMP-037-FIX-02 / CR-037-FIX-01)	COMPLETED — manual/browser verification NOT performed (see Section 13); supersedes the "Checkout & Order Customer Flow" direction originally speculated for IMP-037 in Section 16
 IMP-038 — Customer Authentication Completion (real scope; supersedes the "Payment UI & Stripe Customer Flow" direction originally speculated for IMP-038 in Section 16 — see Section 25)	COMPLETED — commit e49e3dadcc0d03be084c182cadcd3ca1748f06ff (parent 5401ace68856bdafa67d172b56c628da15529499); manual/browser verification NOT performed (see Section 25)
 IMP-039 — Asynchronous Payment Lifecycle (Stripe webhook processing — see Section 26)	COMPLETED — real Stripe verification NOT performed, no STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET configured in this environment (see Section 26)
-IMP-040 — Customer Payment UI & Stripe Checkout (the "Payment UI & Stripe Customer Flow" direction originally speculated for IMP-038 in Section 16, now implemented under its own number — see Section 27)	COMPLETED — real Stripe/browser verification NOT performed, no Stripe credentials configured in this environment (see Section 27)
+IMP-040 — Customer Payment UI & Stripe Checkout (the "Payment UI & Stripe Customer Flow" direction originally speculated for IMP-038 in Section 16, now implemented under its own number — see Section 27)	COMPLETED — real Stripe/browser verification NOT performed, no Stripe credentials configured in this environment (see Section 27); CR-040-01 found and fixed by IMP-041 (see Section 28)
+IMP-041 — Stripe Test-Mode & Browser E2E Verification	COMPLETED (review + defect fix) — real Stripe test-mode and browser E2E verification BLOCKED, missing credentials/tooling in this environment, exact prerequisites documented (see Section 28)
 Next milestone	NOT YET APPROVED
 24. Source of Truth
 
@@ -3321,3 +3322,171 @@ window where Payment and Order can be transiently inconsistent, since
 they are never updated inside one shared database transaction) is
 unchanged and still applies — `OrderPaymentPanel`'s bounded polling is a
 UI-level mitigation for exactly that window, not a fix to it.
+
+28. IMP-041 — Stripe Test-Mode & Browser E2E Verification
+
+Status
+
+COMPLETED (review + one concrete defect fixed), pending Code Review.
+Branch `feat/imp-040-customer-payment-ui` (same branch as IMP-040 — this
+milestone is a review/fix pass on top of it, not a new feature branch).
+Commit SHA recorded once created; do not treat any SHA embedded in this
+entry before that point as authoritative, per this document's
+established convention.
+
+Objective
+
+Verify the IMP-040 customer payment flow — review its diff for payment
+correctness/security defects, execute whatever browser/Stripe test-mode
+verification the local environment actually supports, and fix only
+concrete defects found. Primarily a verification milestone, not feature
+development.
+
+Environment Audit
+
+No `.env.local` exists. `.env` (the file tests actually load via
+`dotenv/config`) contains only `DATABASE_URL` and `AUTH_SECRET` —
+`STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and
+`NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` are all absent, confirmed by
+inspecting variable NAMES only, never values. No `stripe` CLI binary, no
+`playwright`, no `chromium-cli`, no `cypress` is installed (`which`/`pnpm
+list` checked directly). This means:
+
+- Stripe test-mode verification (Section D) is BLOCKED — exact missing
+  prerequisites: `STRIPE_SECRET_KEY` (sk_test_…), `STRIPE_WEBHOOK_SECRET`
+  (whsec_…, from `stripe listen --print-secret` or the Stripe Dashboard),
+  `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` (pk_test_…), and the Stripe CLI
+  itself for local webhook forwarding.
+- Browser E2E verification (Section C) is BLOCKED — exact missing
+  prerequisite: a browser automation tool (no `chromium-cli`/Playwright
+  installed), consistent with this same gap disclosed against several
+  earlier milestones in this document (`next dev` has also previously
+  crashed with a V8 out-of-memory pattern in this same sandbox).
+- `DATABASE_URL` IS present, so every automated test requiring real
+  Postgres (including the new real-concurrency tests added below) ran
+  genuinely, not against a mock.
+
+Review Findings, by Severity
+
+CR-040-01 (P2, correctness — found and fixed): `OrderPaymentPanel`
+unconditionally called `POST /api/orders/[id]/payment` on mount. If the
+IMP-039 webhook had already settled a Payment to `SUCCEEDED` before
+`Order.status` itself caught up (IMP-039's own documented cross-module
+consistency window — Section 26), `startOrderPayment` correctly
+returned `PAYMENT_NOT_PENDING`, but the route's 409 response carried no
+further detail, and the panel showed a generic "Payment isn't available
+for this order right now" message — indistinguishable from an actual
+failure, for a payment that had, in fact, already succeeded. This is
+exactly the interaction this milestone's own instructions asked to be
+reviewed ("Review the known IMP-039 cross-module Payment/Order
+consistency limitation. Determine whether the integrated IMP-040 flow
+introduces any new failure mode.") — IMP-040 did not corrupt any data or
+create a security gap, but it DID introduce a real, user-facing
+"wrong status displayed" defect during that pre-existing window.
+
+Fix: `ProcessPaymentResult`'s `PAYMENT_NOT_PENDING` branch (and
+`StartOrderPaymentResult`'s mirror of it) now carries the current,
+already-terminal `Payment` row; `POST /api/orders/[id]/payment`'s 409
+response for this specific error now includes `paymentStatus`; the panel
+checks it and shows payment confirmation (not a generic error) when
+`paymentStatus === "SUCCEEDED"`. `ORDER_ALREADY_PAID`/`ORDER_CANCELLED`
+were deliberately left as generic 409s — these reflect genuine
+Order-level terminal states reached through a narrower, unrelated race
+(Order-level, not the documented Payment-ahead-of-Order window this
+review specifically targeted), and widening their result shape too would
+touch `initializePayment` (IMP-032, unmodified by IMP-040) for a
+lower-value, different race — out of this review's targeted scope.
+
+No other P0/P1/P2 finding. Specifically verified and found correct,
+by direct code reading (not merely by design intent, since this is a
+review pass): both route handlers resolve `userId` exclusively from
+`getCurrentUser()`'s session, never from any request input; ownership is
+enforced via `getCustomerOrder`'s existing null-collapsing check before
+`startOrderPayment` is ever called; `startOrderPayment`/`processPayment`
+derive `amountMinor`/`currency` exclusively from the persisted
+Order/Payment, with no parameter either function could accept to
+override them; `clientSecret` is attributed to a `PROVIDER_REFERENCE_ALREADY_SET`
+result only when the persisted reference matches this call's own
+`startPayment` resolution (never a secret for an unrelated PaymentIntent);
+`OrderPaymentPanel`'s `PaymentForm` never renders a "paid" state directly
+from Stripe's client-side `confirmPayment` result — every path through
+`reconciling`/`paid` passes through `ReconciliationPoller`, which only
+ever reads `GET /api/orders/[id]/payment` (the IMP-039-webhook-backed
+authoritative status); IMP-039's signature verification, webhook
+deduplication, and Payment/Order transition logic are byte-for-byte
+unmodified by the IMP-040/IMP-041 diff (confirmed via `git diff` scoped
+to the webhook files, not merely assumed); no Stripe secret, webhook
+secret, or client secret appears in any `console.error`/`console.warn`
+call added by either milestone.
+
+Browser E2E Verification
+
+BLOCKED — see Environment Audit above. None of the 10 scenarios in this
+milestone's own Section C were executed. No scenario is reported as
+passed; this is a genuine, disclosed gap, not a silent skip.
+
+Stripe Test-Mode Verification
+
+BLOCKED — see Environment Audit above. None of the 7 scenarios in this
+milestone's own Section D were executed against real Stripe test mode.
+REAL STRIPE VERIFICATION: NOT PERFORMED.
+
+Tests
+
+`process-payment.test.ts`/`start-order-payment.test.ts`/
+`api/orders/[id]/payment/route.test.ts` updated for CR-040-01's fix (the
+widened `PAYMENT_NOT_PENDING` shape) — every existing assertion updated,
+none weakened. New: two dedicated `PAYMENT_NOT_PENDING` tests
+distinguishing a SUCCEEDED from a FAILED Payment
+(`start-order-payment.test.ts`), three parametrized route tests covering
+all three terminal `paymentStatus` values in the 409 response
+(`route.test.ts`). New, addressing this milestone's explicit "safe under
+retries and concurrent requests" requirement at the actual
+customer-facing combinator (not just its underlying primitives in
+isolation): a "real repository + real concurrency" section in
+`start-order-payment.test.ts` — two genuinely concurrent
+`startOrderPayment` calls for a brand-new Order resolve to exactly one
+persisted Payment and one provider reference; three sequential calls for
+the same Order never create a second Payment row. `pnpm test`: 434
+passing + 3 skipped (437 total), 39 test files — up from the pre-existing
+429 passing + 3 skipped (432); zero regressions.
+
+Validation Results
+
+`pnpm typecheck`: clean. `pnpm lint`: clean. `pnpm format:check`: limited
+to the same two pre-existing, unrelated warnings already noted for every
+prior milestone (`next.config.ts`, `pnpm-workspace.yaml`). `pnpm test`:
+see above. `pnpm build`: succeeded completely on the first attempt — all
+17 routes compiled/prerendered; the sandbox-level V8 out-of-memory crash
+documented against several earlier milestones did not recur.
+
+Defects Fixed
+
+CR-040-01 only (detailed above). Changed files: `process-payment.ts`,
+`process-payment.test.ts`, `start-order-payment.ts`,
+`start-order-payment.test.ts`, `route.ts`, `route.test.ts`,
+`order-payment-panel.tsx` — all within the Payment module and its one
+transport route; no Catalog/Cart/Checkout/Identity file touched, no
+schema change, no new `PaymentStatus` value, no architecture redesign.
+
+Remaining Verification Gaps and Exact Prerequisites
+
+1. Browser E2E (all 10 scenarios in this milestone's Section C) —
+   requires a browser automation tool (Playwright/`chromium-cli`/
+   equivalent) in this environment, or a working `next dev` in this same
+   sandbox (previously unreliable here).
+2. Stripe test-mode (all 7 scenarios in this milestone's Section D) —
+   requires `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`,
+   `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY`, and the Stripe CLI for local
+   webhook forwarding, none of which are configured here.
+3. The IMP-039 Payment/Order consistency window itself (Section 26)
+   remains architecturally unresolved by design (no cross-module
+   transaction) — CR-040-01's fix makes the CUSTOMER-FACING display
+   correct during that window, it does not close the window itself.
+
+Recommendation
+
+NEEDS FURTHER FIXES completed (CR-040-01, done, included in this
+commit) — otherwise READY FOR CODE REVIEW, with Browser E2E and Stripe
+test-mode verification EXPLICITLY BLOCKED pending external environment
+setup (credentials + browser tooling), not represented as passed.
