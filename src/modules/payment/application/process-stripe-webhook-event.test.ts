@@ -141,6 +141,24 @@ function supportedEvent(
     eventType: "payment_intent.succeeded",
     providerReference: "pi_test_123",
     outcome: "SUCCEEDED",
+    // Matches makePayment()'s defaults (amountMinor: 24800, currency:
+    // "USD") so every existing test's SUCCEEDED path passes IMP-041-FIX's
+    // (PR1-F03) settlement check without having to repeat these on every
+    // call site; tests specifically exercising a mismatch override them.
+    settledAmountMinor: 24800,
+    settledCurrency: "USD",
+    ...overrides,
+  };
+}
+
+function retryableFailureEvent(
+  overrides: Partial<Extract<StripeWebhookEvent, { kind: "retryableFailure" }>> = {},
+): StripeWebhookEvent {
+  return {
+    kind: "retryableFailure",
+    providerEventId: "evt_retry_1",
+    eventType: "payment_intent.payment_failed",
+    providerReference: "pi_test_123",
     ...overrides,
   };
 }
@@ -239,9 +257,85 @@ describe("processStripeWebhookEvent", () => {
     expect(orderCalls).toEqual([{ orderId: "order-1", nextStatus: "PAID" }]);
   });
 
-  it("applies PENDING -> FAILED and does NOT touch the Order", async () => {
+  it("IMP-041-FIX (PR1-F01): a retryableFailure event does NOT transition the Payment and does NOT touch the Order", async () => {
     const payment = makePayment({ status: "PENDING" });
-    const { repository: paymentRepository } = makeFakePaymentRepository(payment);
+    const { repository: paymentRepository, updateStatusIfCurrentCalls } =
+      makeFakePaymentRepository(payment);
+    const { repository: webhookEventRepository, recordCalls } = makeFakeWebhookEventRepository();
+    const { fn: changeOrderStatusFn, calls: orderCalls } = makeFakeChangeOrderStatus();
+
+    const result = await processStripeWebhookEvent(
+      paymentRepository,
+      webhookEventRepository,
+      changeOrderStatusFn,
+      makeVerifyEvent({ ok: true, event: retryableFailureEvent() }),
+      "raw-body",
+      "sig",
+    );
+
+    expect(result).toEqual({
+      outcome: "retryableFailure",
+      payment: expect.objectContaining({ status: "PENDING" }),
+    });
+    expect(updateStatusIfCurrentCalls).toHaveLength(0);
+    expect(orderCalls).toHaveLength(0);
+    // Still recorded for dedup/observability, even though no state changed.
+    expect(recordCalls).toEqual([
+      {
+        provider: "stripe",
+        providerEventId: "evt_retry_1",
+        eventType: "payment_intent.payment_failed",
+        paymentId: "payment-1",
+      },
+    ]);
+  });
+
+  it("IMP-041-FIX (PR1-F01): a failed attempt followed by a genuine success still applies — a retryable failure never blocks a later legitimate success for the SAME PaymentIntent", async () => {
+    const payment = makePayment({ status: "PENDING" });
+    const { repository: paymentRepository, updateStatusIfCurrentCalls } =
+      makeFakePaymentRepository(payment);
+    const { repository: webhookEventRepository } = makeFakeWebhookEventRepository();
+    const { fn: changeOrderStatusFn, calls: orderCalls } = makeFakeChangeOrderStatus();
+
+    const failedAttempt = await processStripeWebhookEvent(
+      paymentRepository,
+      webhookEventRepository,
+      changeOrderStatusFn,
+      makeVerifyEvent({
+        ok: true,
+        event: retryableFailureEvent({ providerEventId: "evt_retry_1" }),
+      }),
+      "raw-body",
+      "sig",
+    );
+    expect(failedAttempt).toEqual({
+      outcome: "retryableFailure",
+      payment: expect.objectContaining({ status: "PENDING" }),
+    });
+
+    const retrySucceeded = await processStripeWebhookEvent(
+      paymentRepository,
+      webhookEventRepository,
+      changeOrderStatusFn,
+      makeVerifyEvent({ ok: true, event: supportedEvent({ providerEventId: "evt_succeeded_1" }) }),
+      "raw-body",
+      "sig",
+    );
+
+    expect(retrySucceeded).toEqual({
+      outcome: "applied",
+      payment: expect.objectContaining({ status: "SUCCEEDED" }),
+    });
+    expect(updateStatusIfCurrentCalls).toEqual([
+      { paymentId: "payment-1", expectedStatus: "PENDING", nextStatus: "SUCCEEDED" },
+    ]);
+    expect(orderCalls).toEqual([{ orderId: "order-1", nextStatus: "PAID" }]);
+  });
+
+  it("IMP-041-FIX (PR1-F01): out-of-order delivery — a retryableFailure event arriving AFTER success is still a no-op and never disturbs the already-SUCCEEDED Payment", async () => {
+    const payment = makePayment({ status: "SUCCEEDED" });
+    const { repository: paymentRepository, updateStatusIfCurrentCalls } =
+      makeFakePaymentRepository(payment);
     const { repository: webhookEventRepository } = makeFakeWebhookEventRepository();
     const { fn: changeOrderStatusFn, calls: orderCalls } = makeFakeChangeOrderStatus();
 
@@ -249,19 +343,49 @@ describe("processStripeWebhookEvent", () => {
       paymentRepository,
       webhookEventRepository,
       changeOrderStatusFn,
-      makeVerifyEvent({
-        ok: true,
-        event: supportedEvent({ outcome: "FAILED", eventType: "payment_intent.payment_failed" }),
-      }),
+      makeVerifyEvent({ ok: true, event: retryableFailureEvent() }),
       "raw-body",
       "sig",
     );
 
     expect(result).toEqual({
-      outcome: "applied",
-      payment: expect.objectContaining({ status: "FAILED" }),
+      outcome: "retryableFailure",
+      payment: expect.objectContaining({ status: "SUCCEEDED" }),
     });
+    expect(updateStatusIfCurrentCalls).toHaveLength(0);
     expect(orderCalls).toHaveLength(0);
+  });
+
+  it("IMP-041-FIX (PR1-F01): duplicate delivery of the SAME retryableFailure event remains a no-op both times", async () => {
+    const payment = makePayment({ status: "PENDING" });
+    const { repository: paymentRepository, updateStatusIfCurrentCalls } =
+      makeFakePaymentRepository(payment);
+    const { repository: webhookEventRepository } = makeFakeWebhookEventRepository();
+    const { fn: changeOrderStatusFn } = makeFakeChangeOrderStatus();
+
+    const first = await processStripeWebhookEvent(
+      paymentRepository,
+      webhookEventRepository,
+      changeOrderStatusFn,
+      makeVerifyEvent({ ok: true, event: retryableFailureEvent() }),
+      "raw-body",
+      "sig",
+    );
+    const duplicate = await processStripeWebhookEvent(
+      paymentRepository,
+      webhookEventRepository,
+      changeOrderStatusFn,
+      makeVerifyEvent({ ok: true, event: retryableFailureEvent() }),
+      "raw-body",
+      "sig",
+    );
+
+    expect(first).toEqual({
+      outcome: "retryableFailure",
+      payment: expect.objectContaining({ status: "PENDING" }),
+    });
+    expect(duplicate).toEqual(first);
+    expect(updateStatusIfCurrentCalls).toHaveLength(0);
   });
 
   it("applies PENDING -> CANCELLED and does NOT touch the Order", async () => {
@@ -317,28 +441,38 @@ describe("processStripeWebhookEvent", () => {
     expect(orderCalls).toEqual([{ orderId: "order-1", nextStatus: "PAID" }]);
   });
 
-  it("treats a duplicate FAILED delivery (Payment already FAILED) as alreadyAtTarget without touching the Order", async () => {
-    const payment = makePayment({ status: "FAILED" });
-    const { repository: paymentRepository } = makeFakePaymentRepository(payment);
+  it("a payment_intent.payment_failed event whose PaymentIntent has itself become canceled maps to CANCELLED, exactly like a direct payment_intent.canceled event", async () => {
+    const payment = makePayment({ status: "PENDING" });
+    const { repository: paymentRepository, updateStatusIfCurrentCalls } =
+      makeFakePaymentRepository(payment);
     const { repository: webhookEventRepository } = makeFakeWebhookEventRepository();
     const { fn: changeOrderStatusFn, calls: orderCalls } = makeFakeChangeOrderStatus();
 
+    // `stripe-webhook.ts`'s own mapper is what actually decides
+    // "canceled vs. retryable" from a payment_intent.payment_failed
+    // event's PaymentIntent status (see stripe-webhook.test.ts) — this
+    // application-layer test only proves that once mapped to a
+    // "supported" CANCELLED event, it is handled identically to a direct
+    // payment_intent.canceled event (never specially re-interpreted here).
     const result = await processStripeWebhookEvent(
       paymentRepository,
       webhookEventRepository,
       changeOrderStatusFn,
       makeVerifyEvent({
         ok: true,
-        event: supportedEvent({ outcome: "FAILED", eventType: "payment_intent.payment_failed" }),
+        event: supportedEvent({ outcome: "CANCELLED", eventType: "payment_intent.payment_failed" }),
       }),
       "raw-body",
       "sig",
     );
 
     expect(result).toEqual({
-      outcome: "alreadyAtTarget",
-      payment: expect.objectContaining({ status: "FAILED" }),
+      outcome: "applied",
+      payment: expect.objectContaining({ status: "CANCELLED" }),
     });
+    expect(updateStatusIfCurrentCalls).toEqual([
+      { paymentId: "payment-1", expectedStatus: "PENDING", nextStatus: "CANCELLED" },
+    ]);
     expect(orderCalls).toHaveLength(0);
   });
 
@@ -366,7 +500,7 @@ describe("processStripeWebhookEvent", () => {
     expect(orderCalls).toHaveLength(0);
   });
 
-  it("never reads or changes Payment.amountMinor/currency — the webhook event carries no monetary fields the mapper even extracts", async () => {
+  it("never overwrites Payment.amountMinor/currency with the event's settled values — they are compared against, never substituted in", async () => {
     const payment = makePayment({ status: "PENDING", amountMinor: 24800, currency: "USD" });
     const { repository: paymentRepository } = makeFakePaymentRepository(payment);
     const { repository: webhookEventRepository } = makeFakeWebhookEventRepository();
@@ -390,6 +524,126 @@ describe("processStripeWebhookEvent", () => {
       expect(result.payment.amountMinor).toBe(24800);
       expect(result.payment.currency).toBe("USD");
     }
+  });
+
+  describe("IMP-041-FIX (PR1-F03): settlement amount/currency validation before SUCCEEDED", () => {
+    it("applies SUCCEEDED when the settled amount and currency exactly match the persisted Payment", async () => {
+      const payment = makePayment({ status: "PENDING", amountMinor: 24800, currency: "USD" });
+      const { repository: paymentRepository, updateStatusIfCurrentCalls } =
+        makeFakePaymentRepository(payment);
+      const { repository: webhookEventRepository } = makeFakeWebhookEventRepository();
+      const { fn: changeOrderStatusFn, calls: orderCalls } = makeFakeChangeOrderStatus();
+
+      const result = await processStripeWebhookEvent(
+        paymentRepository,
+        webhookEventRepository,
+        changeOrderStatusFn,
+        makeVerifyEvent({
+          ok: true,
+          event: supportedEvent({ settledAmountMinor: 24800, settledCurrency: "USD" }),
+        }),
+        "raw-body",
+        "sig",
+      );
+
+      expect(result).toEqual({
+        outcome: "applied",
+        payment: expect.objectContaining({ status: "SUCCEEDED" }),
+      });
+      expect(updateStatusIfCurrentCalls).toHaveLength(1);
+      expect(orderCalls).toEqual([{ orderId: "order-1", nextStatus: "PAID" }]);
+    });
+
+    it("fails closed on an amount mismatch — neither Payment nor Order transitions", async () => {
+      const payment = makePayment({ status: "PENDING", amountMinor: 24800, currency: "USD" });
+      const { repository: paymentRepository, updateStatusIfCurrentCalls } =
+        makeFakePaymentRepository(payment);
+      const { repository: webhookEventRepository } = makeFakeWebhookEventRepository();
+      const { fn: changeOrderStatusFn, calls: orderCalls } = makeFakeChangeOrderStatus();
+
+      const result = await processStripeWebhookEvent(
+        paymentRepository,
+        webhookEventRepository,
+        changeOrderStatusFn,
+        makeVerifyEvent({
+          ok: true,
+          event: supportedEvent({ settledAmountMinor: 19900, settledCurrency: "USD" }),
+        }),
+        "raw-body",
+        "sig",
+      );
+
+      expect(result).toEqual({
+        outcome: "amountMismatch",
+        payment: expect.objectContaining({ status: "PENDING", amountMinor: 24800 }),
+      });
+      expect(updateStatusIfCurrentCalls).toHaveLength(0);
+      expect(orderCalls).toHaveLength(0);
+    });
+
+    it("fails closed on a currency mismatch — neither Payment nor Order transitions", async () => {
+      const payment = makePayment({ status: "PENDING", amountMinor: 24800, currency: "USD" });
+      const { repository: paymentRepository, updateStatusIfCurrentCalls } =
+        makeFakePaymentRepository(payment);
+      const { repository: webhookEventRepository } = makeFakeWebhookEventRepository();
+      const { fn: changeOrderStatusFn, calls: orderCalls } = makeFakeChangeOrderStatus();
+
+      const result = await processStripeWebhookEvent(
+        paymentRepository,
+        webhookEventRepository,
+        changeOrderStatusFn,
+        makeVerifyEvent({
+          ok: true,
+          event: supportedEvent({ settledAmountMinor: 24800, settledCurrency: "EUR" }),
+        }),
+        "raw-body",
+        "sig",
+      );
+
+      expect(result).toEqual({
+        outcome: "amountMismatch",
+        payment: expect.objectContaining({ status: "PENDING", currency: "USD" }),
+      });
+      expect(updateStatusIfCurrentCalls).toHaveLength(0);
+      expect(orderCalls).toHaveLength(0);
+    });
+
+    it("duplicate delivery of a mismatched event is still refused both times — never applied on a retry", async () => {
+      const payment = makePayment({ status: "PENDING", amountMinor: 24800, currency: "USD" });
+      const { repository: paymentRepository, updateStatusIfCurrentCalls } =
+        makeFakePaymentRepository(payment);
+      const { repository: webhookEventRepository } = makeFakeWebhookEventRepository();
+      const { fn: changeOrderStatusFn, calls: orderCalls } = makeFakeChangeOrderStatus();
+      const mismatchedEvent = makeVerifyEvent({
+        ok: true,
+        event: supportedEvent({ settledAmountMinor: 1, settledCurrency: "USD" }),
+      });
+
+      const first = await processStripeWebhookEvent(
+        paymentRepository,
+        webhookEventRepository,
+        changeOrderStatusFn,
+        mismatchedEvent,
+        "raw-body",
+        "sig",
+      );
+      const duplicate = await processStripeWebhookEvent(
+        paymentRepository,
+        webhookEventRepository,
+        changeOrderStatusFn,
+        mismatchedEvent,
+        "raw-body",
+        "sig",
+      );
+
+      expect(first).toEqual({
+        outcome: "amountMismatch",
+        payment: expect.objectContaining({ status: "PENDING" }),
+      });
+      expect(duplicate).toEqual(first);
+      expect(updateStatusIfCurrentCalls).toHaveLength(0);
+      expect(orderCalls).toHaveLength(0);
+    });
   });
 
   it("does not swallow an Order-sync exception — it propagates so the webhook route can return 5xx and let Stripe retry", async () => {

@@ -93,16 +93,22 @@ export async function POST(_request: Request, { params }: RouteParams) {
         // re-fetch status (GET above) rather than resubmit.
         return NextResponse.json({ error: result.error }, { status: 409 });
       case "PAYMENT_NOT_PENDING":
-        // IMP-041: the Payment already reached a terminal status — most
-        // likely the IMP-039 webhook settled it before Order.status
-        // itself caught up (see that milestone's own documented
-        // consistency window). Without `paymentStatus` here, a customer
-        // whose payment actually SUCCEEDED during this window would see
-        // nothing but a generic 409 — the client needs to tell "already
-        // paid" apart from "already failed/cancelled" to display the
-        // correct final state.
+        // IMP-041/IMP-041-FIX (PR1-F05): the Payment already reached a
+        // terminal status — most likely the IMP-039 webhook settled it
+        // before Order.status itself caught up (see that milestone's own
+        // documented consistency window). `paymentStatus` lets the client
+        // tell "already paid" apart from "already failed/canceled";
+        // `orderStatus` (already resolved above by the ownership check,
+        // no extra query) additionally lets it distinguish "Payment
+        // succeeded AND Order is PAID" from "Payment succeeded but Order
+        // sync hasn't caught up yet" — Payment success and Order PAID are
+        // distinct facts, and the client must never conflate them.
         return NextResponse.json(
-          { error: "PAYMENT_NOT_PENDING", paymentStatus: result.payment.status },
+          {
+            error: "PAYMENT_NOT_PENDING",
+            paymentStatus: result.payment.status,
+            orderStatus: order.status,
+          },
           { status: 409 },
         );
       case "PROVIDER_ERROR":

@@ -72,24 +72,39 @@ export async function startOrderPayment(
     return { ok: true, payment: processed.payment, clientSecret: processed.clientSecret };
   }
 
-  if (processed.error === "PROVIDER_REFERENCE_ALREADY_SET" && processed.clientSecret) {
-    // IMP-040's "reuse a valid existing PaymentIntent" requirement: a
-    // concurrent/earlier call already attached the reference this call's
-    // own startPayment resolved too — the secret is still genuinely usable.
-    return { ok: true, payment: processed.payment, clientSecret: processed.clientSecret };
+  if (processed.error === "PROVIDER_REFERENCE_ALREADY_SET") {
+    // IMP-041-FIX (PR1-F02): explicitly check the CURRENT persisted
+    // Payment status before ever treating this as success — never
+    // convert PROVIDER_REFERENCE_ALREADY_SET into a usable clientSecret
+    // merely because one happens to be present. `processPayment` itself
+    // already guards this (see its own doc comment), but the decision of
+    // WHICH outcome to report to the customer-facing caller belongs here,
+    // where `processed.payment.status` is directly available.
+    if (processed.clientSecret && processed.payment.status === "PENDING") {
+      // IMP-040's "reuse a valid existing PaymentIntent" requirement: a
+      // concurrent/earlier call already attached the reference this
+      // call's own startPayment resolved too, and the Payment is still
+      // payable — the secret is still genuinely usable.
+      return { ok: true, payment: processed.payment, clientSecret: processed.clientSecret };
+    }
+    if (processed.payment.status !== "PENDING") {
+      // The Payment reached a terminal status (most likely the IMP-039
+      // webhook settling it) concurrently with this call's own provider
+      // round-trip — report the REAL current status, never a secret for
+      // something no longer payable.
+      return { ok: false, error: "PAYMENT_NOT_PENDING", payment: processed.payment };
+    }
+    // Still PENDING, but no clientSecret could be safely attributed (a
+    // non-compliant provider raced a different reference) — a generic,
+    // retry-worthy outcome rather than a dedicated result variant for a
+    // case this function cannot meaningfully act on differently.
+    return { ok: false, error: "PROVIDER_ERROR" };
   }
 
-  if (
-    processed.error === "PAYMENT_NOT_FOUND" ||
-    processed.error === "PROVIDER_REFERENCE_ALREADY_SET"
-  ) {
-    // PAYMENT_NOT_FOUND cannot realistically happen (paymentId was just
-    // resolved moments earlier); PROVIDER_REFERENCE_ALREADY_SET without a
-    // usable clientSecret means no secret could be safely attributed to
-    // the persisted reference (see `ProcessPaymentResult`'s own doc
-    // comment). Both fold into the same generic, retry-worthy outcome
-    // rather than inventing dedicated result variants for cases this
-    // function cannot meaningfully act on differently.
+  if (processed.error === "PAYMENT_NOT_FOUND") {
+    // Cannot realistically happen — paymentId was just resolved moments
+    // earlier. Folded into the same generic, retry-worthy outcome rather
+    // than inventing a dedicated result variant for an unreachable case.
     return { ok: false, error: "PROVIDER_ERROR" };
   }
 

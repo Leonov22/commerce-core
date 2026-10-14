@@ -68,8 +68,17 @@ function makeFakePaymentRepository(
     async findByOrderId() {
       throw new Error("not used by these tests");
     },
-    async updateStatusIfCurrent() {
-      throw new Error("not used by these tests");
+    async updateStatusIfCurrent(paymentId, expectedStatus, nextStatus) {
+      // IMP-041-FIX (PR1-F02): genuinely functional (mirroring the real
+      // `WHERE id = ? AND status = ?` conditional write) — needed so a
+      // fake `PaymentProvider` can deterministically simulate the IMP-039
+      // webhook committing a status change concurrently, without any
+      // test relying on real threads/timing.
+      if (!current || current.id !== paymentId || current.status !== expectedStatus) {
+        return null;
+      }
+      current = { ...current, status: nextStatus };
+      return current;
     },
     async setProviderReferenceIfPending(
       paymentId: string,
@@ -412,6 +421,36 @@ describe("processPayment", () => {
       // already persisted, so its clientSecret is safe to surface — unlike
       // the mismatched-reference case above, where it is correctly omitted.
       clientSecret: "compliant-ref-1-secret",
+    });
+  });
+
+  it("IMP-041-FIX (PR1-F02): a Payment that transitions to a terminal status BETWEEN the provider's response and the conditional provider-reference persistence never surfaces a usable clientSecret", async () => {
+    // Deterministic construction of the exact race PR1-F02 describes: the
+    // Payment already has a providerReference attached (an earlier
+    // successful start), and — simulating the IMP-039 webhook committing
+    // concurrently, in the narrow gap between this call's own
+    // `startPayment` response and its `setProviderReferenceIfPending`
+    // attempt — this provider's `startPayment` itself flips the SAME
+    // repository's Payment to CANCELLED before returning its (otherwise
+    // valid, same-reference) result. No real concurrency/threads needed:
+    // the provider fake's own side effect deterministically reproduces
+    // the ordering that matters.
+    const payment = makePayment({ providerReference: "pi_abc" });
+    const { repository } = makeFakePaymentRepository(payment);
+    const provider: PaymentProvider = {
+      async startPayment() {
+        await repository.updateStatusIfCurrent(payment.id, "PENDING", "CANCELLED");
+        return { ok: true, providerReference: "pi_abc", clientSecret: "cs_abc" };
+      },
+    };
+
+    const result = await processPayment(repository, provider, payment.id);
+
+    expect(result).toEqual({
+      ok: false,
+      error: "PROVIDER_REFERENCE_ALREADY_SET",
+      payment: expect.objectContaining({ status: "CANCELLED", providerReference: "pi_abc" }),
+      clientSecret: undefined,
     });
   });
 

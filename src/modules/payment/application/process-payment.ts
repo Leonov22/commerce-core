@@ -54,15 +54,20 @@ export type ProcessPaymentResult =
    *      codebase); if one is ever introduced, revisit whether these two
    *      causes still deserve a single result code.
    *
-   * `clientSecret` (IMP-040) is included ONLY when THIS call's own
-   * `startPayment` result resolved the SAME `providerReference` that is
-   * actually persisted (i.e. this call observed its own prior success, or
-   * a compliant provider's idempotent replay of someone else's) —
-   * `undefined` otherwise (e.g. a non-compliant provider that minted an
-   * unrelated reference while racing a different, already-persisted one).
-   * A frontend receiving this branch without a `clientSecret` must
-   * re-fetch payment status rather than retry — the secret genuinely
-   * cannot be safely inferred.
+   * `clientSecret` (IMP-040) is included ONLY when BOTH: (1) THIS call's
+   * own `startPayment` result resolved the SAME `providerReference` that
+   * is actually persisted (i.e. this call observed its own prior success,
+   * or a compliant provider's idempotent replay of someone else's), AND
+   * (2) the current persisted Payment is still `PENDING` — `undefined`
+   * otherwise. Condition (2) is IMP-041-FIX (PR1-F02): without it, a
+   * Payment the IMP-039 webhook concurrently settled to `FAILED`/
+   * `CANCELLED`/`SUCCEEDED` between this call's provider round-trip and
+   * this exact check would still have the SAME (unchanged)
+   * `providerReference` on record — condition (1) alone would then wrongly
+   * hand back a usable client secret for a PaymentIntent that is no
+   * longer payable. A frontend receiving this branch without a
+   * `clientSecret` must re-fetch payment status rather than retry — the
+   * secret genuinely cannot be safely inferred.
    */
   | {
       ok: false;
@@ -223,13 +228,18 @@ export async function processPayment(
     // between these two calls (Payments are never deleted), so this is
     // always non-null in practice.
     const current = await paymentRepository.findById(payment.id);
-    // IMP-040: only surface this call's own clientSecret if it actually
-    // resolved the reference that ended up persisted — see
-    // `ProcessPaymentResult`'s doc comment for why a mismatch (a
-    // non-compliant provider racing a different, already-set reference)
-    // must never hand back a secret for the wrong PaymentIntent.
+    // IMP-040/IMP-041-FIX (PR1-F02): only surface this call's own
+    // clientSecret if it actually resolved the reference that ended up
+    // persisted AND the Payment is still PENDING — see
+    // `ProcessPaymentResult`'s doc comment for why either a reference
+    // mismatch (a non-compliant provider racing a different,
+    // already-set reference) or a status that has since gone terminal
+    // (e.g. the IMP-039 webhook settled it concurrently) must never hand
+    // back a secret for a PaymentIntent that is no longer payable.
     const clientSecret =
-      current?.providerReference === result.providerReference ? result.clientSecret : undefined;
+      current?.providerReference === result.providerReference && current.status === "PENDING"
+        ? result.clientSecret
+        : undefined;
     return {
       ok: false,
       error: "PROVIDER_REFERENCE_ALREADY_SET",

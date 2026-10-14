@@ -203,9 +203,30 @@ describe("POST /api/orders/[id]/payment", () => {
       expect(await response.json()).toEqual({
         error: "PAYMENT_NOT_PENDING",
         paymentStatus,
+        orderStatus: "PENDING",
       });
     },
   );
+
+  it("IMP-041-FIX (PR1-F05): includes the Order's own current status, distinguishing 'Payment succeeded, Order sync still pending' from 'Payment succeeded, Order already PAID'", async () => {
+    resetMocks();
+    mockGetCurrentUser.mockResolvedValueOnce({ id: "user-1" });
+    mockGetCustomerOrder.mockResolvedValueOnce({ ...fakeOrder, status: "PAID" });
+    mockStartOrderPayment.mockResolvedValueOnce({
+      ok: false,
+      error: "PAYMENT_NOT_PENDING",
+      payment: { ...fakePayment, status: "SUCCEEDED" },
+    });
+
+    const response = await POST(makeRequest("POST"), routeContext());
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      error: "PAYMENT_NOT_PENDING",
+      paymentStatus: "SUCCEEDED",
+      orderStatus: "PAID",
+    });
+  });
 
   it("returns 500 INTERNAL_ERROR and never leaks the underlying error when startOrderPayment throws", async () => {
     resetMocks();

@@ -2628,6 +2628,7 @@ IMP-038 — Customer Authentication Completion (real scope; supersedes the "Paym
 IMP-039 — Asynchronous Payment Lifecycle (Stripe webhook processing — see Section 26)	COMPLETED — real Stripe verification NOT performed, no STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET configured in this environment (see Section 26)
 IMP-040 — Customer Payment UI & Stripe Checkout (the "Payment UI & Stripe Customer Flow" direction originally speculated for IMP-038 in Section 16, now implemented under its own number — see Section 27)	COMPLETED — real Stripe/browser verification NOT performed, no Stripe credentials configured in this environment (see Section 27); CR-040-01 found and fixed by IMP-041 (see Section 28)
 IMP-041 — Stripe Test-Mode & Browser E2E Verification	COMPLETED (review + defect fix) — real Stripe test-mode and browser E2E verification BLOCKED, missing credentials/tooling in this environment, exact prerequisites documented (see Section 28)
+IMP-041-FIX — Payment Correctness Before Merge (PR1-F01 through PR1-F05)	COMPLETED — independent Code Review's REQUEST CHANGES addressed; real Stripe test-mode and browser E2E verification remain BLOCKED (see Section 29)
 Next milestone	NOT YET APPROVED
 24. Source of Truth
 
@@ -3490,3 +3491,251 @@ NEEDS FURTHER FIXES completed (CR-040-01, done, included in this
 commit) — otherwise READY FOR CODE REVIEW, with Browser E2E and Stripe
 test-mode verification EXPLICITLY BLOCKED pending external environment
 setup (credentials + browser tooling), not represented as passed.
+
+29. IMP-041-FIX — Payment Correctness Before Merge (PR1-F01 through PR1-F05)
+
+Status
+
+COMPLETED, pending return to Code Review. An independent Code Review of
+PR #1 (branch `feat/imp-040-customer-payment-ui`) returned REQUEST
+CHANGES with five findings, PR1-F01 through PR1-F05. All five were
+verified against the actual code (not assumed correct from the review's
+description alone) and addressed. Commit SHA recorded once created; do
+not treat any SHA embedded in this entry before that point as
+authoritative, per this document's established convention.
+
+PR1-F01 — Retryable Stripe Payment Failures
+
+Root cause: Stripe's `PaymentIntent.Status` has no `"failed"` value at
+all — after one declined payment ATTEMPT, a PaymentIntent normally
+returns to `requires_payment_method`, fully retryable with a new payment
+method via the SAME PaymentIntent/`client_secret`. The webhook mapper
+(`stripe-webhook.ts`) nonetheless mapped every `payment_intent.payment_failed`
+event straight to a terminal internal `FAILED` status, which could
+permanently block a legitimate subsequent success for the same
+PaymentIntent.
+
+Fix: `mapSupportedEvent` now reads the PaymentIntent's own CURRENT
+`status` already present on the event payload (no extra Stripe API call
+needed) — if `"canceled"`, maps to a terminal `CANCELLED` outcome
+(unreusable, exactly like a direct `payment_intent.canceled` event); any
+other status produces a new `{ kind: "retryableFailure" }` event shape
+that `process-stripe-webhook-event.ts` treats as a pure no-op: the
+Payment is resolved (for dedup/observability only) and left exactly as
+it was, still `PENDING`, still payable. `PaymentEventOutcome` (the
+webhook mapper's own vocabulary) no longer includes `"FAILED"` at all —
+domain `PaymentStatus.FAILED` itself is unchanged and still exists (per
+this fix's own instruction not to add/remove `PaymentStatus` values
+without a verified need), it is simply never produced by this webhook
+path anymore.
+
+Changed files: `stripe-webhook.ts`, `stripe-webhook.test.ts`,
+`process-stripe-webhook-event.ts`, `process-stripe-webhook-event.test.ts`,
+`src/app/api/webhooks/stripe/route.ts`, `route.test.ts` (the new
+`retryableFailure` outcome added to the acknowledged-200 switch).
+
+Tests added: a retryable failure causes no transition; a failed attempt
+followed by a genuine success still applies (the core of this fix); an
+out-of-order retryable-failure event arriving AFTER success remains a
+no-op; duplicate delivery of the same retryable-failure event stays a
+no-op both times; a `payment_intent.payment_failed` event whose
+PaymentIntent has itself become `canceled` maps to CANCELLED, both at
+the mapper level (`stripe-webhook.test.ts`, every other retryable status
+value parametrized) and the application level
+(`process-stripe-webhook-event.test.ts`).
+
+No unresolved limitation specific to this finding.
+
+PR1-F02 — Terminal States Must Never Present as Paid
+
+Root cause: `process-payment.ts`'s `PROVIDER_REFERENCE_ALREADY_SET`
+branch checked only that the re-fetched Payment's `providerReference`
+matched this call's own `startPayment` result — never the Payment's
+CURRENT `status`. Once a Payment already has a `providerReference` set
+(from an earlier successful start), that reference never changes
+regardless of what status it later reaches — so if the IMP-039 webhook
+concurrently settled the Payment to `FAILED`/`CANCELLED`/`SUCCEEDED`
+between this call's own provider round-trip and its conditional
+persistence attempt, the reference-only check still matched, and
+`startOrderPayment` converted this into an `ok: true` result with a
+USABLE `clientSecret` for a PaymentIntent that was no longer payable.
+
+Fix, at both layers (defense in depth): `process-payment.ts` now also
+requires `current.status === "PENDING"` before including `clientSecret`
+in a `PROVIDER_REFERENCE_ALREADY_SET` result. `start-order-payment.ts`
+makes the explicit routing decision using `processed.payment.status`
+directly: still `PENDING` + a clientSecret → genuine "reuse a valid
+existing PaymentIntent" success; any OTHER status → `PAYMENT_NOT_PENDING`
+with the real current Payment (never a usable secret for something no
+longer payable); `PENDING` but no clientSecret available → generic
+`PROVIDER_ERROR`.
+
+Changed files: `process-payment.ts`, `process-payment.test.ts`,
+`start-order-payment.ts`, `start-order-payment.test.ts`.
+
+Tests added: a DETERMINISTIC reproduction of the exact race (no reliance
+on real concurrency/timing) at both the `processPayment` level and the
+`startOrderPayment` (API-result) level — a fake `PaymentProvider` whose
+`startPayment` implementation itself calls the shared fake repository's
+`updateStatusIfCurrent` to flip the Payment to `CANCELLED` BEFORE
+returning its (otherwise valid, same-reference) result, proving neither
+layer ever surfaces a usable `clientSecret` for the now-terminal Payment.
+
+No unresolved limitation specific to this finding.
+
+PR1-F03 — Settlement Amount/Currency Validation
+
+Root cause: `mapSupportedEvent` discarded the event's own amount/currency
+fields entirely — a verified, signature-checked `payment_intent.succeeded`
+event could transition a Payment to `SUCCEEDED` without ever confirming
+the settled amount actually matched the persisted, authoritative
+`Payment.amountMinor`/`currency`.
+
+Fix: the event mapper now extracts `amount_received` (confirmed via the
+installed Stripe SDK's own type definitions to be the field representing
+what was ACTUALLY collected — not `amount`, which is merely what was
+INTENDED to be collected at creation) and `currency`, threaded through as
+`settledAmountMinor`/`settledCurrency` on the "supported" event shape.
+`process-stripe-webhook-event.ts` compares these against the persisted
+Payment BEFORE ever calling `settlePaymentTransition` for a `SUCCEEDED`
+outcome — on a mismatch, neither Payment nor Order transitions, a new
+`amountMismatch` outcome is returned, logged with payment/event
+identifiers and a `mismatchType` category (`amount`/`currency`/
+`amount_and_currency`) only — never a raw payload, never any secret.
+The webhook route acknowledges this outcome with 200 (`received: true`),
+deliberately never a 5xx: a genuine settlement mismatch is a data
+anomaly a webhook retry cannot resolve, so acknowledging avoids an
+endless Stripe retry loop, exactly like the pre-existing `conflict`
+outcome already does for a different kind of anomaly.
+
+Changed files: `stripe-webhook.ts`, `stripe-webhook.test.ts`,
+`process-stripe-webhook-event.ts`, `process-stripe-webhook-event.test.ts`,
+`src/app/api/webhooks/stripe/route.ts`, `route.test.ts`.
+
+Tests added: exact amount/currency match still applies; an amount
+mismatch fails closed (neither Payment nor Order transitions); a
+currency mismatch fails closed; duplicate delivery of a mismatched event
+is refused both times, never applied on a retry; `amount_received`
+(not `amount`) is confirmed as the field actually read.
+
+No unresolved limitation specific to this finding.
+
+PR1-F04 — Remove the Misleading Guest Payment CTA
+
+Root cause: `CheckoutSuccess` told an unauthenticated (guest) customer to
+"Sign in to pay for this order" — but the authenticated payment route
+requires session ownership of the Order (`getCustomerOrder`), and a
+guest Order has no `userId` any session could ever match. Signing in (or
+registering) could never actually unlock payment for that specific
+Order — the CTA promised something the application cannot deliver, and
+this fix does not build a guest-order-linking mechanism to make it true
+(explicitly out of scope).
+
+Fix: `CheckoutSuccess` no longer shows a "pay" CTA of any kind to a
+guest — only the honest `guestPaymentUnavailable` message ("This order
+was placed as a guest. This preview doesn't yet support paying for a
+guest order through an account — signing in won't give you access to
+it.") plus "Continue shopping". The authenticated path (`payNow` → `/account/orders/[id]`)
+is completely unchanged. The now-unused `success.signInToPay` i18n key
+was removed rather than left dangling.
+
+Changed files: `checkout-success.tsx`, `en.json`.
+
+No test added: `checkout-success.tsx` is a plain presentational
+component with no branching logic beyond the `isAuthenticated` prop
+already exercised by the existing checkout flow, and this project's
+Vitest config has no JSX/component-rendering support (unchanged
+limitation, consistent with every earlier milestone that hit it) — this
+is manual/browser verification territory, disclosed as such below rather
+than fabricated.
+
+PR1-F05 — Distinguish Payment Success from Order Paid
+
+Root cause: IMP-041's own earlier fix (CR-040-01) correctly recognized a
+`SUCCEEDED` Payment during the IMP-039 consistency window, but its
+success copy ("Payment received. This order is now paid.") still
+conflated Payment success with the Order actually being `PAID` — exactly
+the distinction the architecture section of this fix explicitly
+requires ("Payment success and Order status PAID are distinct facts").
+
+Fix: `POST /api/orders/[id]/payment`'s `PAYMENT_NOT_PENDING` 409 response
+now also includes `orderStatus` (already resolved by the route's own
+ownership check — no additional query). `OrderPaymentPanel`'s rendering
+is rebuilt around a single `SettledStatusBox` helper, shared by every
+terminal-status call site, that renders: `SUCCEEDED` + Order `PAID` →
+"paid" confirmation; `SUCCEEDED` + Order still `PENDING` → "payment
+confirmed, Order status updating" (never claims the Order is already
+paid); `FAILED` → a distinct failed message; `CANCELLED` → a distinct
+canceled message; anything else (including a status this panel has
+never seen) → treated as unknown, never inferred as success — enforced
+by a closed `KnownPaymentStatus` vocabulary (`toKnownPaymentStatus`) a
+raw string cannot bypass. `ReconciliationPoller` now reports the full
+settled status (Payment status + Order status) to its caller instead of
+a bare boolean, so both `OrderPaymentPanel` and `PaymentForm` render
+through the same `SettledStatusBox` rather than duplicating (and
+potentially diverging) presentation logic. Reconciliation remains
+bounded (6 attempts, 2 seconds apart, unchanged) and never starts a new
+payment attempt during a status refresh.
+
+Changed files: `src/app/api/orders/[id]/payment/route.ts`, `route.test.ts`,
+`order-payment-panel.tsx`, `en.json` (new `paymentConfirmedOrderUpdating`/
+`failed`/`canceled` keys).
+
+Tests added: the route's `PAYMENT_NOT_PENDING` response is verified to
+include `orderStatus` alongside `paymentStatus`, including the exact
+consistency-window combination (Payment `SUCCEEDED`, Order still
+`PENDING`) that originally triggered CR-040-01, and the fully-settled
+combination (Payment `SUCCEEDED`, Order `PAID`) side by side, proving
+the route-level data the UI needs is now present and correct for both.
+`order-payment-panel.tsx` itself has no automated test (same JSX/
+rendering limitation as PR1-F04) — its correct behavior is verified by
+code reading only, disclosed as such below.
+
+No unresolved limitation specific to this finding.
+
+Tests, Typecheck, Lint, Formatting, Build
+
+`pnpm test`: 452 passing + 3 skipped (455 total), 39 test files — up
+from the pre-existing 434 passing + 3 skipped (437); zero regressions.
+`pnpm typecheck`: clean. `pnpm lint`: clean. `pnpm format:check`: limited
+to the same two pre-existing, unrelated warnings already noted for
+every prior milestone (`next.config.ts`, `pnpm-workspace.yaml`). `pnpm
+build`: succeeded completely on the first attempt — all 17 routes
+compiled/prerendered.
+
+Browser E2E / Stripe Test-Mode Verification
+
+Both remain BLOCKED, unchanged from IMP-041's own disclosure (Section
+28) — no browser automation tool and no Stripe credentials are
+available in this environment. REAL STRIPE VERIFICATION: NOT PERFORMED.
+`OrderPaymentPanel`'s and `CheckoutSuccess`'s corrected rendering logic
+(PR1-F02/PR1-F04/PR1-F05) has been verified by code reading against
+every status combination it branches on, never by actually rendering it
+in a browser — this is disclosed explicitly rather than claimed as
+tested.
+
+Remaining Limitations
+
+1. Browser E2E and Stripe test-mode verification — same exact missing
+   prerequisites as IMP-041 (Section 28): a browser automation tool, and
+   `STRIPE_SECRET_KEY`/`STRIPE_WEBHOOK_SECRET`/
+   `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` plus the Stripe CLI.
+2. The IMP-039 Payment/Order consistency window (Section 26) remains
+   architecturally unresolved by design (no cross-module transaction) —
+   PR1-F05's fix makes the CUSTOMER-FACING display correct during that
+   window, it does not close the window itself.
+3. Guest checkout orders remain unpayable through this application after
+   PR1-F04 — this is now accurately disclosed to the customer rather than
+   silently gapped or misleadingly promised, but the underlying
+   limitation (no guest-order-linking mechanism) is unchanged and was
+   explicitly out of this fix's scope.
+
+Recommendation
+
+READY TO RETURN TO CODE REVIEW. All five REQUEST CHANGES findings
+(PR1-F01 through PR1-F05) were verified against the actual code and
+corrected, with regression tests added for each; the full test suite,
+typecheck, lint, and build all pass. Browser E2E and real Stripe
+test-mode verification remain explicitly BLOCKED pending external
+environment setup (credentials + browser tooling) and are not
+represented as passed.

@@ -63,19 +63,24 @@ describe("POST /api/webhooks/stripe", () => {
     expect(await response.json()).toEqual({ error: "INVALID_SIGNATURE" });
   });
 
-  it.each(["ignored", "unknownPayment", "conflict", "applied", "alreadyAtTarget"])(
-    "returns 200 { received: true } for outcome %s — Stripe must not retry",
-    async (outcome) => {
-      mockProcessStripeWebhookEvent.mockClear();
-      mockProcessStripeWebhookEvent.mockResolvedValueOnce({ outcome });
-      const request = makeRequest("body", { "stripe-signature": "sig" });
+  it.each([
+    "ignored",
+    "unknownPayment",
+    "conflict",
+    "applied",
+    "alreadyAtTarget",
+    "retryableFailure",
+    "amountMismatch",
+  ])("returns 200 { received: true } for outcome %s — Stripe must not retry", async (outcome) => {
+    mockProcessStripeWebhookEvent.mockClear();
+    mockProcessStripeWebhookEvent.mockResolvedValueOnce({ outcome });
+    const request = makeRequest("body", { "stripe-signature": "sig" });
 
-      const response = await POST(request);
+    const response = await POST(request);
 
-      expect(response.status).toBe(200);
-      expect(await response.json()).toEqual({ received: true });
-    },
-  );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ received: true });
+  });
 
   it("returns 500 INTERNAL_ERROR and never leaks the underlying error when processing throws", async () => {
     mockProcessStripeWebhookEvent.mockClear();

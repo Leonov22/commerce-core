@@ -23,7 +23,21 @@ export type ProcessStripeWebhookEventResult =
   | { outcome: "unknownPayment" }
   | { outcome: "conflict"; payment: Payment }
   | { outcome: "applied"; payment: Payment }
-  | { outcome: "alreadyAtTarget"; payment: Payment };
+  | { outcome: "alreadyAtTarget"; payment: Payment }
+  /**
+   * IMP-041-FIX (PR1-F01): a `payment_intent.payment_failed` event whose
+   * PaymentIntent remains retryable — no transition happened at all, the
+   * Payment is exactly as it was before this event, still `PENDING` and
+   * still payable through its existing `providerReference`/client secret.
+   */
+  | { outcome: "retryableFailure"; payment: Payment }
+  /**
+   * IMP-041-FIX (PR1-F03): a `payment_intent.succeeded` event whose
+   * settled amount/currency does NOT match the authoritative, persisted
+   * Payment — refused, never applied. The Payment is untouched (still
+   * whatever it was before this event).
+   */
+  | { outcome: "amountMismatch"; payment: Payment };
 
 interface SettleResult {
   outcome: "applied" | "alreadyAtTarget" | "conflict";
@@ -118,6 +132,32 @@ async function settlePaymentTransition(
  * already-fully-processed event still short-circuits fast in the common
  * case, without weakening this retry-driven recovery path, since the
  * dedup result is never treated as proof that no work remains.
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * RETRYABLE FAILURES ARE A NO-OP (IMP-041-FIX, PR1-F01)
+ * ═══════════════════════════════════════════════════════════════════════
+ * `event.kind === "retryableFailure"` means Stripe reported one failed
+ * payment ATTEMPT while the PaymentIntent itself remains open for retry
+ * (see `stripe-webhook.ts`'s own doc comment). This function resolves the
+ * Payment (for observability/dedup only) and returns WITHOUT ever calling
+ * `settlePaymentTransition` — no write happens, the Payment stays exactly
+ * as it was. This is what lets a genuinely later `payment_intent.succeeded`
+ * for the same PaymentIntent still apply normally afterward.
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * SETTLEMENT INTEGRITY BEFORE SUCCEEDED (IMP-041-FIX, PR1-F03)
+ * ═══════════════════════════════════════════════════════════════════════
+ * Before ever applying a `SUCCEEDED` transition, this function compares
+ * the event's own `settledAmountMinor`/`settledCurrency` (Stripe's
+ * `amount_received`/`currency` — see `stripe-webhook.ts`) against the
+ * persisted, authoritative `Payment.amountMinor`/`currency`. A mismatch
+ * fails closed: no Payment transition, no Order transition, logged with
+ * identifiers and a mismatch category only (never a raw payload or any
+ * secret). This is never retried automatically — a genuine mismatch is a
+ * data anomaly a webhook retry cannot resolve, so it is acknowledged
+ * (never a 5xx) exactly like the pre-existing `conflict` outcome already
+ * is, to avoid an endless Stripe retry loop over something retrying can
+ * never fix.
  */
 export async function processStripeWebhookEvent(
   paymentRepository: PaymentRepository,
@@ -158,6 +198,35 @@ export async function processStripeWebhookEvent(
     eventType: event.eventType,
     paymentId: payment.id,
   });
+
+  if (event.kind === "retryableFailure") {
+    console.warn(
+      "[payment/process-stripe-webhook-event] retryable payment attempt failure — Payment remains PENDING for retry",
+      { paymentId: payment.id, providerEventId: event.providerEventId },
+    );
+    return { outcome: "retryableFailure", payment };
+  }
+
+  if (
+    event.outcome === "SUCCEEDED" &&
+    (event.settledAmountMinor !== payment.amountMinor || event.settledCurrency !== payment.currency)
+  ) {
+    console.error(
+      "[payment/process-stripe-webhook-event] settlement amount/currency mismatch — refusing to mark Payment SUCCEEDED",
+      {
+        paymentId: payment.id,
+        providerEventId: event.providerEventId,
+        mismatchType:
+          event.settledAmountMinor !== payment.amountMinor &&
+          event.settledCurrency !== payment.currency
+            ? "amount_and_currency"
+            : event.settledAmountMinor !== payment.amountMinor
+              ? "amount"
+              : "currency",
+      },
+    );
+    return { outcome: "amountMismatch", payment };
+  }
 
   const settled = await settlePaymentTransition(paymentRepository, payment, event.outcome);
 

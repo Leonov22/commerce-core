@@ -274,6 +274,42 @@ describe("startOrderPayment", () => {
     });
   });
 
+  it("IMP-041-FIX (PR1-F02): a Payment that races to a terminal status mid-flight is never reported as a usable success — the API-level result correctly maps to PAYMENT_NOT_PENDING", async () => {
+    // Mirrors `process-payment.test.ts`'s own deterministic PR1-F02 test,
+    // one layer up: proves the customer-facing `StartOrderPaymentResult`
+    // itself — not just the underlying `ProcessPaymentResult` — never
+    // leaks a usable clientSecret for a Payment that settled to a
+    // terminal status in the gap between the provider's response and the
+    // conditional provider-reference persistence.
+    const order = makeOrder();
+    const existingPayment: Payment = {
+      id: "payment-1",
+      orderId: order.id,
+      status: "PENDING",
+      amountMinor: order.totalAmountMinor,
+      currency: order.currency,
+      providerReference: "pi_abc",
+      providerStartAttemptedAt: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    const { repository } = makeFakePaymentRepository(existingPayment);
+    const provider: PaymentProvider = {
+      async startPayment() {
+        await repository.updateStatusIfCurrent("payment-1", "PENDING", "CANCELLED");
+        return { ok: true, providerReference: "pi_abc", clientSecret: "cs_abc" };
+      },
+    };
+
+    const result = await startOrderPayment(repository, provider, makeGetOrder(order), order.id);
+
+    expect(result).toEqual({
+      ok: false,
+      error: "PAYMENT_NOT_PENDING",
+      payment: expect.objectContaining({ status: "CANCELLED", providerReference: "pi_abc" }),
+    });
+  });
+
   it("propagates PROVIDER_ERROR when the provider fails, and persists nothing", async () => {
     const order = makeOrder();
     const { repository } = makeFakePaymentRepository();

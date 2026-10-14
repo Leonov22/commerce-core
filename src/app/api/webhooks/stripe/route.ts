@@ -39,11 +39,17 @@ export async function POST(request: Request) {
       case "conflict":
       case "applied":
       case "alreadyAtTarget":
+      case "retryableFailure":
+      case "amountMismatch":
         // All acknowledged: Stripe must not retry any of these. `ignored`
         // (an event type this milestone doesn't act on),
         // `unknownPayment`/`conflict` (logged anomalies retrying cannot
-        // resolve), and `applied`/`alreadyAtTarget` (successful — including
-        // an already-fully-processed duplicate delivery) are all terminal
+        // resolve), `applied`/`alreadyAtTarget` (successful — including an
+        // already-fully-processed duplicate delivery), `retryableFailure`
+        // (IMP-041-FIX: a failed attempt whose PaymentIntent remains open
+        // — no transition was needed, not a reason to retry the webhook
+        // itself), and `amountMismatch` (IMP-041-FIX: a genuine settlement
+        // data anomaly a webhook retry cannot resolve) are all terminal
         // outcomes from this delivery's perspective.
         return NextResponse.json({ received: true }, { status: 200 });
       default:
