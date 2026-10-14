@@ -31,7 +31,11 @@ function makeFakePaymentProvider(
       }
       nextId += 1;
       const prefix = options.providerReferencePrefix ?? "fake-provider-ref";
-      return { ok: true, providerReference: `${prefix}-${nextId}` };
+      return {
+        ok: true,
+        providerReference: `${prefix}-${nextId}`,
+        clientSecret: `${prefix}-${nextId}-secret`,
+      };
     },
   };
 
@@ -62,12 +66,12 @@ function makeFakeCompliantPaymentProvider(): {
       calls.push(input);
       const existing = referencesByPaymentId.get(input.paymentId);
       if (existing) {
-        return { ok: true, providerReference: existing };
+        return { ok: true, providerReference: existing, clientSecret: `${existing}-secret` };
       }
       nextId += 1;
       const providerReference = `compliant-ref-${nextId}`;
       referencesByPaymentId.set(input.paymentId, providerReference);
-      return { ok: true, providerReference };
+      return { ok: true, providerReference, clientSecret: `${providerReference}-secret` };
     },
   };
 
@@ -120,12 +124,12 @@ function makeFakeCompliantPaymentProviderWithBarrier(expectedConcurrentCalls: nu
 
       const existing = referencesByPaymentId.get(input.paymentId);
       if (existing) {
-        return { ok: true, providerReference: existing };
+        return { ok: true, providerReference: existing, clientSecret: `${existing}-secret` };
       }
       nextId += 1;
       const providerReference = `compliant-ref-${nextId}`;
       referencesByPaymentId.set(input.paymentId, providerReference);
-      return { ok: true, providerReference };
+      return { ok: true, providerReference, clientSecret: `${providerReference}-secret` };
     },
   };
 
@@ -181,7 +185,11 @@ describe("PaymentProvider contract", () => {
     const { provider } = makeFakePaymentProvider({ providerReferencePrefix: "via-port" });
     const result = await chargeViaProvider(provider, validInput);
 
-    expect(result).toEqual({ ok: true, providerReference: "via-port-1" });
+    expect(result).toEqual({
+      ok: true,
+      providerReference: "via-port-1",
+      clientSecret: "via-port-1-secret",
+    });
   });
 
   it("different Payments produce independent provider references", async () => {

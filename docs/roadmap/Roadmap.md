@@ -2440,8 +2440,8 @@ SUPERSEDED: the Architect-approved IMP-038 ticket redefined this
 milestone's actual scope to "Customer Authentication Completion"
 (Section 25) instead — fixing stale post-login/post-registration
 navigation, not Payment UI. The Payment UI / Stripe customer-flow
-direction speculated above remains a legitimate future milestone if the
-Architect still wants it, under a different milestone number.
+direction speculated above was later implemented under its own number —
+see IMP-040 — Customer Payment UI & Stripe Checkout (Section 27).
 
 IMP-039 — Asynchronous Payment Lifecycle. Future milestone for Stripe
 webhook/event processing, asynchronous payment state changes, Payment
@@ -2626,7 +2626,7 @@ IMP-036 — Storefront & Customer UX Foundation (incl. IMP-036-FIX-01)	COMPLETED
 IMP-037 — Product Discovery & Product Details Vertical Slice (incl. IMP-037-FIX-01 / CR-037-01-SEED, IMP-037-FIX-02 / CR-037-FIX-01)	COMPLETED — manual/browser verification NOT performed (see Section 13); supersedes the "Checkout & Order Customer Flow" direction originally speculated for IMP-037 in Section 16
 IMP-038 — Customer Authentication Completion (real scope; supersedes the "Payment UI & Stripe Customer Flow" direction originally speculated for IMP-038 in Section 16 — see Section 25)	COMPLETED — commit e49e3dadcc0d03be084c182cadcd3ca1748f06ff (parent 5401ace68856bdafa67d172b56c628da15529499); manual/browser verification NOT performed (see Section 25)
 IMP-039 — Asynchronous Payment Lifecycle (Stripe webhook processing — see Section 26)	COMPLETED — real Stripe verification NOT performed, no STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET configured in this environment (see Section 26)
-Payment UI & Stripe Customer Flow (originally speculated as IMP-038, superseded — see Section 16)	PLANNED — direction only, unassigned milestone number, NOT YET APPROVED
+IMP-040 — Customer Payment UI & Stripe Checkout (the "Payment UI & Stripe Customer Flow" direction originally speculated for IMP-038 in Section 16, now implemented under its own number — see Section 27)	COMPLETED — real Stripe/browser verification NOT performed, no Stripe credentials configured in this environment (see Section 27)
 Next milestone	NOT YET APPROVED
 24. Source of Truth
 
@@ -3088,3 +3088,236 @@ infrastructure, Redis/Kafka/RabbitMQ, CQRS, WebSockets, polling, a new
 authentication system, and a generic webhook framework — none of this
 was introduced. No new `PaymentStatus` value was added. No unrelated
 Catalog/Cart/Checkout/Identity file was modified.
+
+27. IMP-040 — Customer Payment UI & Stripe Checkout
+
+Status
+
+COMPLETED, pending Code Review. The "Payment UI & Stripe Customer Flow"
+direction speculated for IMP-038 in Section 16 (superseded there by
+Customer Authentication Completion) is implemented here, under its own
+number, exactly as that section's SUPERSEDED note anticipated. Branch
+`feat/imp-040-customer-payment-ui`, based on `main` at `c777761` (the
+IMP-039 commit) — not committed as part of this entry's own write-up;
+record the actual commit SHA through the normal follow-up documentation
+process once the commit exists, per this document's established
+convention of never fabricating a commit's own SHA inside itself.
+
+Objective
+
+Complete the customer payment journey using Stripe Payment Element,
+connecting Checkout's existing Order creation to IMP-032–IMP-035's
+Payment foundation and IMP-039's webhook-driven lifecycle — all three
+already existed but had zero transport/UI wiring between them (IMP-032
+through IMP-035's own "What Is Deliberately Deferred" notes all said so
+explicitly). Order creation must never be confused with successful
+payment; the customer needs an accurate, recoverable payment status.
+
+Audit Findings (repository inspection performed before any change)
+
+`StartPaymentResult` (the `PaymentProvider` port, IMP-033) had exactly
+one success field, `providerReference` — no `client_secret` anywhere in
+the port, the Stripe adapter, or its test fakes. This is the one genuine
+gap this milestone had to close: a client-side Stripe Elements flow
+cannot collect payment details without a PaymentIntent's `client_secret`,
+and nothing in the existing architecture had ever needed one before,
+since `processPayment` had zero transport callers (confirmed by grep —
+`initializePayment`/`processPayment`/`getStripePaymentProvider` were
+referenced nowhere under `src/app`). `CheckoutSuccess` held its order id
+only in client React state, with no link to anywhere order-id-addressable
+— today's checkout flow had no in-app path from "order created" to
+"pay for it" at all, so this milestone is wiring a cold path end to end,
+not extending a partial one. No existing API route combined "require
+auth" + "check resource ownership" (that pattern existed only at the
+`account/orders/[id]/page.tsx` RSC-page level, via `getCustomerOrder`'s
+null-collapsing ownership check) — reused directly rather than inventing
+a new one. Guest checkout orders (`userId: null`) have no existing
+post-checkout access mechanism of any kind (no token, no session-
+independent lookup); see "Scope Decision: No Guest Payment Access" below.
+
+Functional Scope Implemented
+
+A "Pay now" step on the existing, already-ownership-scoped
+`/account/orders/[id]` page (`CustomerOrderDetailView`'s new
+`paymentSlot` prop, composed in by the page exactly like `[locale]/layout.tsx`'s
+pre-existing `cartSlot`/`accountSlot` pattern — Order's presentation
+layer still never imports `@/modules/payment`). A new
+`POST /api/orders/[id]/payment` initializes-or-resumes the Order's
+Payment and starts it with the real Stripe provider, returning a
+`clientSecret` for Stripe Payment Element; `GET` on the same route
+reports current Order/Payment status for recovery/polling. `CheckoutSuccess`
+now links to that page ("Pay now") for an authenticated customer, or to
+sign-in for a guest. Stripe Payment Element (`@stripe/stripe-js` +
+`@stripe/react-stripe-js`, newly added dependencies — no other new
+runtime dependency) renders once a `clientSecret` is available;
+`confirmPayment({ redirect: "if_required" })` keeps card payments on the
+page with an immediate client-side result, while any payment method that
+genuinely redirects away still returns via `return_url` into the same
+reconciliation path.
+
+Extending the Provider Contract — `clientSecret` (Architectural Decision)
+
+`StartPaymentResult`'s `ok: true` branch gained one required field,
+`clientSecret: string`, alongside the existing `providerReference` — the
+smallest extension that makes the already-existing, already-tested
+`PaymentProvider` port/Stripe adapter usable from a browser, not a
+redesign. `StripePaymentIntentsClient`'s `create`/`retrieve`/`search`
+return shapes were widened to declare `client_secret` (already present on
+every real Stripe PaymentIntent response; the interface had simply never
+needed it before), threaded through the adapter's one shared
+`toValidatedResult` validation function exactly like `amount`/`currency`
+already were — a PaymentIntent without a usable `client_secret` is
+refused the same way a canceled or amount-mismatched one already was.
+`ProcessPaymentResult` carries `clientSecret` on its `ok: true` branch,
+and — guarded — on `PROVIDER_REFERENCE_ALREADY_SET` only when this call's
+own `startPayment` resolved the SAME reference that ended up persisted
+(never a secret for an unrelated PaymentIntent). No change to
+`StartPaymentInput`, no new port method, no new `PaymentStatus` value.
+
+Reuse, Not a New Orchestration Layer
+
+`src/modules/payment/application/start-order-payment.ts` is the only new
+application-layer file — a thin combinator calling `initializePayment`
+(IMP-032) then `processPayment` (IMP-034) exactly as they already exist,
+adding branching only to treat "resume an existing Payment" and "start a
+fresh one" as the same customer-facing outcome. No new persistence, no
+new provider-call shape, no new concurrency primitive: duplicate
+submissions and concurrent initialization are safe entirely because the
+underlying primitives already are (Postgres's unique constraint on
+`Payment.orderId`, `setProviderReferenceIfPending`'s conditional write,
+Stripe's own idempotency-key handling) — this milestone did not add a
+mutex, a lock, or a new idempotency key of any kind.
+
+Scope Decision: No Guest Payment Access
+
+The audit found zero existing mechanism for a guest to access their own
+order after checkout (no token, no session-independent lookup), and this
+milestone's own instructions explicitly excluded building new guest-
+checkout infrastructure. Rather than invent one, the payment step
+requires an authenticated session that owns the Order
+(`getCustomerOrder`) — exactly the existing authenticated/ownership model,
+never a new one. A guest who just checked out sees a "sign in to pay"
+link instead of "pay now"; today's `createOrderFromCheckout` still
+accepts guest orders unmodified, but paying for one in-app now requires
+signing in. This is a real, documented limitation (see "What Is
+Deliberately Deferred" below), not a silent gap.
+
+API
+
+`POST /api/orders/[id]/payment` and `GET /api/orders/[id]/payment` —
+both require an authenticated session (401 `UNAUTHENTICATED` otherwise)
+and ownership of the Order via `getCustomerOrder` (404 `ORDER_NOT_FOUND`
+otherwise, indistinguishable from "doesn't exist", matching
+`account/orders/[id]/page.tsx`'s own `notFound()` convention). `POST`
+success: `{ clientSecret, orderStatus, paymentStatus }`. `POST` failure
+mapping: `ORDER_ALREADY_PAID`/`ORDER_CANCELLED`/`PAYMENT_NOT_PENDING` →
+409 (nothing left to start, never retried); `PROVIDER_ERROR` → 502; any
+thrown exception → 500, never leaking the underlying error. `GET`
+success: `{ orderStatus, paymentStatus }` (`paymentStatus: null` before
+any Payment exists). Never accepts or trusts a client-supplied amount,
+currency, payment status, or provider reference — every value
+`startOrderPayment` acts on comes from the already-persisted Order/Payment.
+
+Security
+
+Customer cannot control Payment/Order status, amount, currency, or
+provider reference — every one of those is read from the authoritative,
+already-persisted record, never from the request body (the route accepts
+no body at all for `POST`). `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` is the
+one new environment variable that IS meant for the client bundle (Stripe's
+own publishable key, not secret by design — unlike `STRIPE_SECRET_KEY`/
+`STRIPE_WEBHOOK_SECRET`, both still server-only and untouched). No
+Stripe secret, webhook secret, or client secret is ever logged; both new
+route handlers' `console.error` calls carry only generic context. The
+customer-side `confirmPayment` result is never, by itself, treated as
+proof of payment — `OrderPaymentPanel`'s own doc comment states this
+explicitly: a client-side "succeeded" result only ever triggers a
+server-status refresh/poll, and the final UI state always reconciles
+against `GET /api/orders/[id]/payment`, which in turn reflects only what
+IMP-039's signature-verified webhook has actually persisted. IMP-039's
+signature verification, event idempotency, and Payment/Order transition
+logic are completely unmodified by this milestone.
+
+Bounded Polling / Recovery
+
+`OrderPaymentPanel` polls the server's own status endpoint up to 6 times,
+2 seconds apart (bounded — never unbounded, never a WebSocket/long-poll),
+stopping early once Payment reaches a terminal status; a `router.refresh()`
+is triggered once SUCCEEDED is observed so the server-rendered Order
+status updates too. Running out of bounded attempts without a terminal
+status is treated as inconclusive, not as failure (Step requirement: "A
+timeout or missing response does not prove that payment failed") — the
+customer can always return to the same page later, which independently
+re-fetches current status on every normal render regardless of whether
+the panel's own poll ever resolved.
+
+Tests
+
+`payment-provider.test.ts`, `process-payment.test.ts`, and
+`stripe-payment-provider.test.ts` were all updated for the new
+`clientSecret` field — every existing fake/assertion updated, no test
+weakened or deleted, all pre-existing behavior re-confirmed passing
+unmodified. New: `start-order-payment.test.ts` (8 tests: ORDER_NOT_FOUND/
+ORDER_ALREADY_PAID/ORDER_CANCELLED propagation, fresh initialization,
+resuming an existing PENDING Payment without creating a second one,
+reusing a valid existing PaymentIntent's clientSecret on retry/refresh,
+PAYMENT_NOT_PENDING when the webhook already settled the Payment ahead of
+Order sync, and PROVIDER_ERROR persisting nothing). New:
+`api/orders/[id]/payment/route.test.ts` (15 tests, mirrors
+`api/orders/route.test.ts`'s/`api/webhooks/stripe/route.test.ts`'s
+`vi.mock` pattern for the same JSX-barrel limitation: 401/404 auth and
+ownership enforcement for both methods, the full POST success/error-status
+mapping, no leaked internals on a thrown exception, and that only the
+URL-derived `orderId` — never a request body — ever reaches
+`startOrderPayment`). `OrderPaymentPanel` itself has no automated test:
+this project's Vitest config has no jsdom/React Testing Library (only
+`src/**/*.test.ts`, no `.tsx` support, unchanged since every earlier
+milestone that hit this same limitation) — consistent with that
+established pattern, this is disclosed honestly below rather than
+fabricated. `pnpm test`: 429 passing + 3 skipped (432 total), 39 test
+files — up from the pre-existing 406 passing + 3 skipped (409), 37 files;
+zero regressions.
+
+Validation Results
+
+`pnpm typecheck`: clean. `pnpm lint`: clean. `pnpm format:check`: limited
+to the same two pre-existing, unrelated warnings already noted for every
+prior milestone (`next.config.ts`, `pnpm-workspace.yaml`). `pnpm test`:
+see above. `pnpm build`: succeeded completely on the first attempt — all
+17 routes (including the two new ones,
+`/api/orders/[id]/payment` and the now-dynamic
+`/account/orders/[id]`) compiled/prerendered; the sandbox-level V8
+out-of-memory crash documented against several earlier milestones in
+this roadmap did not recur this time.
+
+Manual / Browser / Stripe Test-Mode Verification
+
+REAL STRIPE VERIFICATION: NOT PERFORMED — neither `STRIPE_SECRET_KEY` nor
+`STRIPE_WEBHOOK_SECRET` nor `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` is
+configured in this environment. MANUAL/BROWSER VERIFICATION: NOT
+PERFORMED — consistent with this project's repeated, disclosed sandbox
+limitations (no `chromium-cli`, `next dev` has previously crashed with a
+V8 out-of-memory pattern in this same sandbox). The actual Stripe
+Elements rendering, card confirmation, redirect-return handling, and
+bounded-polling UI were therefore verified only by code review and the
+automated tests above (which exercise every branch of
+`startOrderPayment`/the route up to, but not including, a real browser
+rendering `<PaymentElement>` or a real Stripe test-mode confirmation) —
+not by actually running them. This should be verified by the user or in
+Code Review's own environment before this milestone is considered fully
+done.
+
+What Is Deliberately Deferred
+
+Refunds, subscriptions, saved cards, a second payment provider, guest
+checkout payment access (see "Scope Decision" above — a real, accepted
+limitation, not an oversight), an admin dashboard, and any unrelated
+checkout redesign — none of this was introduced, per this milestone's own
+explicit exclusions. No `PaymentAttempt`/retry/queue infrastructure, no
+Redis/Kafka/RabbitMQ, no event bus, no WebSockets, no unbounded polling,
+no new `PaymentStatus` value, no new authentication system. The IMP-039
+webhook's own already-documented limitation (a brief, self-healing
+window where Payment and Order can be transiently inconsistent, since
+they are never updated inside one shared database transaction) is
+unchanged and still applies — `OrderPaymentPanel`'s bounded polling is a
+UI-level mitigation for exactly that window, not a fix to it.

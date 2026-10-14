@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { getTranslations, getLocale } from "next-intl/server";
 import { Package } from "lucide-react";
 import { Container } from "@/shared/components/layout/container";
@@ -7,6 +8,17 @@ import type { Order } from "@/modules/order/domain/order";
 
 interface CustomerOrderDetailViewProps {
   order: Order;
+  /**
+   * Payment UI for this Order (IMP-040), composed in — never imported
+   * directly by this file. Mirrors `site-header.tsx`'s `cartSlot`/
+   * `accountSlot` pattern exactly: Order's presentation layer must not
+   * import `@/modules/payment` (module-boundary rule), so the page
+   * (`account/orders/[id]/page.tsx`, which is allowed to compose multiple
+   * modules) decides whether a payment slot exists at all and renders it.
+   * `null`/`undefined` when the Order isn't eligible for payment (already
+   * paid/cancelled) — nothing is rendered in that case.
+   */
+  paymentSlot?: ReactNode;
 }
 
 /**
@@ -22,7 +34,10 @@ interface CustomerOrderDetailViewProps {
  * chosen — adding that would be a new Order field, outside this
  * milestone's minimal, ownership-only schema change.
  */
-export async function CustomerOrderDetailView({ order }: CustomerOrderDetailViewProps) {
+export async function CustomerOrderDetailView({
+  order,
+  paymentSlot,
+}: CustomerOrderDetailViewProps) {
   const t = await getTranslations("Account.orders");
   const locale = await getLocale();
   const dateFormatter = new Intl.DateTimeFormat(locale, { dateStyle: "medium" });
@@ -104,6 +119,8 @@ export async function CustomerOrderDetailView({ order }: CustomerOrderDetailView
             </div>
           </div>
         </div>
+
+        {paymentSlot ? <div className="mt-10 max-w-md">{paymentSlot}</div> : null}
       </Container>
     </section>
   );

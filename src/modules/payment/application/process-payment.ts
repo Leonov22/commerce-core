@@ -7,7 +7,13 @@ import type {
 import type { Payment } from "@/modules/payment/domain/payment";
 
 export type ProcessPaymentResult =
-  | { ok: true; payment: Payment }
+  /**
+   * `clientSecret` (IMP-040) is this call's own `startPayment` result's
+   * secret — always usable for the just-persisted `payment.providerReference`,
+   * since `ok: true` only happens when THIS call's reference is the one
+   * that was actually written.
+   */
+  | { ok: true; payment: Payment; clientSecret: string }
   | { ok: false; error: "PAYMENT_NOT_FOUND" }
   /** The Payment is already terminal (`SUCCEEDED`/`FAILED`/`CANCELLED`) — never re-sent to a provider. */
   | { ok: false; error: "PAYMENT_NOT_PENDING" }
@@ -39,8 +45,23 @@ export type ProcessPaymentResult =
    *      (`updateStatusIfCurrent` has zero callers anywhere in this
    *      codebase); if one is ever introduced, revisit whether these two
    *      causes still deserve a single result code.
+   *
+   * `clientSecret` (IMP-040) is included ONLY when THIS call's own
+   * `startPayment` result resolved the SAME `providerReference` that is
+   * actually persisted (i.e. this call observed its own prior success, or
+   * a compliant provider's idempotent replay of someone else's) —
+   * `undefined` otherwise (e.g. a non-compliant provider that minted an
+   * unrelated reference while racing a different, already-persisted one).
+   * A frontend receiving this branch without a `clientSecret` must
+   * re-fetch payment status rather than retry — the secret genuinely
+   * cannot be safely inferred.
    */
-  | { ok: false; error: "PROVIDER_REFERENCE_ALREADY_SET"; payment: Payment };
+  | {
+      ok: false;
+      error: "PROVIDER_REFERENCE_ALREADY_SET";
+      payment: Payment;
+      clientSecret?: string;
+    };
 
 /**
  * Processes an existing Payment through a supplied, provider-neutral
@@ -191,8 +212,20 @@ export async function processPayment(
     // between these two calls (Payments are never deleted), so this is
     // always non-null in practice.
     const current = await paymentRepository.findById(payment.id);
-    return { ok: false, error: "PROVIDER_REFERENCE_ALREADY_SET", payment: current! };
+    // IMP-040: only surface this call's own clientSecret if it actually
+    // resolved the reference that ended up persisted — see
+    // `ProcessPaymentResult`'s doc comment for why a mismatch (a
+    // non-compliant provider racing a different, already-set reference)
+    // must never hand back a secret for the wrong PaymentIntent.
+    const clientSecret =
+      current?.providerReference === result.providerReference ? result.clientSecret : undefined;
+    return {
+      ok: false,
+      error: "PROVIDER_REFERENCE_ALREADY_SET",
+      payment: current!,
+      clientSecret,
+    };
   }
 
-  return { ok: true, payment: updated };
+  return { ok: true, payment: updated, clientSecret: result.clientSecret };
 }

@@ -149,11 +149,11 @@
       "deliveryPending": "Select a method",
       "total": "Total",
       "amount": "{amount}",
-      "disclaimer": "Final pricing, taxes, and shipping will be confirmed at payment — not yet available in this preview."
+      "disclaimer": "Final pricing is confirmed when payment is completed."
     },
     "submit": "Place order",
     "submitting": "Placing order…",
-    "submitNote": "Your order will be created with Pending status. Payment isn't available in this preview yet.",
+    "submitNote": "Your order will be created with Pending status. You'll be able to pay once it's created.",
     "errors": {
       "required": "This field is required.",
       "invalidEmail": "Enter a valid email address.",
@@ -166,7 +166,9 @@
       "title": "Order created successfully.",
       "orderId": "Order ID: {id}",
       "status": "Status: Pending — awaiting payment.",
-      "continueShopping": "Continue shopping"
+      "continueShopping": "Continue shopping",
+      "payNow": "View order & pay",
+      "signInToPay": "Sign in to pay for this order"
     }
   },
   "Account": {
@@ -245,6 +247,19 @@
         "PENDING": "Pending",
         "PAID": "Paid",
         "CANCELLED": "Cancelled"
+      },
+      "payment": {
+        "loading": "Preparing payment…",
+        "submit": "Pay now",
+        "submitting": "Processing…",
+        "paid": "Payment received. This order is now paid.",
+        "reconciling": "Confirming your payment…",
+        "unavailable": "Payment isn't available for this order right now.",
+        "error": "Something went wrong preparing payment. Please try again.",
+        "retry": "Try again",
+        "refreshStatus": "Refresh status",
+        "confirmFailed": "We couldn't confirm your payment. Please check your details and try again.",
+        "stillProcessing": "Your payment is still being confirmed — refresh this page in a moment to see the latest status."
       }
     }
   },

@@ -127,7 +127,11 @@ function makeFakePaymentProvider(
       }
       nextId += 1;
       const prefix = options.providerReferencePrefix ?? "fake-provider-ref";
-      return { ok: true, providerReference: `${prefix}-${nextId}` };
+      return {
+        ok: true,
+        providerReference: `${prefix}-${nextId}`,
+        clientSecret: `${prefix}-${nextId}-secret`,
+      };
     },
   };
 
@@ -158,12 +162,12 @@ function makeFakeCompliantPaymentProvider(): {
       calls.push(input);
       const existing = referencesByPaymentId.get(input.paymentId);
       if (existing) {
-        return { ok: true, providerReference: existing };
+        return { ok: true, providerReference: existing, clientSecret: `${existing}-secret` };
       }
       nextId += 1;
       const providerReference = `compliant-ref-${nextId}`;
       referencesByPaymentId.set(input.paymentId, providerReference);
-      return { ok: true, providerReference };
+      return { ok: true, providerReference, clientSecret: `${providerReference}-secret` };
     },
   };
 
@@ -400,6 +404,10 @@ describe("processPayment", () => {
       ok: false,
       error: "PROVIDER_REFERENCE_ALREADY_SET",
       payment: first.payment,
+      // The retry's own startPayment call resolved the SAME providerReference
+      // already persisted, so its clientSecret is safe to surface — unlike
+      // the mismatched-reference case above, where it is correctly omitted.
+      clientSecret: "compliant-ref-1-secret",
     });
   });
 
@@ -573,7 +581,11 @@ describe("processPayment — real repository + real concurrency (IMP-034)", () =
         arrived += 1;
         if (arrived >= 2) releaseLatch();
         await latch;
-        return { ok: true, providerReference: `race-claim-ref-${calls.length}` };
+        return {
+          ok: true,
+          providerReference: `race-claim-ref-${calls.length}`,
+          clientSecret: `race-claim-ref-${calls.length}-secret`,
+        };
       },
     };
 
