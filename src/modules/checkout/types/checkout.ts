@@ -92,6 +92,19 @@ export interface CheckoutLine {
  */
 export type CheckoutSummaryState =
   | { status: "loading" }
+  /**
+   * PR2-F02: the resolved cart lines span more than one currency. Its own
+   * explicit state — never folded into `ready` behind a flag — for the
+   * same reason `loading` is its own state rather than an empty `ready`
+   * result: a caller that destructures `ready`'s fields without checking
+   * a flag first must never be able to render a summed total that mixes
+   * currencies as if it were a single valid amount. The authoritative
+   * server-side order-creation path (`createOrderFromCheckout`) enforces
+   * the same single-currency invariant independently and rejects this
+   * case with `INCONSISTENT_CURRENCY` — this state exists only so the
+   * client never shows a misleading total before that point is reached.
+   */
+  | { status: "mixedCurrency" }
   | {
       status: "ready";
       lines: CheckoutLine[];
@@ -130,8 +143,22 @@ export function resolveCheckoutSummary(
     lines.push({ item, product, lineTotalAmountMinor: product.priceAmountMinor * item.quantity });
   }
 
+  // PR2-F02: resolved lines must share exactly one currency before a
+  // subtotal is computed at all — summing amounts across currencies
+  // would produce a number with no real meaning, labeled with whichever
+  // currency happened to resolve first. An empty or all-unresolved cart
+  // has zero distinct currencies and falls through to `ready` unchanged.
+  const distinctCurrencies = new Set(lines.map((line) => line.product.currency));
+  if (distinctCurrencies.size > 1) {
+    return { status: "mixedCurrency" };
+  }
+
   const subtotalAmountMinor = lines.reduce((sum, line) => sum + line.lineTotalAmountMinor, 0);
-  const currency = lines[0]?.product.currency ?? "USD";
+  // EUR is this store's default/only currency (business decision) — this
+  // fallback is reached only when no cart line resolved to a real product
+  // yet (e.g. a genuinely empty cart), so there is nothing to read a
+  // currency FROM; it never overrides a resolved product's own currency.
+  const currency = lines[0]?.product.currency ?? "EUR";
 
   return { status: "ready", lines, unresolvedCount, subtotalAmountMinor, currency };
 }

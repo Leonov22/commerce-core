@@ -45,6 +45,14 @@ export type StripeWebhookEvent =
        * document as the correct one to verify a settlement against.
        */
       settledAmountMinor: number;
+      /**
+       * Currency-fix: always already normalized to this codebase's
+       * canonical uppercase ISO 4217 convention (`"USD"`, `"EUR"`, ...) —
+       * never Stripe's own raw lowercase (`"usd"`). See
+       * `toCanonicalCurrency`'s doc comment below for why this
+       * normalization happens here, at the Stripe-specific boundary,
+       * rather than at the comparison site.
+       */
       settledCurrency: string;
     }
   /**
@@ -93,6 +101,34 @@ export type VerifyStripeWebhookResult =
  * holding its existing `client_secret`-backing reference), so the
  * customer's next genuine attempt can still succeed against it.
  */
+/**
+ * Stripe's API always reports `currency` in lowercase (e.g. `"usd"`) — this
+ * is documented Stripe behavior, not an inconsistency. This codebase's own
+ * canonical convention, established since IMP-032 and used consistently by
+ * `Order.currency`/`Payment.currency`/`Product.currency` (and already
+ * mirrored by `stripe-payment-provider.ts`'s outbound
+ * `input.currency.toLowerCase()` call before EVER sending a currency TO
+ * Stripe), is uppercase ISO 4217 codes (`"USD"`, `"EUR"`). This is the
+ * inbound mirror of that same boundary: Stripe's own representation is
+ * translated into this system's canonical one exactly once, here, at the
+ * Stripe-specific provider boundary — so `process-stripe-webhook-event.ts`
+ * (provider-neutral application code) can compare `settledCurrency`
+ * against `Payment.currency` with a plain `!==`, never needing to know
+ * Stripe's casing convention exists at all.
+ *
+ * Fixes a confirmed defect: before this normalization, a genuinely
+ * successful `payment_intent.succeeded` event's lowercase `currency`
+ * NEVER matched the uppercase persisted `Payment.currency`, so EVERY
+ * successful payment was misclassified as an `amountMismatch` and
+ * silently failed to transition Payment to `SUCCEEDED` or Order to
+ * `PAID` — regardless of the actual amount. Strict amount validation
+ * (`settledAmountMinor !== payment.amountMinor`) is completely unaffected
+ * and remains exact-match, case/format being inapplicable to a number.
+ */
+function toCanonicalCurrency(currency: string): string {
+  return currency.toUpperCase();
+}
+
 function mapSupportedEvent(event: Stripe.Event):
   | {
       providerReference: string;
@@ -109,7 +145,7 @@ function mapSupportedEvent(event: Stripe.Event):
         providerReference: paymentIntent.id,
         outcome: "SUCCEEDED",
         settledAmountMinor: paymentIntent.amount_received,
-        settledCurrency: paymentIntent.currency,
+        settledCurrency: toCanonicalCurrency(paymentIntent.currency),
       };
     }
     case "payment_intent.payment_failed": {
@@ -119,7 +155,7 @@ function mapSupportedEvent(event: Stripe.Event):
           providerReference: paymentIntent.id,
           outcome: "CANCELLED",
           settledAmountMinor: paymentIntent.amount_received,
-          settledCurrency: paymentIntent.currency,
+          settledCurrency: toCanonicalCurrency(paymentIntent.currency),
         };
       }
       // Still retryable — see the doc comment above.
@@ -131,7 +167,7 @@ function mapSupportedEvent(event: Stripe.Event):
         providerReference: paymentIntent.id,
         outcome: "CANCELLED",
         settledAmountMinor: paymentIntent.amount_received,
-        settledCurrency: paymentIntent.currency,
+        settledCurrency: toCanonicalCurrency(paymentIntent.currency),
       };
     }
     default:

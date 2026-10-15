@@ -188,7 +188,10 @@ async function main() {
         slug: product.slug,
         status: ProductStatus.ACTIVE,
         priceAmountMinor: product.priceAmountMinor,
-        currency: "USD",
+        // EUR is this store's default/only currency (business decision) —
+        // the numeric price values above are unchanged; only the currency
+        // code changed, never an exchange-rate conversion.
+        currency: "EUR",
         categoryId,
         badge: product.badge,
         sortOrder: product.sortOrder,
@@ -200,7 +203,7 @@ async function main() {
         slug: product.slug,
         status: ProductStatus.ACTIVE,
         priceAmountMinor: product.priceAmountMinor,
-        currency: "USD",
+        currency: "EUR",
         categoryId,
         badge: product.badge,
         sortOrder: product.sortOrder,

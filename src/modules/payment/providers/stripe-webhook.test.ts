@@ -87,8 +87,85 @@ describe("verifyStripeWebhookEvent", () => {
         providerReference: "pi_123",
         outcome: "SUCCEEDED",
         settledAmountMinor: 1000,
-        settledCurrency: "usd",
+        // Currency-fix: Stripe's own raw lowercase "usd" (set above) is
+        // normalized to this codebase's canonical uppercase convention —
+        // see the dedicated describe block below for the full regression
+        // coverage this fix requires.
+        settledCurrency: "USD",
       },
+    });
+  });
+
+  describe("currency-fix: Stripe's lowercase currency is normalized to this codebase's canonical uppercase convention", () => {
+    it("normalizes Stripe's lowercase 'usd' to 'USD' so it matches the uppercase convention Payment.currency/Order.currency/Product.currency already use", () => {
+      const payload = paymentIntentEventPayload("payment_intent.succeeded", "pi_123", {
+        id: "evt_succeeded",
+        currency: "usd",
+      });
+      const signature = signPayload(payload);
+
+      const result = verifyStripeWebhookEvent(payload, signature, WEBHOOK_SECRET);
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.event).toMatchObject({ settledCurrency: "USD" });
+    });
+
+    it("normalizes a genuinely different lowercase currency ('eur') to its own uppercase form ('EUR') — proving this is a real case-fold, not a hardcoded override to USD", () => {
+      const payload = paymentIntentEventPayload("payment_intent.succeeded", "pi_123", {
+        id: "evt_succeeded",
+        currency: "eur",
+      });
+      const signature = signPayload(payload);
+
+      const result = verifyStripeWebhookEvent(payload, signature, WEBHOOK_SECRET);
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.event).toMatchObject({ settledCurrency: "EUR" });
+    });
+
+    it("also normalizes currency on a payment_intent.canceled event", () => {
+      const payload = paymentIntentEventPayload("payment_intent.canceled", "pi_789", {
+        id: "evt_canceled",
+        currency: "eur",
+      });
+      const signature = signPayload(payload);
+
+      const result = verifyStripeWebhookEvent(payload, signature, WEBHOOK_SECRET);
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.event).toMatchObject({ settledCurrency: "EUR" });
+    });
+
+    it("also normalizes currency on a payment_intent.payment_failed event whose PaymentIntent has itself been canceled", () => {
+      const payload = paymentIntentEventPayload("payment_intent.payment_failed", "pi_456", {
+        id: "evt_failed",
+        status: "canceled",
+        currency: "eur",
+      });
+      const signature = signPayload(payload);
+
+      const result = verifyStripeWebhookEvent(payload, signature, WEBHOOK_SECRET);
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.event).toMatchObject({ settledCurrency: "EUR" });
+    });
+
+    it("leaves an already-uppercase currency unchanged (idempotent normalization)", () => {
+      const payload = paymentIntentEventPayload("payment_intent.succeeded", "pi_123", {
+        id: "evt_succeeded",
+        currency: "USD",
+      });
+      const signature = signPayload(payload);
+
+      const result = verifyStripeWebhookEvent(payload, signature, WEBHOOK_SECRET);
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.event).toMatchObject({ settledCurrency: "USD" });
     });
   });
 

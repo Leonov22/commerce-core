@@ -26,16 +26,23 @@ import { prisma } from "@/modules/order/infrastructure/prisma-client";
  * factory that closed over an un-hoisted `const` would hit it before
  * initialization.
  */
-const { OVERFLOW_PRODUCT_ID, unavailableProductIds } = vi.hoisted(() => ({
-  OVERFLOW_PRODUCT_ID: "qa-overflow-fixture",
-  // CR-031-02: a mutable set of product ids the mock pretends Catalog can no
-  // longer resolve — lets a test simulate "this product became unavailable
-  // between the original submission and a later retry" without touching
-  // real seeded data. Tests that use this must always remove their id(s)
-  // afterward (a `finally` block), since this set is shared module state
-  // across every test in this file.
-  unavailableProductIds: new Set<string>(),
-}));
+const { OVERFLOW_PRODUCT_ID, MIXED_CURRENCY_PRODUCT_ID, unavailableProductIds } = vi.hoisted(
+  () => ({
+    OVERFLOW_PRODUCT_ID: "qa-overflow-fixture",
+    // PR2-F02: a reserved id resolving to a different currency ("EUR")
+    // than the real seeded products (currently "USD") — lets a test prove
+    // the mixed-currency rejection below without depending on the real
+    // Catalog ever actually holding products in two currencies at once.
+    MIXED_CURRENCY_PRODUCT_ID: "qa-mixed-currency-fixture",
+    // CR-031-02: a mutable set of product ids the mock pretends Catalog can no
+    // longer resolve — lets a test simulate "this product became unavailable
+    // between the original submission and a later retry" without touching
+    // real seeded data. Tests that use this must always remove their id(s)
+    // afterward (a `finally` block), since this set is shared module state
+    // across every test in this file.
+    unavailableProductIds: new Set<string>(),
+  }),
+);
 
 /**
  * Real seeded Catalog prices ($86-$310) can never drive
@@ -68,11 +75,41 @@ vi.mock("@/modules/catalog", async (importOriginal) => {
     },
   };
 
+  const mixedCurrencyFixture: Product = {
+    id: "qa-mixed-currency-fixture",
+    slug: "qa-mixed-currency-fixture",
+    status: "ACTIVE",
+    priceAmountMinor: 10000,
+    currency: "EUR",
+    categorySlug: "qa",
+    badge: null,
+    isFeatured: false,
+    sortOrder: 0,
+    translation: {
+      locale: "en",
+      name: "QA Mixed Currency Fixture",
+      meta: "",
+      description: "",
+      material: "",
+      dimensions: "",
+    },
+  };
+
   return {
     ...actual,
     getProductsByIds: async (ids: string[], locale: string) => {
       if (ids.length === 1 && ids[0] === "qa-overflow-fixture") {
         return [overflowFixture];
+      }
+      if (ids.includes(MIXED_CURRENCY_PRODUCT_ID)) {
+        const otherIds = ids.filter((id) => id !== MIXED_CURRENCY_PRODUCT_ID);
+        const resolvedOthers =
+          otherIds.length > 0
+            ? (await actual.getProductsByIds(otherIds, locale)).filter(
+                (product) => !unavailableProductIds.has(product.id),
+              )
+            : [];
+        return [...resolvedOthers, mixedCurrencyFixture];
       }
       const resolved = await actual.getProductsByIds(ids, locale);
       return resolved.filter((product) => !unavailableProductIds.has(product.id));
@@ -515,6 +552,34 @@ describe("createOrderFromCheckout — monetary overflow (application path)", () 
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.error).toBe("AMOUNT_OUT_OF_RANGE");
+    expect(calls).toHaveLength(0);
+  });
+});
+
+/**
+ * PR2-F02 (independent Code Review of PR #2): demonstrates that
+ * `createOrderFromCheckout` already enforces a single-currency invariant
+ * across resolved cart lines, independent of and in addition to the
+ * client-side presentation fix in `resolveCheckoutSummary`
+ * (`checkout.ts`/`checkout.test.ts`). This is the authoritative
+ * server-side path — client-only validation would be insufficient, since
+ * a request can reach `POST /api/orders` without having gone through the
+ * checkout UI at all.
+ */
+describe("createOrderFromCheckout — single-currency invariant (PR2-F02)", () => {
+  it("rejects a cart whose resolved lines span more than one currency with INCONSISTENT_CURRENCY, and never calls the repository", async () => {
+    const { repository, calls } = makeFakeRepository();
+    const result = await createOrderFromCheckout(repository, {
+      customer: validCustomer,
+      items: [
+        { productId: "1", quantity: 1 }, // real seeded product, currency "USD"
+        { productId: MIXED_CURRENCY_PRODUCT_ID, quantity: 1 }, // fixture, currency "EUR"
+      ],
+      deliveryAmountMinor: 800,
+      locale: "en",
+    });
+
+    expect(result).toEqual({ ok: false, error: "INCONSISTENT_CURRENCY" });
     expect(calls).toHaveLength(0);
   });
 });
