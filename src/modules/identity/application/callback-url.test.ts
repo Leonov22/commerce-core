@@ -51,4 +51,33 @@ describe("resolveSafeCallbackUrl", () => {
   it("accepts the root path", () => {
     expect(resolveSafeCallbackUrl("/")).toBe("/");
   });
+
+  it("rejects a value containing an embedded tab character", () => {
+    expect(resolveSafeCallbackUrl("/\t/evil.example")).toBe("/account");
+  });
+
+  it("rejects a value containing an embedded line feed", () => {
+    expect(resolveSafeCallbackUrl("/\n/evil.example")).toBe("/account");
+  });
+
+  it("rejects a value containing an embedded carriage return", () => {
+    expect(resolveSafeCallbackUrl("/\r/evil.example")).toBe("/account");
+  });
+
+  it("rejects the reported protocol-relative bypass attempt — a leading-slash-then-tab value that would resolve to '//evil.example' if the tab were stripped during URL parsing", () => {
+    expect(resolveSafeCallbackUrl("/\t/evil.example")).not.toBe("/\t/evil.example");
+    expect(resolveSafeCallbackUrl("/\t/evil.example")).toBe("/account");
+  });
+
+  it("rejects a tab/newline/carriage-return anywhere in the value, not only at the start", () => {
+    expect(resolveSafeCallbackUrl("/checkout\t/evil.example")).toBe("/account");
+    expect(resolveSafeCallbackUrl("/checkout\n/evil.example")).toBe("/account");
+    expect(resolveSafeCallbackUrl("/checkout\r/evil.example")).toBe("/account");
+  });
+
+  it("still accepts a legitimate internal path containing none of these characters", () => {
+    expect(resolveSafeCallbackUrl("/account/orders/cmv9lm7mk000d08jn1zj5goqd")).toBe(
+      "/account/orders/cmv9lm7mk000d08jn1zj5goqd",
+    );
+  });
 });

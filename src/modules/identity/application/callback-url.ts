@@ -17,6 +17,16 @@ const DEFAULT_CALLBACK_URL = "/account";
  *   normalize a leading backslash the same as a forward slash, which would
  *   otherwise smuggle a protocol-relative URL past a naive `startsWith("/")`
  *   check;
+ * - embedded ASCII tab (`\t`), line feed (`\n`), or carriage return (`\r`)
+ *   anywhere in the value — defensive hardening against ambiguous URL
+ *   parsing: the WHATWG URL Standard has these three characters stripped
+ *   during parsing, so a value like `/\t/evil.example` could pass every
+ *   check above (it starts with a single `/`, contains no backslash) and
+ *   still be resolved as `//evil.example` wherever something downstream
+ *   parses it as a URL. This is not demonstrated to be exploitable through
+ *   this application's own navigation calls — it is rejected purely so the
+ *   validation here does not depend on how any particular consumer happens
+ *   to parse the result;
  * - anything not starting with exactly one `/` (relative paths without a
  *   leading slash, empty strings, `undefined`/`null`).
  *
@@ -34,6 +44,9 @@ export function resolveSafeCallbackUrl(value: string | null | undefined): string
     return DEFAULT_CALLBACK_URL;
   }
   if (value.includes("\\")) {
+    return DEFAULT_CALLBACK_URL;
+  }
+  if (value.includes("\t") || value.includes("\n") || value.includes("\r")) {
     return DEFAULT_CALLBACK_URL;
   }
 
