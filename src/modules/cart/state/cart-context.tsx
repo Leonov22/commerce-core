@@ -6,7 +6,7 @@ import {
   useEffect,
   useMemo,
   useReducer,
-  useRef,
+  useState,
   type ReactNode,
 } from "react";
 import { cartReducer, initialCartState } from "@/modules/cart/state/cart-reducer";
@@ -38,30 +38,44 @@ export function CartProvider({ children }: { children: ReactNode }) {
   // server already sent, a hydration mismatch. The one-render "empty,
   // then populated" flash this causes for a returning visitor is the
   // standard, accepted tradeoff for client-only persisted state.
-  const isFirstPersistRef = useRef(true);
+  //
+  // `isHydrated` is real component STATE, not a ref, specifically because
+  // of React Strict Mode's development-only double-invoke behavior: on
+  // mount, Strict Mode runs every effect's setup twice (setup → cleanup →
+  // setup again) before any state update dispatched from within those
+  // effects has actually been applied to a new render. A ref-based "skip
+  // exactly the first run" guard does not survive this — Strict Mode's
+  // SECOND invocation of the persist-effect below would already see the
+  // ref flipped to its "past the first run" value (set by the first
+  // invocation moments earlier, in the same commit), so it would proceed
+  // to persist, but `items` would still be the ORIGINAL pre-hydration
+  // empty array (the hydration dispatch's own re-render hasn't happened
+  // yet) — overwriting a real stored cart with `[]` before hydration ever
+  // gets a chance to apply. Gating on `isHydrated` STATE instead works
+  // correctly here precisely because an effect's closure only ever
+  // observes state as of the render that scheduled it — both of Strict
+  // Mode's double-invoked passes still see `isHydrated === false` (the
+  // `setIsHydrated(true)` calls from either pass are merely SCHEDULED, not
+  // yet applied), so the persist-effect correctly skips both times; only
+  // once a genuine new render actually commits with `isHydrated === true`
+  // does persisting resume, by which point `items` already reflects
+  // whatever hydration (if any) applied.
+  const [isHydrated, setIsHydrated] = useState(false);
 
   useEffect(() => {
     const stored = loadCartFromStorage();
     if (stored.length > 0) {
       dispatch({ type: "HYDRATE", items: stored });
     }
+    setIsHydrated(true);
   }, []);
 
   useEffect(() => {
-    // Skips exactly the one render this effect sees before the hydration
-    // effect above has had a chance to dispatch — both effects run, in
-    // declaration order, in the same post-mount flush; without this guard
-    // this effect would still see the pre-hydration (empty) `items` value
-    // and write that over whatever was already correctly stored, a moment
-    // before the hydration dispatch's own re-render corrects it anyway.
-    // Skipping this one run entirely removes that window rather than
-    // merely shrinking it.
-    if (isFirstPersistRef.current) {
-      isFirstPersistRef.current = false;
+    if (!isHydrated) {
       return;
     }
     saveCartToStorage(items);
-  }, [items]);
+  }, [items, isHydrated]);
 
   const value = useMemo<CartContextValue>(
     () => ({
