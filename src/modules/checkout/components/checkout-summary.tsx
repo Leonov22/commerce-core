@@ -35,6 +35,17 @@ export function CheckoutSummary({
     );
   }
 
+  if (summary.status === "mixedCurrency") {
+    return (
+      <div className="rounded-lg border border-border p-6">
+        <h2 className="text-base font-medium">{t("summary.heading")}</h2>
+        <p role="alert" className="mt-6 text-sm text-destructive">
+          {t("summary.mixedCurrency")}
+        </p>
+      </div>
+    );
+  }
+
   const { lines, unresolvedCount, subtotalAmountMinor, currency } = summary;
   const deliveryOption = DELIVERY_OPTIONS.find((option) => option.key === deliveryMethod);
   const deliveryAmountMinor = deliveryOption?.priceAmountMinor ?? 0;

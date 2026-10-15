@@ -129,6 +129,82 @@ describe("resolveCheckoutSummary", () => {
     if (result.status !== "ready") return;
     expect(result.currency).toBe("EUR");
   });
+
+  it("accepts a cart with multiple lines that all share the EUR currency", () => {
+    const productsById = new Map([
+      ["1", makeProduct({ id: "1", currency: "EUR", priceAmountMinor: 24000 })],
+      ["2", makeProduct({ id: "2", currency: "EUR", priceAmountMinor: 31000 })],
+    ]);
+    const result = resolveCheckoutSummary(
+      [makeItem("1", 1), makeItem("2", 1)],
+      productsById,
+      false,
+    );
+
+    expect(result.status).toBe("ready");
+    if (result.status !== "ready") return;
+    expect(result.currency).toBe("EUR");
+    expect(result.subtotalAmountMinor).toBe(55000);
+  });
+
+  it("accepts a cart with multiple lines that all share the USD currency", () => {
+    const productsById = new Map([
+      ["1", makeProduct({ id: "1", currency: "USD", priceAmountMinor: 24000 })],
+      ["2", makeProduct({ id: "2", currency: "USD", priceAmountMinor: 9600 })],
+    ]);
+    const result = resolveCheckoutSummary(
+      [makeItem("1", 1), makeItem("2", 1)],
+      productsById,
+      false,
+    );
+
+    expect(result.status).toBe("ready");
+    if (result.status !== "ready") return;
+    expect(result.currency).toBe("USD");
+    expect(result.subtotalAmountMinor).toBe(33600);
+  });
+
+  it("PR2-F02: fails closed with status 'mixedCurrency' for a cart whose resolved lines span more than one currency, never summing across them or silently picking the first", () => {
+    const productsById = new Map([
+      ["1", makeProduct({ id: "1", currency: "EUR", priceAmountMinor: 24000 })],
+      ["2", makeProduct({ id: "2", currency: "USD", priceAmountMinor: 31000 })],
+    ]);
+    const result = resolveCheckoutSummary(
+      [makeItem("1", 1), makeItem("2", 1)],
+      productsById,
+      false,
+    );
+
+    expect(result).toEqual({ status: "mixedCurrency" });
+  });
+
+  it("PR2-F02: an unresolved product alongside a mixed-currency pair does not mask the mixed-currency failure", () => {
+    const productsById = new Map([
+      ["1", makeProduct({ id: "1", currency: "EUR" })],
+      ["2", makeProduct({ id: "2", currency: "USD" })],
+    ]);
+    const result = resolveCheckoutSummary(
+      [makeItem("1", 1), makeItem("2", 1), makeItem("999", 1)],
+      productsById,
+      false,
+    );
+
+    expect(result).toEqual({ status: "mixedCurrency" });
+  });
+
+  it("PR2-F02: an unresolved product alongside a single-currency cart still resolves normally", () => {
+    const productsById = new Map([["1", makeProduct({ id: "1", currency: "EUR" })]]);
+    const result = resolveCheckoutSummary(
+      [makeItem("1", 1), makeItem("999", 1)],
+      productsById,
+      false,
+    );
+
+    expect(result.status).toBe("ready");
+    if (result.status !== "ready") return;
+    expect(result.currency).toBe("EUR");
+    expect(result.unresolvedCount).toBe(1);
+  });
 });
 
 describe("validateCustomerInformation", () => {

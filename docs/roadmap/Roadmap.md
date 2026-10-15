@@ -3739,3 +3739,226 @@ typecheck, lint, and build all pass. Browser E2E and real Stripe
 test-mode verification remain explicitly BLOCKED pending external
 environment setup (credentials + browser tooling) and are not
 represented as passed.
+
+30. IMP-042 — Stripe Webhook Currency Normalization & EUR Catalog Migration
+
+Status
+
+COMPLETED, pending Code Review. Branch `fix/webhook-currency-and-eur-migration`
+(based on `feat/imp-040-customer-payment-ui` at `eabf874`, since the
+defect below did not yet exist on `main`). Three commits: `908ef3f`,
+`5f4e8f9`, `686b8c9`.
+
+Root cause (908ef3f): Stripe's API always reports `PaymentIntent.currency`
+lowercase (e.g. `"usd"`), while `Payment.currency`/`Order.currency`/
+`Product.currency` are stored in this codebase's canonical uppercase ISO
+4217 convention (`"USD"`). The webhook mapper (`stripe-webhook.ts`)
+passed Stripe's raw value through unnormalized, so the settlement
+comparison in `process-stripe-webhook-event.ts`
+(`settledCurrency !== payment.currency`) never matched for any
+genuinely successful payment — every `payment_intent.succeeded` event
+was misclassified as an amount/currency mismatch, and the
+Payment/Order never transitioned to `SUCCEEDED`/`PAID`, regardless of
+the actual amount paid. This directly explained a real reported
+symptom: a successful Stripe payment whose Order remained stuck
+`PENDING`.
+
+Fix: normalize to uppercase at the single point where
+`stripe-webhook.ts` extracts `settledCurrency` from the Stripe event
+(`toCanonicalCurrency`), mirroring the existing outbound convention
+(`stripe-payment-provider.ts` already lowercases before sending TO
+Stripe). No change to the comparison logic itself, strict amount
+validation, signature verification, idempotency, or any existing
+state-transition rule.
+
+Business decision (5f4e8f9): EUR is now this store's default and only
+currency going forward. Numeric prices/delivery amounts are unchanged —
+only the currency code changes, deliberately never an exchange-rate
+conversion. `prisma/seed.ts`'s demo products now seed `currency: "EUR"`
+(code-level change only — the broad seed script was NOT run against
+any database as part of this change, its own CR-037-01-SEED guard
+unmodified). A new, narrowly-scoped `prisma/set-product-currency.ts`
+script mirrors `set-featured-products.ts`'s pattern to migrate the six
+existing demo products' `currency` field only, on an already-seeded
+database, without touching price/status/category/badge/translations —
+not executed against any database by this work. The "no product
+resolved yet" currency fallback in `cart-summary.tsx`/`checkout.ts`
+changed from `"USD"` to `"EUR"`; `checkout-delivery.tsx`'s delivery-price
+display now formats in EUR. `createOrderFromCheckout` already derived
+currency dynamically from resolved Catalog products and already
+validated single-currency carts (`INCONSISTENT_CURRENCY`) — no change
+needed there. Historical Order/Payment rows are an immutable
+checkout-time snapshot, completely untouched by this work. No Stripe
+Tax / automatic tax calculation introduced.
+
+Atomicity fix (686b8c9): an independent review of
+`prisma/set-product-currency.ts` found that its `updateMany` ran before
+the exact-matched-count validation, so a partial id match (fewer than
+all 6 configured products found) would leave that subset already
+converted to EUR before the script threw. Fixed by wrapping the update
+and the count check in a single `prisma.$transaction`, so a partial
+match rolls back entirely instead of leaving the migration
+half-applied. The count-validation logic was extracted into a pure,
+Prisma-independent `evaluateProductCurrencyProvisioning` helper
+(mirroring the existing `evaluateFeaturedProvisioning` precedent) and
+covered by its own unit tests.
+
+Changed files: `stripe-webhook.ts`, `stripe-webhook.test.ts`,
+`prisma/seed.ts`, `prisma/set-product-currency.ts` (new),
+`cart-summary.tsx`, `checkout-delivery.tsx`, `checkout.ts`,
+`checkout.test.ts`, `product-currency-provisioning.ts` (new),
+`product-currency-provisioning.test.ts` (new).
+
+Remaining Limitations
+
+1. `prisma/set-product-currency.ts` was never executed against any
+   database — the connected database's seeded demo products remain
+   `"USD"` until the script is deliberately run. The webhook
+   normalization fix (908ef3f) is currency-agnostic and corrects
+   settlement for whatever currency is actually stored today, so this
+   does not block that fix from taking effect.
+2. Browser E2E and real Stripe test-mode verification remain BLOCKED,
+   unchanged from IMP-041's own disclosure (Section 28) — no browser
+   automation tool and no Stripe credentials are available in this
+   environment.
+
+Recommendation
+
+READY TO RETURN TO CODE REVIEW.
+
+31. IMP-042-FIX — Currency Migration Correctness Before Merge (PR2-F01, PR2-F02)
+
+Status
+
+COMPLETED, pending return to Code Review. An independent Code Review of
+PR #2 (branch `fix/webhook-currency-and-eur-migration`, covering
+IMP-042's three commits above) returned REQUEST CHANGES with two
+findings, PR2-F01 and PR2-F02. Both were verified against the actual
+code (not assumed correct from the review's description alone) and
+addressed. Commit SHA recorded once created.
+
+PR2-F01 — Protect the Product-Currency Provisioning Script Against the Wrong Database
+
+Root cause: `prisma/set-product-currency.ts`'s transaction and exact-
+matched-count validation (IMP-042/686b8c9) protect against updating the
+wrong NUMBER of rows, but say nothing about whether `DATABASE_URL`
+points at the database the operator actually intends to migrate.
+Running the script while `DATABASE_URL` points at an unintended
+database (e.g. a connection string left exported from a different
+project or session) would silently "succeed" against data nobody meant
+to touch — merely having some `DATABASE_URL` set proves nothing about
+operator intent.
+
+Fix: a new `isProductCurrencyMigrationConfirmed` fail-closed gate
+(`product-currency-migration-guard.ts`), checked before any Prisma
+client is constructed, mirrors CR-037-01-SEED's established
+`SEED_ALLOW_BROAD_WRITE` shape — a separate, explicit, exact-match
+confirmation environment variable (`PRODUCT_CURRENCY_MIGRATION_CONFIRM`)
+that must be deliberately set for the run. Deliberately not based on
+`NODE_ENV` or any invented staging/production environment taxonomy —
+this project documents no such distinction anywhere
+(`docs/08-devops/` is an undocumented placeholder) — and never compared
+against `DATABASE_URL`'s own value, so no connection detail is ever
+parsed, logged, or printed. A missing, empty, or mismatched confirmation
+aborts before `updateMany` is called, exactly like
+`assertBroadSeedIsConfirmed` does for `seed.ts`.
+
+Changed files: `prisma/set-product-currency.ts` (gate wired in before
+Prisma client construction; doc comment updated with the run
+instructions), `product-currency-migration-guard.ts` (new),
+`product-currency-migration-guard.test.ts` (new), `.env.example`
+(documents the new variable, following the existing
+`SEED_ALLOW_BROAD_WRITE` convention).
+
+Tests added: refuses when the confirmation variable is unset or has any
+other value; does not trust `NODE_ENV`; merely having `DATABASE_URL` set
+(with or without an unrelated confirmation value) is never sufficient;
+confirms only with the exact value; the match is case-sensitive.
+
+Not run against any database, per this fix's own constraint — the gate
+itself is unit-tested in isolation (pure function, no Prisma import),
+and the actual `process.exit(1)` abort path and the previously-added
+`$transaction` rollback were not independently re-exercised against a
+live database here.
+
+PR2-F02 — Prevent Mixed-Currency Cart Totals
+
+Root cause: `resolveCheckoutSummary` (`checkout.ts`) summed resolved
+cart line totals unconditionally while taking the displayed currency
+from only the first resolved line — a cart that somehow resolved to
+more than one currency would render one apparently valid total with a
+single currency label, even though the underlying amounts were never
+converted. The authoritative server-side order-creation path
+(`createOrderFromCheckout`) already enforced a single-currency
+invariant (`INCONSISTENT_CURRENCY`) and had zero regression test
+coverage for it.
+
+Fix: `CheckoutSummaryState` gained its own explicit `mixedCurrency`
+status — never folded into `ready` behind a flag, for the same reason
+`loading` is its own state rather than an empty `ready` result — so a
+caller can never destructure a summed, mislabeled total.
+`resolveCheckoutSummary` now checks the resolved lines' distinct
+currencies before computing any subtotal; more than one distinct
+currency fails the whole resolution closed, discarding no product and
+picking no "first" currency. `checkout-summary.tsx` renders an explicit
+error message for this state instead of a total.
+`createOrderFromCheckout`'s own pre-existing server-side invariant was
+left unchanged (it already fails closed correctly) and is now
+demonstrated with a concrete regression test, closing the coverage gap
+the review found.
+
+Changed files: `checkout.ts` (`mixedCurrency` state +
+`resolveCheckoutSummary` currency check), `checkout.test.ts` (EUR-only,
+USD-only, mixed EUR/USD, mixed+unresolved, and single-currency+unresolved
+cases), `checkout-summary.tsx` (new UI branch), `en.json`
+(`summary.mixedCurrency` message), `checkout-order.test.ts` (new
+`INCONSISTENT_CURRENCY` regression test against the real, already-
+authoritative server-side path, using a reserved EUR-currency fixture
+product id alongside a real seeded USD product).
+
+No unresolved limitation specific to this finding — `checkout-form.tsx`
+needed no change, since its existing `summary.status === "ready"` gate
+already excludes the new `mixedCurrency` status without modification.
+
+Tests, Typecheck, Lint, Formatting, Build
+
+`pnpm test`: 476 passing + 3 skipped (479 total), 41 test files — up
+from the pre-existing 463 passing + 3 skipped (466); 13 new tests, zero
+regressions. (One transient failure was observed during this work in
+`prisma-product-repository.test.ts`'s pre-existing IMP-037 featured-
+products test, caused by two stray product rows already present in the
+shared database at that moment — unrelated to any file this fix
+touches; two subsequent full runs were clean.) `pnpm typecheck`: clean.
+`pnpm lint`: clean. `pnpm format:check`: limited to the same two
+pre-existing, unrelated warnings already noted for every prior
+milestone (`next.config.ts`, `pnpm-workspace.yaml`). `pnpm build`:
+crashed with a JavaScript heap out-of-memory error in this local
+environment (reproduced after retrying with a larger `--max-old-space-size`)
+— an environment resource constraint, not evaluated as a pass or a
+failure signal; typecheck/lint/test are this project's relied-upon
+correctness gates.
+
+Browser E2E / Stripe Test-Mode Verification
+
+Both remain BLOCKED, unchanged from IMP-041's own disclosure (Section
+28) — no browser automation tool and no Stripe credentials are
+available in this environment.
+
+Remaining Limitations
+
+1. Same as IMP-042's Section above: `prisma/set-product-currency.ts`
+   (now also gated by PR2-F01's confirmation requirement) has still
+   never been executed against any database.
+2. Browser E2E and Stripe test-mode verification — same missing
+   prerequisites as every prior milestone.
+3. `pnpm build` could not be evaluated in this local environment due to
+   an out-of-memory crash, unrelated to this change.
+
+Recommendation
+
+READY TO RETURN TO CODE REVIEW. Both REQUEST CHANGES findings (PR2-F01,
+PR2-F02) were verified against the actual code and corrected, with
+regression tests added for each; typecheck, lint, and the full test
+suite pass. Browser E2E, real Stripe test-mode verification, and the
+build check remain explicitly not represented as passed, for the
+reasons stated above.
