@@ -5,7 +5,15 @@ export type CartAction =
   | { type: "INCREASE_QUANTITY"; productId: string }
   | { type: "DECREASE_QUANTITY"; productId: string }
   | { type: "REMOVE_ITEM"; productId: string }
-  | { type: "CLEAR_CART" };
+  | { type: "CLEAR_CART" }
+  /**
+   * Replaces the whole cart wholesale with already-validated items read
+   * from `localStorage` (`cart-storage.ts`) after mount — never merged
+   * with whatever the in-memory state already holds, since the only time
+   * this fires is immediately after a fresh mount, before any real user
+   * interaction could have added anything to merge with.
+   */
+  | { type: "HYDRATE"; items: CartState };
 
 export const initialCartState: CartState = [];
 
@@ -39,6 +47,9 @@ export function cartReducer(state: CartState, action: CartAction): CartState {
 
     case "CLEAR_CART":
       return [];
+
+    case "HYDRATE":
+      return action.items;
 
     default:
       return state;

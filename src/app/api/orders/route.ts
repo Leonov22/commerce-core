@@ -26,6 +26,13 @@ import { isValidIdempotencyKey } from "@/app/api/orders/validate-idempotency-key
  *   creating a duplicate. It is a correlation token only — never treated as
  *   authorization; `userId` below is still resolved solely from the
  *   session.
+ * - Account-first checkout: requires an authenticated session — a request
+ *   with no session is rejected with 401 before Catalog, idempotency, or
+ *   any other check runs. Enforced here independently of the checkout
+ *   page's own redirect, since this route is the actual authority, not the
+ *   UI. Guest checkout (a created Order with `userId: null`) is no longer
+ *   reachable through this route; existing guest Orders from before this
+ *   change are untouched and remain exactly as they were.
  */
 
 const MAX_ITEMS_PER_REQUEST = 50;
@@ -115,9 +122,18 @@ export async function POST(request: Request) {
     : routing.defaultLocale;
 
   // Server-derived only — the client never supplies or influences this.
-  // Guest checkout remains fully supported: no session simply means `null`.
+  // Account-first checkout: an authenticated session is now required to
+  // create an order at all — enforced here independently of the checkout
+  // page's own redirect (`[locale]/checkout/page.tsx`), since this is the
+  // one actual order-creation endpoint in the application (confirmed: the
+  // module's generic, unvalidated `createOrder` command has no caller
+  // anywhere in `src/app/`) and must reject an unauthenticated request on
+  // its own, not merely rely on the UI never reaching it.
   const currentUser = await getCurrentUser();
-  const userId = currentUser?.id ?? null;
+  if (!currentUser) {
+    return NextResponse.json({ error: "UNAUTHENTICATED" }, { status: 401 });
+  }
+  const userId = currentUser.id;
 
   try {
     const result = await createOrderFromCheckout({

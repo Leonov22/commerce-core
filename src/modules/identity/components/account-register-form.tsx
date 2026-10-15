@@ -26,7 +26,12 @@ const ERROR_MESSAGE_KEYS: Record<RegisterErrorCode, string> = {
   SIGN_IN_FAILED: "errors.unexpected",
 };
 
-export function AccountRegisterForm() {
+interface AccountRegisterFormProps {
+  /** Already validated server-side by the caller — used verbatim, never re-validated here. */
+  callbackUrl: string;
+}
+
+export function AccountRegisterForm({ callbackUrl }: AccountRegisterFormProps) {
   const t = useTranslations("Account.register");
   const router = useRouter();
 
@@ -69,7 +74,7 @@ export function AccountRegisterForm() {
       // the App Router's cached layout output (guest navigation) instead
       // of re-evaluating `getCurrentUser()` for the newly authenticated
       // session. `router.refresh()` forces that re-evaluation.
-      router.push("/account");
+      router.push(callbackUrl);
       router.refresh();
     } catch {
       setErrorMessage(t(ERROR_MESSAGE_KEYS.INTERNAL_ERROR));

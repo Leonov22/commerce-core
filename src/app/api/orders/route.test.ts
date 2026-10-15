@@ -37,6 +37,20 @@ const { POST } = orderRouteModule;
 
 const VALID_IDEMPOTENCY_KEY = "test-idempotency-key-aaaaaaaa";
 
+/**
+ * Account-first checkout: `POST /api/orders` now requires a session (see
+ * `route.ts`'s own doc comment) — every test below that isn't specifically
+ * about the unauthenticated-rejection case itself must mock an
+ * authenticated user, since `getCurrentUser()` resolving to `null` is no
+ * longer a "guest, proceed anyway" case; it is now a 401.
+ */
+const AUTHENTICATED_USER = {
+  id: "real-user-a",
+  email: "a@example.com",
+  createdAt: new Date(),
+  updatedAt: new Date(),
+};
+
 function makeRequest(body: unknown, headers: Record<string, string> = {}): Request {
   return new Request("http://localhost/api/orders", {
     method: "POST",
@@ -72,12 +86,7 @@ describe("POST /api/orders — ownership cannot be overridden by the client (CR0
   });
 
   it("uses the authenticated session's user id, ignoring a client-supplied userId in the body", async () => {
-    mockGetCurrentUser.mockResolvedValueOnce({
-      id: "real-user-a",
-      email: "a@example.com",
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    });
+    mockGetCurrentUser.mockResolvedValueOnce(AUTHENTICATED_USER);
     mockCreateOrderFromCheckout.mockResolvedValueOnce({
       ok: true,
       order: {
@@ -100,36 +109,14 @@ describe("POST /api/orders — ownership cannot be overridden by the client (CR0
     expect(callArg.userId).not.toBe("malicious-user-b");
   });
 
-  it("uses null (guest) when there is no authenticated session, regardless of a client-supplied userId", async () => {
-    mockGetCurrentUser.mockResolvedValueOnce(null);
-    mockCreateOrderFromCheckout.mockResolvedValueOnce({
-      ok: true,
-      order: {
-        id: "order-2",
-        status: "PENDING",
-        userId: null,
-        subtotalAmountMinor: 100,
-        deliveryAmountMinor: 0,
-        totalAmountMinor: 100,
-        currency: "USD",
-      },
-    });
-
-    const response = await POST(makeRequest(validBody({ userId: "malicious-user-b" })));
-
-    expect(response.status).toBe(201);
-    const callArg = mockCreateOrderFromCheckout.mock.calls[0]?.[0];
-    expect(callArg.userId).toBeNull();
-  });
-
-  it("ignores a client-supplied userId even when the field is absent entirely for a guest session", async () => {
-    mockGetCurrentUser.mockResolvedValueOnce(null);
+  it("ignores a client-supplied userId even when the field is absent entirely, using the authenticated session's id instead", async () => {
+    mockGetCurrentUser.mockResolvedValueOnce(AUTHENTICATED_USER);
     mockCreateOrderFromCheckout.mockResolvedValueOnce({
       ok: true,
       order: {
         id: "order-3",
         status: "PENDING",
-        userId: null,
+        userId: AUTHENTICATED_USER.id,
         subtotalAmountMinor: 100,
         deliveryAmountMinor: 0,
         totalAmountMinor: 100,
@@ -141,17 +128,17 @@ describe("POST /api/orders — ownership cannot be overridden by the client (CR0
 
     expect(response.status).toBe(201);
     const callArg = mockCreateOrderFromCheckout.mock.calls[0]?.[0];
-    expect(callArg.userId).toBeNull();
+    expect(callArg.userId).toBe(AUTHENTICATED_USER.id);
   });
 
   it("ignores a client-supplied status in the checkout body — initial status is never client-selectable (IMP-030)", async () => {
-    mockGetCurrentUser.mockResolvedValueOnce(null);
+    mockGetCurrentUser.mockResolvedValueOnce(AUTHENTICATED_USER);
     mockCreateOrderFromCheckout.mockResolvedValueOnce({
       ok: true,
       order: {
         id: "order-4",
         status: "PENDING",
-        userId: null,
+        userId: AUTHENTICATED_USER.id,
         subtotalAmountMinor: 100,
         deliveryAmountMinor: 0,
         totalAmountMinor: 100,
@@ -166,6 +153,47 @@ describe("POST /api/orders — ownership cannot be overridden by the client (CR0
     // trust — it hardcodes PENDING internally (see checkout-order.ts).
     const callArg = mockCreateOrderFromCheckout.mock.calls[0]?.[0];
     expect(callArg.status).toBeUndefined();
+  });
+});
+
+describe("POST /api/orders — account-first checkout requires an authenticated session", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("rejects with 401 UNAUTHENTICATED when there is no session, and never calls createOrderFromCheckout", async () => {
+    mockGetCurrentUser.mockResolvedValueOnce(null);
+
+    const response = await POST(makeRequest(validBody()));
+
+    expect(response.status).toBe(401);
+    const json = (await response.json()) as { error: string };
+    expect(json.error).toBe("UNAUTHENTICATED");
+    expect(mockCreateOrderFromCheckout).not.toHaveBeenCalled();
+  });
+
+  it("rejects with 401 even when a client-supplied userId is present in the body — guest checkout cannot be reinstated by supplying one", async () => {
+    mockGetCurrentUser.mockResolvedValueOnce(null);
+
+    const response = await POST(makeRequest(validBody({ userId: "someone-else" })));
+
+    expect(response.status).toBe(401);
+    expect(mockCreateOrderFromCheckout).not.toHaveBeenCalled();
+  });
+
+  it("checks authentication before Catalog/order creation runs, but after the Idempotency-Key header and request-body checks (consistent with the route's own existing validation order)", async () => {
+    // Deliberately does NOT mock `getCurrentUser` at all — the missing
+    // Idempotency-Key header must be rejected before the route ever calls
+    // it, so no queued return value should be consumed by this test (and
+    // none must be left dangling to leak into a later, unrelated test).
+    const response = await POST(makeRequestWithoutIdempotencyKey(validBody()));
+
+    // The missing-header check fires first — 400, not 401 — proving
+    // authentication isn't checked before more fundamental request
+    // validity, while still never reaching order creation either way.
+    expect(response.status).toBe(400);
+    expect(mockGetCurrentUser).not.toHaveBeenCalled();
+    expect(mockCreateOrderFromCheckout).not.toHaveBeenCalled();
   });
 });
 
@@ -219,14 +247,14 @@ describe("POST /api/orders — Idempotency-Key header contract (IMP-031)", () =>
   });
 
   it("does not read an idempotency key from the JSON body — only the header is honored", async () => {
-    mockGetCurrentUser.mockResolvedValueOnce(null);
+    mockGetCurrentUser.mockResolvedValueOnce(AUTHENTICATED_USER);
     mockCreateOrderFromCheckout.mockResolvedValueOnce({
       ok: true,
       created: true,
       order: {
         id: "order-idem-1",
         status: "PENDING",
-        userId: null,
+        userId: AUTHENTICATED_USER.id,
         subtotalAmountMinor: 100,
         deliveryAmountMinor: 0,
         totalAmountMinor: 100,
@@ -245,14 +273,14 @@ describe("POST /api/orders — Idempotency-Key header contract (IMP-031)", () =>
   });
 
   it("passes a valid Idempotency-Key header through to createOrderFromCheckout", async () => {
-    mockGetCurrentUser.mockResolvedValueOnce(null);
+    mockGetCurrentUser.mockResolvedValueOnce(AUTHENTICATED_USER);
     mockCreateOrderFromCheckout.mockResolvedValueOnce({
       ok: true,
       created: true,
       order: {
         id: "order-idem-2",
         status: "PENDING",
-        userId: null,
+        userId: AUTHENTICATED_USER.id,
         subtotalAmountMinor: 100,
         deliveryAmountMinor: 0,
         totalAmountMinor: 100,
@@ -276,14 +304,14 @@ describe("POST /api/orders — idempotency result handling (IMP-031)", () => {
   });
 
   it("returns 201 when createOrderFromCheckout reports created: true", async () => {
-    mockGetCurrentUser.mockResolvedValueOnce(null);
+    mockGetCurrentUser.mockResolvedValueOnce(AUTHENTICATED_USER);
     mockCreateOrderFromCheckout.mockResolvedValueOnce({
       ok: true,
       created: true,
       order: {
         id: "order-created",
         status: "PENDING",
-        userId: null,
+        userId: AUTHENTICATED_USER.id,
         subtotalAmountMinor: 100,
         deliveryAmountMinor: 0,
         totalAmountMinor: 100,
@@ -298,14 +326,14 @@ describe("POST /api/orders — idempotency result handling (IMP-031)", () => {
   });
 
   it("returns 200 (not 201) when createOrderFromCheckout reports created: false — a replayed submission, not a new Order", async () => {
-    mockGetCurrentUser.mockResolvedValueOnce(null);
+    mockGetCurrentUser.mockResolvedValueOnce(AUTHENTICATED_USER);
     mockCreateOrderFromCheckout.mockResolvedValueOnce({
       ok: true,
       created: false,
       order: {
         id: "order-replayed",
         status: "PENDING",
-        userId: null,
+        userId: AUTHENTICATED_USER.id,
         subtotalAmountMinor: 100,
         deliveryAmountMinor: 0,
         totalAmountMinor: 100,
@@ -320,7 +348,7 @@ describe("POST /api/orders — idempotency result handling (IMP-031)", () => {
   });
 
   it("returns 409 IDEMPOTENCY_KEY_CONFLICT when the key was already used for a different submission, and never leaks the other Order", async () => {
-    mockGetCurrentUser.mockResolvedValueOnce(null);
+    mockGetCurrentUser.mockResolvedValueOnce(AUTHENTICATED_USER);
     mockCreateOrderFromCheckout.mockResolvedValueOnce({
       ok: false,
       error: "IDEMPOTENCY_KEY_CONFLICT",

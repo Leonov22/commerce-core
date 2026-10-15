@@ -3,7 +3,12 @@ import { Container } from "@/shared/components/layout/container";
 import { Link } from "@/core/i18n/navigation";
 import { AccountRegisterForm } from "@/modules/identity/components/account-register-form";
 
-export async function AccountRegisterView() {
+interface AccountRegisterViewProps {
+  /** Already validated by the caller — see `AccountLoginView`'s identical prop doc comment. */
+  callbackUrl: string;
+}
+
+export async function AccountRegisterView({ callbackUrl }: AccountRegisterViewProps) {
   const t = await getTranslations("Account.register");
 
   return (
@@ -13,12 +18,15 @@ export async function AccountRegisterView() {
         <p className="mt-3 max-w-md text-muted-foreground">{t("intro")}</p>
 
         <div className="mt-10">
-          <AccountRegisterForm />
+          <AccountRegisterForm callbackUrl={callbackUrl} />
         </div>
 
         <p className="mt-6 text-sm text-muted-foreground">
           {t("haveAccount")}{" "}
-          <Link href="/account/login" className="font-medium text-foreground underline">
+          <Link
+            href={`/account/login?callbackUrl=${encodeURIComponent(callbackUrl)}`}
+            className="font-medium text-foreground underline"
+          >
             {t("loginLink")}
           </Link>
         </p>

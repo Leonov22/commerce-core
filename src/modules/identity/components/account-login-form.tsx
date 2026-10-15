@@ -7,7 +7,12 @@ import { useRouter } from "@/core/i18n/navigation";
 import { Button } from "@/shared/components/ui/button";
 import { AccountField } from "@/modules/identity/components/account-field";
 
-export function AccountLoginForm() {
+interface AccountLoginFormProps {
+  /** Already validated server-side by the caller — used verbatim, never re-validated here. */
+  callbackUrl: string;
+}
+
+export function AccountLoginForm({ callbackUrl }: AccountLoginFormProps) {
   const t = useTranslations("Account.login");
   const router = useRouter();
 
@@ -45,7 +50,7 @@ export function AccountLoginForm() {
       // `getCurrentUser()` to be re-evaluated for the destination route,
       // without a full page reload and without a second source of
       // authentication truth.
-      router.push("/account");
+      router.push(callbackUrl);
       router.refresh();
     } catch {
       setHasError(true);
