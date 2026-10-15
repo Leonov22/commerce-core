@@ -44,8 +44,15 @@ function CartProbe({ onItems }: { onItems: (items: CartItem[]) => void }) {
 describe("CartProvider — hydration survives React Strict Mode's double-invoked mount effects", () => {
   let container: HTMLDivElement;
   let root: Root | undefined;
+  // Captured before any test replaces `window.localStorage` (see the first
+  // test below) and unconditionally restored in `afterEach` — not inline
+  // at the end of that test's own body, which would never run if an
+  // `expect` above it throws, leaving the fake installed for every test
+  // that runs afterward.
+  let originalLocalStorage: Storage;
 
   beforeEach(() => {
+    originalLocalStorage = window.localStorage;
     window.localStorage.clear();
     container = document.createElement("div");
     document.body.appendChild(container);
@@ -58,6 +65,10 @@ describe("CartProvider — hydration survives React Strict Mode's double-invoked
       });
     }
     container.remove();
+    Object.defineProperty(window, "localStorage", {
+      value: originalLocalStorage,
+      configurable: true,
+    });
   });
 
   it("hydrates the persisted cart, and the pre-hydration empty state is never written to storage at any point — not even transiently", async () => {
@@ -79,8 +90,9 @@ describe("CartProvider — hydration survives React Strict Mode's double-invoked
     // intercept calls made from other modules (its methods are backed by
     // jsdom's internal implementation, not plain writable own properties),
     // so `window.localStorage` is replaced outright with a small recording
-    // fake backed by the same underlying real store, restored afterward.
-    const originalLocalStorage = window.localStorage;
+    // fake backed by the same underlying real store. Restored in
+    // `afterEach` above — unconditionally, even if an assertion below
+    // throws — never inline here.
     const backingStore = new Map<string, string>();
     for (let i = 0; i < originalLocalStorage.length; i++) {
       const key = originalLocalStorage.key(i);
@@ -143,11 +155,6 @@ describe("CartProvider — hydration survives React Strict Mode's double-invoked
 
     const stillStored = JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? "null");
     expect(stillStored).toEqual(persisted);
-
-    Object.defineProperty(window, "localStorage", {
-      value: originalLocalStorage,
-      configurable: true,
-    });
   });
 
   it("still hydrates correctly (no crash, no stale write) when nothing was previously stored", async () => {
