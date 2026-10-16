@@ -96,17 +96,30 @@ export interface ProductRepository {
   createCategory(input: { slug: string; name: string; sortOrder: number }): Promise<Category>;
 
   /**
-   * IMP-046: sets (creates or replaces) the product's single image.
-   * Returns `null` if no product exists with this id — never throws for
-   * "not found", mirroring `updateProduct`. Deliberately separate from
-   * `updateProduct`/`AdminProductInput`: image management has its own
-   * authorization/validation path (a Vercel Blob upload), never the
-   * general create/update JSON body.
+   * IMP-046 (CR-046-01: concurrent replacement race fix). Atomic
+   * compare-and-set for the product's single image: writes the new
+   * `image` ONLY if the product's current `imageUrl` still equals
+   * `expectedCurrentImageUrl` exactly (a plain read-then-write, as the
+   * old `setProductImage`/`clearProductImage` methods did, cannot
+   * express this — a second writer's update between the read and the
+   * write would be silently lost). `expectedCurrentImageUrl: null`
+   * matches a product that currently has no image.
+   *
+   * Returns the updated `AdminProduct` if the compare-and-set
+   * succeeded (exactly one row matched both the id and the expected
+   * current image). Returns `null` if no product exists with this id
+   * OR the product's image has already changed since
+   * `expectedCurrentImageUrl` was read — callers that need to tell
+   * these two cases apart re-check existence themselves (see
+   * `admin-product-image-commands.ts`).
+   *
+   * Used for both setting/replacing (`image.imageUrl` a string) and
+   * clearing (`image.imageUrl: null`) — one primitive for both, since
+   * both are "only change the image if it's still what I last saw".
    */
-  setProductImage(
+  compareAndSetProductImage(
     productId: string,
-    image: { imageUrl: string; imageAlt: string | null },
+    expectedCurrentImageUrl: string | null,
+    image: { imageUrl: string | null; imageAlt: string | null },
   ): Promise<AdminProduct | null>;
-  /** Clears the product's image fields back to `null`. Returns `null` if no product exists with this id. */
-  clearProductImage(productId: string): Promise<AdminProduct | null>;
 }

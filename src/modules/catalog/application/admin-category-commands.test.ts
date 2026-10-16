@@ -42,10 +42,7 @@ function makeFakeRepository(existingSlugs: string[] = []): {
     async categorySlugExists(slug) {
       return existingSlugs.includes(slug);
     },
-    async setProductImage() {
-      throw new Error("not used");
-    },
-    async clearProductImage() {
+    async compareAndSetProductImage() {
       throw new Error("not used");
     },
     async createCategory(input): Promise<Category> {

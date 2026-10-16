@@ -357,30 +357,32 @@ export const prismaProductRepository: ProductRepository = {
     return category!;
   },
 
-  async setProductImage(
+  async compareAndSetProductImage(
     productId: string,
-    image: { imageUrl: string; imageAlt: string | null },
+    expectedCurrentImageUrl: string | null,
+    image: { imageUrl: string | null; imageAlt: string | null },
   ): Promise<AdminProduct | null> {
-    const existing = await prisma.product.findUnique({ where: { id: productId } });
-    if (!existing) {
-      return null;
-    }
-    const row = await prisma.product.update({
-      where: { id: productId },
+    // `updateMany` (not `update`), because `update`'s `where` can only
+    // ever identify a row by a unique field — it cannot additionally
+    // condition the write on `imageUrl`'s current value. `updateMany`
+    // accepts an arbitrary filter, and its `count` tells us atomically,
+    // in one round trip, whether the row actually matched BOTH `id` AND
+    // `imageUrl: expectedCurrentImageUrl` at the moment of the write —
+    // exactly the compare-and-set this needs. A separate
+    // read-then-write (what the earlier `setProductImage`/
+    // `clearProductImage` did) cannot give that guarantee: another
+    // writer's update landing between the read and the write would be
+    // silently overwritten. Mirrors `set-product-currency.ts`'s own
+    // `updateMany` + exact-count-check precedent.
+    const result = await prisma.product.updateMany({
+      where: { id: productId, imageUrl: expectedCurrentImageUrl },
       data: { imageUrl: image.imageUrl, imageAlt: image.imageAlt },
-      include: ADMIN_PRODUCT_INCLUDE,
     });
-    return toAdminProduct(row);
-  },
-
-  async clearProductImage(productId: string): Promise<AdminProduct | null> {
-    const existing = await prisma.product.findUnique({ where: { id: productId } });
-    if (!existing) {
+    if (result.count !== 1) {
       return null;
     }
-    const row = await prisma.product.update({
+    const row = await prisma.product.findUniqueOrThrow({
       where: { id: productId },
-      data: { imageUrl: null, imageAlt: null },
       include: ADMIN_PRODUCT_INCLUDE,
     });
     return toAdminProduct(row);

@@ -101,10 +101,7 @@ function makeFakeRepository(products: Product[], categories: Category[]): Produc
     async createCategory() {
       throw new Error("not used by these tests");
     },
-    async setProductImage() {
-      throw new Error("not used by these tests");
-    },
-    async clearProductImage() {
+    async compareAndSetProductImage() {
       throw new Error("not used by these tests");
     },
   };

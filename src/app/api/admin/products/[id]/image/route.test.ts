@@ -5,16 +5,19 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  * don't re-test it. They capture the `onBeforeGenerateToken`/
  * `onUploadCompleted` callbacks this route passes to it and invoke them
  * directly, which is exactly the boundary this route owns: authorization,
- * pathname/product-identity verification, and the database write.
+ * pathname/product-identity verification, the compare-and-set precondition
+ * (`baseImageUrl`), and the database write (CR-046-01).
  */
 const {
   mockGetCurrentUser,
+  mockGetAdminProduct,
   mockConfirmAdminProductImageUpload,
   mockRemoveAdminProductImage,
   mockDeleteProductImageBlob,
   mockHandleUpload,
 } = vi.hoisted(() => ({
   mockGetCurrentUser: vi.fn(),
+  mockGetAdminProduct: vi.fn(),
   mockConfirmAdminProductImageUpload: vi.fn(),
   mockRemoveAdminProductImage: vi.fn(),
   mockDeleteProductImageBlob: vi.fn(),
@@ -27,6 +30,7 @@ vi.mock("@/modules/identity", () => ({
 }));
 
 vi.mock("@/modules/catalog", () => ({
+  getAdminProduct: mockGetAdminProduct,
   confirmAdminProductImageUpload: mockConfirmAdminProductImageUpload,
   removeAdminProductImage: mockRemoveAdminProductImage,
   deleteProductImageBlob: mockDeleteProductImageBlob,
@@ -58,7 +62,7 @@ function capturedOptions() {
   const call = mockHandleUpload.mock.calls[0]?.[0];
   if (!call) throw new Error("handleUpload was not called");
   return call as {
-    onBeforeGenerateToken: (pathname: string) => Promise<unknown>;
+    onBeforeGenerateToken: (pathname: string) => Promise<{ tokenPayload: string }>;
     onUploadCompleted: (args: {
       blob: { url: string; pathname: string };
       tokenPayload: string | null;
@@ -75,7 +79,7 @@ describe("POST /api/admin/products/[id]/image — onBeforeGenerateToken (token i
     });
   });
 
-  it("rejects an unauthenticated token request", async () => {
+  it("rejects an unauthenticated token request, never reading the product", async () => {
     mockGetCurrentUser.mockResolvedValueOnce(null);
     await POST(makeTokenRequest(), makeParams("product-1"));
 
@@ -83,6 +87,7 @@ describe("POST /api/admin/products/[id]/image — onBeforeGenerateToken (token i
     await expect(onBeforeGenerateToken("products/product-1/image")).rejects.toThrow(
       "UNAUTHENTICATED",
     );
+    expect(mockGetAdminProduct).not.toHaveBeenCalled();
   });
 
   it("rejects a token request from an authenticated non-admin", async () => {
@@ -103,8 +108,21 @@ describe("POST /api/admin/products/[id]/image — onBeforeGenerateToken (token i
     );
   });
 
-  it("issues token options restricted to the three allowed image types and a bounded size for an authorized admin", async () => {
+  it("rejects when the product no longer exists", async () => {
     mockGetCurrentUser.mockResolvedValueOnce(ADMIN_USER);
+    mockGetAdminProduct.mockResolvedValueOnce(null);
+    await POST(makeTokenRequest(), makeParams("product-1"));
+
+    const { onBeforeGenerateToken } = capturedOptions();
+    await expect(onBeforeGenerateToken("products/product-1/image")).rejects.toThrow("NOT_FOUND");
+  });
+
+  it("issues token options restricted to the three allowed image types, a bounded size, and embeds the product's CURRENT imageUrl as baseImageUrl", async () => {
+    mockGetCurrentUser.mockResolvedValueOnce(ADMIN_USER);
+    mockGetAdminProduct.mockResolvedValueOnce({
+      id: "product-1",
+      imageUrl: "https://example.public.blob.vercel-storage.com/products/product-1/old",
+    });
     await POST(makeTokenRequest(), makeParams("product-1"));
 
     const { onBeforeGenerateToken } = capturedOptions();
@@ -116,7 +134,26 @@ describe("POST /api/admin/products/[id]/image — onBeforeGenerateToken (token i
 
     expect(options.allowedContentTypes).toEqual(["image/jpeg", "image/png", "image/webp"]);
     expect(options.maximumSizeInBytes).toBeGreaterThan(0);
-    expect(JSON.parse(options.tokenPayload)).toEqual({ productId: "product-1" });
+    expect(JSON.parse(options.tokenPayload)).toEqual({
+      productId: "product-1",
+      baseImageUrl: "https://example.public.blob.vercel-storage.com/products/product-1/old",
+    });
+  });
+
+  it("embeds baseImageUrl: null for a product with no current image", async () => {
+    mockGetCurrentUser.mockResolvedValueOnce(ADMIN_USER);
+    mockGetAdminProduct.mockResolvedValueOnce({ id: "product-1", imageUrl: null });
+    await POST(makeTokenRequest(), makeParams("product-1"));
+
+    const { onBeforeGenerateToken } = capturedOptions();
+    const options = (await onBeforeGenerateToken("products/product-1/image")) as {
+      tokenPayload: string;
+    };
+
+    expect(JSON.parse(options.tokenPayload)).toEqual({
+      productId: "product-1",
+      baseImageUrl: null,
+    });
   });
 
   it("returns 400 when handleUpload itself rejects (e.g. a malformed/unsigned request)", async () => {
@@ -126,7 +163,7 @@ describe("POST /api/admin/products/[id]/image — onBeforeGenerateToken (token i
   });
 });
 
-describe("POST /api/admin/products/[id]/image — onUploadCompleted (confirmation)", () => {
+describe("POST /api/admin/products/[id]/image — onUploadCompleted (confirmation, CR-046-01)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockHandleUpload.mockResolvedValue({
@@ -147,15 +184,16 @@ describe("POST /api/admin/products/[id]/image — onUploadCompleted (confirmatio
     await expect(
       onUploadCompleted({
         blob: BLOB,
-        tokenPayload: JSON.stringify({ productId: "some-other-product" }),
+        tokenPayload: JSON.stringify({ productId: "some-other-product", baseImageUrl: null }),
       }),
     ).rejects.toThrow("PRODUCT_MISMATCH");
     expect(mockConfirmAdminProductImageUpload).not.toHaveBeenCalled();
   });
 
-  it("confirms the upload and deletes the previous blob after the database write succeeds", async () => {
+  it("passes baseImageUrl from the tokenPayload through to confirmAdminProductImageUpload", async () => {
     mockConfirmAdminProductImageUpload.mockResolvedValueOnce({
       ok: true,
+      applied: true,
       product: { id: "product-1" },
       previousImageUrl: "https://example.public.blob.vercel-storage.com/products/product-1/old",
     });
@@ -164,7 +202,10 @@ describe("POST /api/admin/products/[id]/image — onUploadCompleted (confirmatio
     const { onUploadCompleted } = capturedOptions();
     await onUploadCompleted({
       blob: BLOB,
-      tokenPayload: JSON.stringify({ productId: "product-1" }),
+      tokenPayload: JSON.stringify({
+        productId: "product-1",
+        baseImageUrl: "https://example.public.blob.vercel-storage.com/products/product-1/old",
+      }),
     });
 
     expect(mockConfirmAdminProductImageUpload).toHaveBeenCalledWith({
@@ -172,15 +213,34 @@ describe("POST /api/admin/products/[id]/image — onUploadCompleted (confirmatio
       imageUrl: BLOB.url,
       pathname: BLOB.pathname,
       imageAlt: null,
+      baseImageUrl: "https://example.public.blob.vercel-storage.com/products/product-1/old",
     });
+  });
+
+  it("deletes the previous blob only when the confirmation reports applied: true", async () => {
+    mockConfirmAdminProductImageUpload.mockResolvedValueOnce({
+      ok: true,
+      applied: true,
+      product: { id: "product-1" },
+      previousImageUrl: "https://example.public.blob.vercel-storage.com/products/product-1/old",
+    });
+
+    await POST(makeTokenRequest(), makeParams("product-1"));
+    const { onUploadCompleted } = capturedOptions();
+    await onUploadCompleted({
+      blob: BLOB,
+      tokenPayload: JSON.stringify({ productId: "product-1", baseImageUrl: "old" }),
+    });
+
     expect(mockDeleteProductImageBlob).toHaveBeenCalledWith(
       "https://example.public.blob.vercel-storage.com/products/product-1/old",
     );
   });
 
-  it("does not attempt to delete anything when there was no previous image", async () => {
+  it("does not attempt to delete anything when applied is true but there was no previous image", async () => {
     mockConfirmAdminProductImageUpload.mockResolvedValueOnce({
       ok: true,
+      applied: true,
       product: { id: "product-1" },
       previousImageUrl: null,
     });
@@ -189,7 +249,52 @@ describe("POST /api/admin/products/[id]/image — onUploadCompleted (confirmatio
     const { onUploadCompleted } = capturedOptions();
     await onUploadCompleted({
       blob: BLOB,
-      tokenPayload: JSON.stringify({ productId: "product-1" }),
+      tokenPayload: JSON.stringify({ productId: "product-1", baseImageUrl: null }),
+    });
+
+    expect(mockDeleteProductImageBlob).not.toHaveBeenCalled();
+  });
+
+  it("CR-046-01: never deletes anything when the confirmation reports applied: false (DUPLICATE_CURRENT) — a retry of an already-applied completion", async () => {
+    mockConfirmAdminProductImageUpload.mockResolvedValue({
+      ok: true,
+      applied: false,
+      reason: "DUPLICATE_CURRENT",
+      product: { id: "product-1", imageUrl: BLOB.url },
+    });
+
+    await POST(makeTokenRequest(), makeParams("product-1"));
+    const { onUploadCompleted } = capturedOptions();
+
+    await onUploadCompleted({
+      blob: BLOB,
+      tokenPayload: JSON.stringify({ productId: "product-1", baseImageUrl: null }),
+    });
+    await onUploadCompleted({
+      blob: BLOB,
+      tokenPayload: JSON.stringify({ productId: "product-1", baseImageUrl: null }),
+    });
+
+    expect(mockDeleteProductImageBlob).not.toHaveBeenCalled();
+  });
+
+  it("CR-046-01: never deletes anything when the confirmation reports applied: false (STALE_SUPERSEDED) — a delayed retry of a completion a newer upload already replaced", async () => {
+    mockConfirmAdminProductImageUpload.mockResolvedValueOnce({
+      ok: true,
+      applied: false,
+      reason: "STALE_SUPERSEDED",
+      product: {
+        id: "product-1",
+        imageUrl: "https://example.public.blob.vercel-storage.com/products/product-1/image-b",
+      },
+    });
+
+    await POST(makeTokenRequest(), makeParams("product-1"));
+    const { onUploadCompleted } = capturedOptions();
+
+    await onUploadCompleted({
+      blob: BLOB,
+      tokenPayload: JSON.stringify({ productId: "product-1", baseImageUrl: "old" }),
     });
 
     expect(mockDeleteProductImageBlob).not.toHaveBeenCalled();
@@ -202,35 +307,16 @@ describe("POST /api/admin/products/[id]/image — onUploadCompleted (confirmatio
     const { onUploadCompleted } = capturedOptions();
 
     await expect(
-      onUploadCompleted({ blob: BLOB, tokenPayload: JSON.stringify({ productId: "product-1" }) }),
+      onUploadCompleted({
+        blob: BLOB,
+        tokenPayload: JSON.stringify({ productId: "product-1", baseImageUrl: null }),
+      }),
     ).rejects.toThrow("NOT_FOUND");
-    expect(mockDeleteProductImageBlob).not.toHaveBeenCalled();
-  });
-
-  it("handles a duplicate completion delivery (Vercel webhook retry) safely: the idempotent confirm reports no previousImageUrl, so nothing is deleted twice", async () => {
-    mockConfirmAdminProductImageUpload.mockResolvedValue({
-      ok: true,
-      product: { id: "product-1" },
-      previousImageUrl: null,
-    });
-
-    await POST(makeTokenRequest(), makeParams("product-1"));
-    const { onUploadCompleted } = capturedOptions();
-
-    await onUploadCompleted({
-      blob: BLOB,
-      tokenPayload: JSON.stringify({ productId: "product-1" }),
-    });
-    await onUploadCompleted({
-      blob: BLOB,
-      tokenPayload: JSON.stringify({ productId: "product-1" }),
-    });
-
     expect(mockDeleteProductImageBlob).not.toHaveBeenCalled();
   });
 });
 
-describe("DELETE /api/admin/products/[id]/image", () => {
+describe("DELETE /api/admin/products/[id]/image (CR-046-01)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -249,7 +335,7 @@ describe("DELETE /api/admin/products/[id]/image", () => {
     expect(mockRemoveAdminProductImage).not.toHaveBeenCalled();
   });
 
-  it("returns 404 when the product has no matching record (missing image / missing product)", async () => {
+  it("returns 404 when the product has no matching record", async () => {
     mockGetCurrentUser.mockResolvedValueOnce(ADMIN_USER);
     mockRemoveAdminProductImage.mockResolvedValueOnce({ ok: false, error: "NOT_FOUND" });
 
@@ -261,6 +347,7 @@ describe("DELETE /api/admin/products/[id]/image", () => {
     mockGetCurrentUser.mockResolvedValueOnce(ADMIN_USER);
     mockRemoveAdminProductImage.mockResolvedValueOnce({
       ok: true,
+      applied: true,
       previousImageUrl:
         "https://example.public.blob.vercel-storage.com/products/product-1/image-abc123",
     });
@@ -273,13 +360,31 @@ describe("DELETE /api/admin/products/[id]/image", () => {
     );
   });
 
-  it("is idempotent for a product with no image: succeeds without attempting any blob delete", async () => {
+  it("is idempotent for a product with no image (ALREADY_CLEARED): 200, without attempting any blob delete", async () => {
     mockGetCurrentUser.mockResolvedValueOnce(ADMIN_USER);
-    mockRemoveAdminProductImage.mockResolvedValueOnce({ ok: true, previousImageUrl: null });
+    mockRemoveAdminProductImage.mockResolvedValueOnce({
+      ok: true,
+      applied: false,
+      reason: "ALREADY_CLEARED",
+    });
 
     const response = await DELETE(new Request("http://localhost"), makeParams("product-1"));
 
     expect(response.status).toBe(200);
+    expect(mockDeleteProductImageBlob).not.toHaveBeenCalled();
+  });
+
+  it("CR-046-01: returns 409 and deletes nothing when the image changed concurrently (CHANGED_CONCURRENTLY) — never deletes a blob a concurrent upload just replaced", async () => {
+    mockGetCurrentUser.mockResolvedValueOnce(ADMIN_USER);
+    mockRemoveAdminProductImage.mockResolvedValueOnce({
+      ok: true,
+      applied: false,
+      reason: "CHANGED_CONCURRENTLY",
+    });
+
+    const response = await DELETE(new Request("http://localhost"), makeParams("product-1"));
+
+    expect(response.status).toBe(409);
     expect(mockDeleteProductImageBlob).not.toHaveBeenCalled();
   });
 });

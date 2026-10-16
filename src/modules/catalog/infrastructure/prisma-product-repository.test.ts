@@ -136,4 +136,97 @@ describe("prismaProductRepository", () => {
       expect(categories[0]?.translation.name).toBe("Seating");
     });
   });
+
+  /**
+   * IMP-046 (CR-046-01: concurrent replacement race fix). Integration
+   * tests against the real Prisma `updateMany`-based compare-and-set —
+   * confirming it actually behaves atomically against real Postgres
+   * (including the `IS NULL` semantics for a product with no image),
+   * not just in the application-layer fakes (`admin-product-image-commands.test.ts`).
+   */
+  describe("compareAndSetProductImage", () => {
+    async function createTestProduct() {
+      const category = await prisma.category.findFirstOrThrow();
+      const product = await prisma.product.create({
+        data: {
+          slug: `test-cas-product-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          status: "DRAFT",
+          priceAmountMinor: 1000,
+          currency: "USD",
+          categoryId: category.id,
+          translations: {
+            create: {
+              locale: "en",
+              name: "CAS Test Product",
+              meta: "test",
+              description: "test",
+              material: "test",
+              dimensions: "test",
+            },
+          },
+        },
+      });
+      createdProductIds.push(product.id);
+      return product;
+    }
+
+    it("writes the new image when the expected current imageUrl (null) matches", async () => {
+      const product = await createTestProduct();
+      const updated = await prismaProductRepository.compareAndSetProductImage(product.id, null, {
+        imageUrl: "https://example.public.blob.vercel-storage.com/products/test/image-a",
+        imageAlt: null,
+      });
+      expect(updated?.imageUrl).toBe(
+        "https://example.public.blob.vercel-storage.com/products/test/image-a",
+      );
+    });
+
+    it("refuses to write when the expected current imageUrl no longer matches — the real compare-and-set precondition", async () => {
+      const product = await createTestProduct();
+      await prismaProductRepository.compareAndSetProductImage(product.id, null, {
+        imageUrl: "https://example.public.blob.vercel-storage.com/products/test/image-a",
+        imageAlt: null,
+      });
+
+      // A stale caller still expecting `null` (the ORIGINAL state) must
+      // be refused now that the image has already moved on to "image-a".
+      const staleResult = await prismaProductRepository.compareAndSetProductImage(
+        product.id,
+        null,
+        {
+          imageUrl: "https://example.public.blob.vercel-storage.com/products/test/image-stale",
+          imageAlt: null,
+        },
+      );
+      expect(staleResult).toBeNull();
+
+      const current = await prismaProductRepository.findByIdForAdmin(product.id);
+      expect(current?.imageUrl).toBe(
+        "https://example.public.blob.vercel-storage.com/products/test/image-a",
+      );
+    });
+
+    it("returns null for a nonexistent product", async () => {
+      const result = await prismaProductRepository.compareAndSetProductImage("nonexistent", null, {
+        imageUrl: "https://example.public.blob.vercel-storage.com/products/test/image-a",
+        imageAlt: null,
+      });
+      expect(result).toBeNull();
+    });
+
+    it("can clear the image back to null via compare-and-set", async () => {
+      const product = await createTestProduct();
+      await prismaProductRepository.compareAndSetProductImage(product.id, null, {
+        imageUrl: "https://example.public.blob.vercel-storage.com/products/test/image-a",
+        imageAlt: null,
+      });
+
+      const cleared = await prismaProductRepository.compareAndSetProductImage(
+        product.id,
+        "https://example.public.blob.vercel-storage.com/products/test/image-a",
+        { imageUrl: null, imageAlt: null },
+      );
+      expect(cleared?.imageUrl).toBeNull();
+    });
+  });
 });
