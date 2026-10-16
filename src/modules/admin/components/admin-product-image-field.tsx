@@ -17,6 +17,32 @@ const ACCEPTED_TYPES = ["image/jpeg", "image/png", "image/webp"];
 const MAX_BYTES = 8 * 1024 * 1024;
 
 /**
+ * A long, opaque run of token-like characters never belongs in UI text —
+ * this is a defensive redaction, not a claim that `upload()`'s own
+ * errors normally contain one. Catches accidental leakage (e.g. a
+ * provider error echoing part of a request) rather than assuming it
+ * can't happen.
+ */
+const SECRET_LIKE_PATTERN = /[A-Za-z0-9_-]{24,}/g;
+
+/**
+ * Surfaces the ACTUAL upload failure instead of a fixed, uninformative
+ * string — the previous blanket `catch { setErrorCode("UPLOAD_FAILED") }`
+ * discarded whatever `upload()` actually threw, which made a real
+ * diagnosis (e.g. a missing Blob credential vs. a network error vs. an
+ * authorization failure) impossible from the UI alone. The admin panel
+ * is authenticated/authorized-only, so a specific error message is safe
+ * to show here where it wouldn't be on a public page — still redacted
+ * defensively, and the full error is only ever logged to the browser's
+ * own console (`console.error`), never sent anywhere.
+ */
+function describeUploadError(error: unknown): string {
+  console.error("[admin-product-image-field] image upload failed", error);
+  const message = error instanceof Error && error.message ? error.message : "Unknown error";
+  return `Upload failed: ${message.replace(SECRET_LIKE_PATTERN, "[redacted]")}`;
+}
+
+/**
  * Upload/replace/remove UI for a product's single image (IMP-046).
  * Uploads go directly from this browser to Vercel Blob storage via
  * `upload()` — this component never sends file bytes to our own server
@@ -67,8 +93,8 @@ export function AdminProductImageField({ productId, imageUrl }: AdminProductImag
       });
       setPreviewUrl(blob.url);
       router.refresh();
-    } catch {
-      setErrorCode("UPLOAD_FAILED");
+    } catch (error) {
+      setErrorCode(describeUploadError(error));
     } finally {
       setIsBusy(false);
     }
