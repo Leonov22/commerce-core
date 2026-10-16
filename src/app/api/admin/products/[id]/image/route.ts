@@ -60,6 +60,23 @@ function expectedPathname(productId: string): string {
   return `products/${productId}/image`;
 }
 
+/**
+ * Diagnostic-only redaction, mirroring `admin-product-image-field.tsx`'s
+ * own client-side one: never let anything resembling a token/secret
+ * value reach Vercel's Function logs, even defensively — none of the
+ * errors this route is expected to throw (its own `Error` messages, or
+ * `@vercel/blob`'s own error text) legitimately contain one, but this
+ * guards against an unexpected message echoing part of a request
+ * anyway. Logs only the error's own name/message and the (non-secret)
+ * `productId` already visible in the URL — never headers, cookies, or
+ * the request body.
+ */
+const SECRET_LIKE_PATTERN = /[A-Za-z0-9_-]{24,}/g;
+
+function redact(value: string): string {
+  return value.replace(SECRET_LIKE_PATTERN, "[redacted]");
+}
+
 interface UploadTokenPayload {
   productId: string;
   baseImageUrl: string | null;
@@ -146,6 +163,18 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
 
     return NextResponse.json(jsonResponse);
   } catch (error) {
+    // The browser never sees this — `@vercel/blob/client`'s `upload()`
+    // discards the response body on any non-2xx status and throws its
+    // own generic "Failed to retrieve the client token" instead. This
+    // is the one place the real reason (one of our own thrown checks
+    // above, or a failure inside `handleUpload`'s own call to the Blob
+    // API, e.g. a missing/invalid credential) is actually visible —
+    // in this route's own Vercel Function logs.
+    console.error("[api/admin/products/[id]/image] POST failed", {
+      productId,
+      errorName: error instanceof Error ? error.name : typeof error,
+      errorMessage: redact(error instanceof Error ? error.message : String(error)),
+    });
     return NextResponse.json(
       { error: error instanceof Error ? error.message : "UNKNOWN_ERROR" },
       { status: 400 },
