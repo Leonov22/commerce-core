@@ -29,6 +29,10 @@ export interface Product {
   badge: ProductBadge | null;
   isFeatured: boolean;
   sortOrder: number;
+  /** IMP-046: the product's single image, if one has been uploaded. A Vercel Blob public URL, never a local path. */
+  imageUrl: string | null;
+  /** Admin-set alt text; `null` means the storefront should fall back to the product's own name. */
+  imageAlt: string | null;
   /** Translation resolved for the locale that was requested. */
   translation: ProductTranslation;
 }

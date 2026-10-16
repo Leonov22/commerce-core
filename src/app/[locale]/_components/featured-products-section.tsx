@@ -65,6 +65,8 @@ export async function FeaturedProductsSection() {
                     : undefined
               }
               imageLabel={t("imagePlaceholder")}
+              imageUrl={product.imageUrl}
+              imageAlt={product.imageAlt}
               href={productDetailsHref(product.id)}
             />
           ))}

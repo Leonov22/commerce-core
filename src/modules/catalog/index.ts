@@ -8,7 +8,18 @@
 import "server-only";
 import { prismaProductRepository } from "@/modules/catalog/infrastructure/prisma-product-repository";
 import * as catalogQueries from "@/modules/catalog/application/catalog-queries";
-import type { ProductListFilter } from "@/modules/catalog/repositories/product-repository";
+import * as adminProductQueries from "@/modules/catalog/application/admin-product-queries";
+import * as adminProductCommands from "@/modules/catalog/application/admin-product-commands";
+import * as adminCategoryCommands from "@/modules/catalog/application/admin-category-commands";
+import * as adminProductImageCommands from "@/modules/catalog/application/admin-product-image-commands";
+import { deleteProductImageBlob as deleteProductImageBlobImpl } from "@/modules/catalog/infrastructure/product-image-blob-storage";
+import type {
+  ProductListFilter,
+  AdminProductListOptions,
+} from "@/modules/catalog/repositories/product-repository";
+import type { RawAdminProductInput } from "@/modules/catalog/application/admin-product-commands";
+import type { RawAdminCategoryInput } from "@/modules/catalog/application/admin-category-commands";
+import type { ConfirmProductImageUploadInput } from "@/modules/catalog/application/admin-product-image-commands";
 
 export type {
   Product,
@@ -20,6 +31,33 @@ export type { Category, CategoryTranslation } from "@/modules/catalog/domain/cat
 export type { ProductListFilter } from "@/modules/catalog/repositories/product-repository";
 export type { StorefrontProductSummary } from "@/modules/catalog/presentation/storefront-product";
 export { toStorefrontProductSummary } from "@/modules/catalog/presentation/storefront-product";
+
+// Admin Panel (IMP-043) — exported from this same barrel, not a separate
+// module entry point: it is the same Catalog domain/repository, just with
+// broader, authorization-gated operations the storefront never needed.
+export type { AdminProduct, AdminProductListItem } from "@/modules/catalog/domain/admin-product";
+export type {
+  AdminProductListFilter,
+  AdminProductListOptions,
+  AdminProductListPage,
+  AdminProductSortField,
+} from "@/modules/catalog/repositories/product-repository";
+export type {
+  RawAdminProductInput,
+  CreateAdminProductResult,
+  UpdateAdminProductResult,
+  AdminProductValidationError,
+} from "@/modules/catalog/application/admin-product-commands";
+export type {
+  RawAdminCategoryInput,
+  CreateAdminCategoryResult,
+} from "@/modules/catalog/application/admin-category-commands";
+export type {
+  ConfirmProductImageUploadInput,
+  ConfirmProductImageUploadResult,
+  RemoveProductImageResult,
+  AdminProductImageError,
+} from "@/modules/catalog/application/admin-product-image-commands";
 
 export function getProductById(id: string, locale: string) {
   return catalogQueries.getProductById(prismaProductRepository, id, locale);
@@ -35,4 +73,37 @@ export function listProducts(locale: string, filter?: ProductListFilter) {
 
 export function listCategories(locale: string) {
   return catalogQueries.listCategories(prismaProductRepository, locale);
+}
+
+export function listAdminProducts(options: AdminProductListOptions) {
+  return adminProductQueries.listAdminProducts(prismaProductRepository, options);
+}
+
+export function getAdminProduct(id: string) {
+  return adminProductQueries.getAdminProduct(prismaProductRepository, id);
+}
+
+export function createAdminProduct(input: RawAdminProductInput) {
+  return adminProductCommands.createAdminProduct(prismaProductRepository, input);
+}
+
+export function updateAdminProduct(id: string, input: RawAdminProductInput) {
+  return adminProductCommands.updateAdminProduct(prismaProductRepository, id, input);
+}
+
+export function createAdminCategory(input: RawAdminCategoryInput) {
+  return adminCategoryCommands.createAdminCategory(prismaProductRepository, input);
+}
+
+export function confirmAdminProductImageUpload(input: ConfirmProductImageUploadInput) {
+  return adminProductImageCommands.confirmAdminProductImageUpload(prismaProductRepository, input);
+}
+
+export function removeAdminProductImage(productId: string) {
+  return adminProductImageCommands.removeAdminProductImage(prismaProductRepository, productId);
+}
+
+/** IMP-046: re-exported so route code never reaches into `@/modules/catalog/infrastructure` directly. */
+export function deleteProductImageBlob(url: string) {
+  return deleteProductImageBlobImpl(url);
 }

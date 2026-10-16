@@ -28,6 +28,7 @@ function makeFakeRepository(seed: UserRecord[] = []): {
       const user: User = {
         id: `fake-user-${users.length + 1}`,
         email: input.email,
+        role: "CUSTOMER",
         createdAt: now,
         updatedAt: now,
       };
@@ -97,6 +98,7 @@ describe("registerUser", () => {
       {
         id: "existing-user",
         email: "jane@example.com",
+        role: "CUSTOMER",
         passwordHash: "irrelevant",
         createdAt: now,
         updatedAt: now,

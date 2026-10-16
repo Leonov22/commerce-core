@@ -65,6 +65,8 @@ vi.mock("@/modules/catalog", async (importOriginal) => {
     badge: null,
     isFeatured: false,
     sortOrder: 0,
+    imageUrl: null,
+    imageAlt: null,
     translation: {
       locale: "en",
       name: "QA Overflow Fixture",
@@ -85,6 +87,8 @@ vi.mock("@/modules/catalog", async (importOriginal) => {
     badge: null,
     isFeatured: false,
     sortOrder: 0,
+    imageUrl: null,
+    imageAlt: null,
     translation: {
       locale: "en",
       name: "QA Mixed Currency Fixture",

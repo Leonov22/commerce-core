@@ -23,6 +23,8 @@ function makeProduct(overrides: Partial<Product> = {}): Product {
     badge: null,
     isFeatured: false,
     sortOrder: 0,
+    imageUrl: null,
+    imageAlt: null,
     translation: {
       locale: "en",
       name: "Studio Chair",
@@ -70,6 +72,40 @@ function makeFakeRepository(products: Product[], categories: Category[]): Produc
     },
     async listCategories() {
       return categories;
+    },
+    // IMP-043 (Admin Panel) methods — not exercised by `catalog-queries`
+    // itself, which only ever calls the storefront-facing methods above;
+    // present only so this fake satisfies `ProductRepository`'s full
+    // shape.
+    async listForAdmin() {
+      throw new Error("not used by these tests");
+    },
+    async findByIdForAdmin() {
+      throw new Error("not used by these tests");
+    },
+    async createProduct() {
+      throw new Error("not used by these tests");
+    },
+    async updateProduct() {
+      throw new Error("not used by these tests");
+    },
+    async categoryExists() {
+      throw new Error("not used by these tests");
+    },
+    async slugExists() {
+      throw new Error("not used by these tests");
+    },
+    async categorySlugExists() {
+      throw new Error("not used by these tests");
+    },
+    async createCategory() {
+      throw new Error("not used by these tests");
+    },
+    async setProductImage() {
+      throw new Error("not used by these tests");
+    },
+    async clearProductImage() {
+      throw new Error("not used by these tests");
     },
   };
 }

@@ -13,6 +13,9 @@ export interface StorefrontProductSummary {
   priceAmountMinor: number;
   currency: string;
   badge: "NEW" | "LIMITED" | null;
+  /** IMP-046: see `Product.imageUrl`'s own doc comment. */
+  imageUrl: string | null;
+  imageAlt: string | null;
 }
 
 export function toStorefrontProductSummary(product: Product): StorefrontProductSummary {
@@ -23,5 +26,7 @@ export function toStorefrontProductSummary(product: Product): StorefrontProductS
     priceAmountMinor: product.priceAmountMinor,
     currency: product.currency,
     badge: product.badge,
+    imageUrl: product.imageUrl,
+    imageAlt: product.imageAlt,
   };
 }

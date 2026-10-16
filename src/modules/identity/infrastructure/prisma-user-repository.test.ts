@@ -30,6 +30,9 @@ describe("prismaUserRepository", () => {
     expect(user.email).toBe(email);
     expect(user.id).toBeTruthy();
     expect("passwordHash" in user).toBe(false);
+    // IMP-043: every newly-registered user defaults to CUSTOMER — nothing
+    // in the public registration flow can grant ADMIN.
+    expect(user.role).toBe("CUSTOMER");
   });
 
   it("finds a user by email, including the password hash", async () => {

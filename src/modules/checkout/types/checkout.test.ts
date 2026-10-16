@@ -33,6 +33,8 @@ function makeProduct(overrides: Partial<CheckoutCatalogProduct> = {}): CheckoutC
     priceAmountMinor: 24000,
     currency: "USD",
     badge: null,
+    imageUrl: null,
+    imageAlt: null,
     ...overrides,
   };
 }

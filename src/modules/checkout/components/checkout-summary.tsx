@@ -1,4 +1,5 @@
 import { useLocale, useTranslations } from "next-intl";
+import Image from "next/image";
 import { Package } from "lucide-react";
 import { formatProductPrice } from "@/modules/catalog/client";
 import type { StorefrontProductSummary } from "@/modules/catalog/client";
@@ -64,16 +65,28 @@ export function CheckoutSummary({
       <ul className="mt-6 flex flex-col gap-4">
         {lines.map(({ item, product, lineTotalAmountMinor }) => (
           <li key={item.productId} className="flex items-start gap-3">
-            <div
-              role="img"
-              aria-label={tCatalog("imagePlaceholder")}
-              className="flex h-12 w-12 flex-none items-center justify-center rounded-md border border-border bg-muted"
-            >
-              <Package
-                aria-hidden="true"
-                className="h-5 w-5 text-muted-foreground"
-                strokeWidth={1.25}
-              />
+            <div className="relative flex h-12 w-12 flex-none items-center justify-center overflow-hidden rounded-md border border-border bg-muted">
+              {product.imageUrl ? (
+                <Image
+                  src={product.imageUrl}
+                  alt={product.imageAlt ?? product.name}
+                  fill
+                  sizes="48px"
+                  className="object-cover"
+                />
+              ) : (
+                <div
+                  role="img"
+                  aria-label={tCatalog("imagePlaceholder")}
+                  className="flex h-full w-full items-center justify-center"
+                >
+                  <Package
+                    aria-hidden="true"
+                    className="h-5 w-5 text-muted-foreground"
+                    strokeWidth={1.25}
+                  />
+                </div>
+              )}
             </div>
             <div className="flex flex-1 items-start justify-between gap-2 text-sm">
               <div>

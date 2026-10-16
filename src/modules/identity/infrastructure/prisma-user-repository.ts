@@ -5,12 +5,19 @@ import type {
   NewUserInput,
   UserRecord,
 } from "@/modules/identity/repositories/user-repository";
-import type { User } from "@/modules/identity/domain/user";
+import type { User, UserRole } from "@/modules/identity/domain/user";
 
-function toDomainUser(row: { id: string; email: string; createdAt: Date; updatedAt: Date }): User {
+function toDomainUser(row: {
+  id: string;
+  email: string;
+  role: string;
+  createdAt: Date;
+  updatedAt: Date;
+}): User {
   return {
     id: row.id,
     email: row.email,
+    role: row.role as UserRole,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };

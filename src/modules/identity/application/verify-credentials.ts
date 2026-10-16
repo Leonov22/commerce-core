@@ -40,6 +40,7 @@ export async function verifyCredentials(
   const user: User = {
     id: record.id,
     email: record.email,
+    role: record.role,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   };

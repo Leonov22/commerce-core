@@ -1,4 +1,5 @@
 import { useLocale, useTranslations } from "next-intl";
+import Image from "next/image";
 import { Package, X } from "lucide-react";
 import { formatProductPrice } from "@/modules/catalog/client";
 import type { StorefrontProductSummary } from "@/modules/catalog/client";
@@ -35,12 +36,28 @@ export function CartItem({
 
   return (
     <li className="flex gap-4 border-b border-border py-6 last:border-b-0">
-      <div
-        role="img"
-        aria-label={tCatalog("imagePlaceholder")}
-        className="flex h-24 w-24 flex-none items-center justify-center rounded-lg border border-border bg-muted"
-      >
-        <Package aria-hidden="true" className="h-8 w-8 text-muted-foreground" strokeWidth={1.25} />
+      <div className="relative flex h-24 w-24 flex-none items-center justify-center overflow-hidden rounded-lg border border-border bg-muted">
+        {product?.imageUrl ? (
+          <Image
+            src={product.imageUrl}
+            alt={product.imageAlt ?? name}
+            fill
+            sizes="96px"
+            className="object-cover"
+          />
+        ) : (
+          <div
+            role="img"
+            aria-label={tCatalog("imagePlaceholder")}
+            className="flex h-full w-full items-center justify-center"
+          >
+            <Package
+              aria-hidden="true"
+              className="h-8 w-8 text-muted-foreground"
+              strokeWidth={1.25}
+            />
+          </div>
+        )}
       </div>
 
       <div className="flex flex-1 flex-col justify-between">

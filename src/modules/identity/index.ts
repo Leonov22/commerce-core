@@ -21,7 +21,8 @@ import * as currentUserCommand from "@/modules/identity/application/current-user
 import type { RegisterUserInput } from "@/modules/identity/application/register-user";
 import type { VerifyCredentialsInput } from "@/modules/identity/application/verify-credentials";
 
-export type { User } from "@/modules/identity/domain/user";
+export type { User, UserRole } from "@/modules/identity/domain/user";
+export { isAdminUser } from "@/modules/identity/domain/user";
 export type {
   RegisterUserInput,
   RegisterUserResult,
@@ -34,6 +35,7 @@ export { UnauthenticatedError } from "@/modules/identity/application/current-use
 export {
   resolveProtectedPageRedirect,
   resolveGuestOnlyPageRedirect,
+  resolveAdminPageRedirect,
 } from "@/modules/identity/application/account-access";
 
 // Customer-facing account UI (IMP-028) — thin `app/[locale]/account/*`

@@ -76,6 +76,15 @@ model Product {
   isFeatured Boolean       @default(false)
   sortOrder  Int           @default(0)
 
+  // IMP-046: one optional image per product, stored in Vercel Blob —
+  // `imageUrl` is the Blob's own public URL (never a locally-written file
+  // path; see `product-image-blob-storage.ts`), `imageAlt` is admin-set
+  // alt text that the storefront falls back to the product's own name
+  // when null. Purely additive/nullable: every existing row has neither,
+  // which renders as the pre-existing placeholder.
+  imageUrl String?
+  imageAlt String?
+
   publishedAt DateTime?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
@@ -330,9 +339,17 @@ model PaymentWebhookEvent {
 // Deliberately minimal: authentication credentials only. Email is always
 // stored lowercased by the application layer, so the plain `@unique` below
 // is sufficient for case-insensitive uniqueness without a citext extension.
-// Profiles, addresses, roles, and any relation to Order belong to future
-// milestones once those requirements are approved — not introduced here.
+// Profiles and addresses remain future milestones once those requirements
+// are approved. `role` (IMP-043) is the one exception: Admin Panel access
+// control needed exactly one new distinction (customer vs admin), added as
+// the smallest safe, backward-compatible column rather than a full
+// profiles/roles redesign.
 // =============================================================================
+
+enum UserRole {
+  CUSTOMER
+  ADMIN
+}
 
 model User {
   id String @id @default(cuid())
@@ -341,6 +358,14 @@ model User {
 
   // Never exposed outside Identity's infrastructure/application layers.
   passwordHash String
+
+  // IMP-043: the smallest safe addition for admin authorization — every
+  // existing row gets `CUSTOMER` via the default, so this is purely
+  // additive and backward-compatible. Deliberately not a separate
+  // roles/permissions table: there is exactly one distinction needed
+  // today (customer vs admin), and a full RBAC model would be solving a
+  // problem this project doesn't have yet.
+  role UserRole @default(CUSTOMER)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

@@ -33,7 +33,13 @@ function makeFakeRepository(users: User[]): UserRepository {
 }
 
 const now = new Date();
-const realUser: User = { id: "user-1", email: "jane@example.com", createdAt: now, updatedAt: now };
+const realUser: User = {
+  id: "user-1",
+  email: "jane@example.com",
+  role: "CUSTOMER",
+  createdAt: now,
+  updatedAt: now,
+};
 
 describe("getCurrentUser", () => {
   it("resolves the repository user matching the session's user id", async () => {

@@ -9,7 +9,13 @@ function makeFakeRepository(seed: UserRecord[]): UserRepository {
   return {
     async create(input) {
       const now = new Date();
-      const user: User = { id: "new-user", email: input.email, createdAt: now, updatedAt: now };
+      const user: User = {
+        id: "new-user",
+        email: input.email,
+        role: "CUSTOMER",
+        createdAt: now,
+        updatedAt: now,
+      };
       return user;
     },
     async findByEmail(email) {
@@ -26,7 +32,14 @@ describe("verifyCredentials", () => {
     const passwordHash = await hashPassword("correct-horse");
     const now = new Date();
     const repository = makeFakeRepository([
-      { id: "user-1", email: "jane@example.com", passwordHash, createdAt: now, updatedAt: now },
+      {
+        id: "user-1",
+        email: "jane@example.com",
+        role: "CUSTOMER",
+        passwordHash,
+        createdAt: now,
+        updatedAt: now,
+      },
     ]);
 
     const result = await verifyCredentials(repository, {
@@ -45,7 +58,14 @@ describe("verifyCredentials", () => {
     const passwordHash = await hashPassword("correct-horse");
     const now = new Date();
     const repository = makeFakeRepository([
-      { id: "user-1", email: "jane@example.com", passwordHash, createdAt: now, updatedAt: now },
+      {
+        id: "user-1",
+        email: "jane@example.com",
+        role: "CUSTOMER",
+        passwordHash,
+        createdAt: now,
+        updatedAt: now,
+      },
     ]);
 
     const result = await verifyCredentials(repository, {

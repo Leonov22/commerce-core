@@ -1,4 +1,5 @@
 import { getLocale, getTranslations } from "next-intl/server";
+import Image from "next/image";
 import { ArrowLeft, Package } from "lucide-react";
 import { Link } from "@/core/i18n/navigation";
 import { Container } from "@/shared/components/layout/container";
@@ -43,16 +44,28 @@ export async function ProductDetailsView({ product, categoryName }: ProductDetai
         </Link>
 
         <div className="mt-8 grid items-start gap-12 lg:grid-cols-2 lg:gap-16">
-          <div
-            role="img"
-            aria-label={tDetails("imagePlaceholder")}
-            className="relative flex aspect-square items-center justify-center rounded-lg border border-border bg-muted"
-          >
-            <Package
-              aria-hidden="true"
-              className="h-16 w-16 text-muted-foreground"
-              strokeWidth={1.25}
-            />
+          <div className="relative flex aspect-square items-center justify-center overflow-hidden rounded-lg border border-border bg-muted">
+            {product.imageUrl ? (
+              <Image
+                src={product.imageUrl}
+                alt={product.imageAlt ?? name}
+                fill
+                sizes="(min-width: 1024px) 50vw, 100vw"
+                className="object-cover"
+              />
+            ) : (
+              <div
+                role="img"
+                aria-label={tDetails("imagePlaceholder")}
+                className="flex h-full w-full items-center justify-center"
+              >
+                <Package
+                  aria-hidden="true"
+                  className="h-16 w-16 text-muted-foreground"
+                  strokeWidth={1.25}
+                />
+              </div>
+            )}
             {badge ? (
               <span className="absolute left-4 top-4 rounded-full bg-background px-2.5 py-1 text-xs font-medium">
                 {badge}
