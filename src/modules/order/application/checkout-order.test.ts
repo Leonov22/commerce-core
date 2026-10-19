@@ -67,6 +67,8 @@ vi.mock("@/modules/catalog", async (importOriginal) => {
     sortOrder: 0,
     imageUrl: null,
     imageAlt: null,
+    effectivePriceAmountMinor: 1_200_000_000,
+    activeDiscount: null,
     translation: {
       locale: "en",
       name: "QA Overflow Fixture",
@@ -89,6 +91,8 @@ vi.mock("@/modules/catalog", async (importOriginal) => {
     sortOrder: 0,
     imageUrl: null,
     imageAlt: null,
+    effectivePriceAmountMinor: 10000,
+    activeDiscount: null,
     translation: {
       locale: "en",
       name: "QA Mixed Currency Fixture",

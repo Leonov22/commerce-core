@@ -80,7 +80,7 @@ export function getDeliveryAmountMinor(method: string): number | null {
 export interface CheckoutLine {
   item: CheckoutCartItem;
   product: CheckoutCatalogProduct;
-  /** Integer minor units: `product.priceAmountMinor * item.quantity`. Never a float. */
+  /** IMP-047: integer minor units: `product.effectivePriceAmountMinor * item.quantity` — the already-discounted price Catalog resolved server-side, never `priceAmountMinor` (the regular price) directly. Never a float. */
   lineTotalAmountMinor: number;
 }
 
@@ -140,7 +140,11 @@ export function resolveCheckoutSummary(
       unresolvedCount += 1;
       continue;
     }
-    lines.push({ item, product, lineTotalAmountMinor: product.priceAmountMinor * item.quantity });
+    lines.push({
+      item,
+      product,
+      lineTotalAmountMinor: product.effectivePriceAmountMinor * item.quantity,
+    });
   }
 
   // PR2-F02: resolved lines must share exactly one currency before a

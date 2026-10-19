@@ -44,6 +44,8 @@ function makeFakeRepository(
       sortOrder: input.sortOrder,
       imageUrl: null,
       imageAlt: null,
+      effectivePriceAmountMinor: input.priceAmountMinor,
+      activeDiscount: null,
       name: input.name,
       meta: input.meta,
       description: input.description,
@@ -91,10 +93,31 @@ function makeFakeRepository(
     async categorySlugExists() {
       throw new Error("not used by these tests");
     },
-    async createCategory() {
+    async compareAndSetProductImage() {
       throw new Error("not used by these tests");
     },
-    async compareAndSetProductImage() {
+    async listDiscountsForProduct() {
+      throw new Error("not used by these tests");
+    },
+    async listAdminDiscounts() {
+      throw new Error("not used by these tests");
+    },
+    async findAdminDiscountById() {
+      throw new Error("not used by these tests");
+    },
+    async createProductDiscount() {
+      throw new Error("not used by these tests");
+    },
+    async updateProductDiscount() {
+      throw new Error("not used by these tests");
+    },
+    async setProductDiscountActive() {
+      throw new Error("not used by these tests");
+    },
+    async deleteProductDiscount() {
+      throw new Error("not used by these tests");
+    },
+    async createCategory() {
       throw new Error("not used by these tests");
     },
   };

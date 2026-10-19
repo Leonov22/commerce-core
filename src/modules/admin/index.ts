@@ -15,3 +15,4 @@ export {
 } from "@/modules/admin/components/admin-states";
 export { AdminProductForm } from "@/modules/admin/components/admin-product-form";
 export { AdminCategoryCreateForm } from "@/modules/admin/components/admin-category-create-form";
+export { AdminDiscountForm } from "@/modules/admin/components/admin-discount-form";

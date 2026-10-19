@@ -26,15 +26,23 @@ function makeItem(productId: string, quantity: number): CheckoutCartItem {
 }
 
 function makeProduct(overrides: Partial<CheckoutCatalogProduct> = {}): CheckoutCatalogProduct {
+  // `effectivePriceAmountMinor` defaults to whatever `priceAmountMinor`
+  // ends up being (including an override) — these tests predate
+  // discounts and intend "no discount active", so the two must stay
+  // equal unless a test explicitly overrides `effectivePriceAmountMinor`
+  // itself (e.g. to simulate an active discount).
+  const priceAmountMinor = overrides.priceAmountMinor ?? 24000;
   return {
     id: "1",
     name: "Studio Chair",
     meta: "Oak & linen",
-    priceAmountMinor: 24000,
+    priceAmountMinor,
     currency: "USD",
     badge: null,
     imageUrl: null,
     imageAlt: null,
+    effectivePriceAmountMinor: priceAmountMinor,
+    activeDiscount: null,
     ...overrides,
   };
 }

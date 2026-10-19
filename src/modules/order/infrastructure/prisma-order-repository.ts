@@ -29,6 +29,7 @@ function toOrderCreateData(input: NewOrderInput) {
       create: input.items.map((item) => ({
         productId: item.productId,
         productName: item.productName,
+        regularUnitPriceAmountMinor: item.regularUnitPriceAmountMinor,
         unitPriceAmountMinor: item.unitPriceAmountMinor,
         quantity: item.quantity,
         lineTotalAmountMinor: item.lineTotalAmountMinor,
@@ -76,6 +77,7 @@ function toDomainOrderItem(row: OrderRow["items"][number]): OrderItem {
     orderId: row.orderId,
     productId: row.productId,
     productName: row.productName,
+    regularUnitPriceAmountMinor: row.regularUnitPriceAmountMinor,
     unitPriceAmountMinor: row.unitPriceAmountMinor,
     quantity: row.quantity,
     lineTotalAmountMinor: row.lineTotalAmountMinor,

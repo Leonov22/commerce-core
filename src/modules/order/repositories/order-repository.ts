@@ -3,6 +3,8 @@ import type { Order, OrderStatus } from "@/modules/order/domain/order";
 export interface NewOrderItemInput {
   productId: string;
   productName: string;
+  /** IMP-047: see `OrderItem.regularUnitPriceAmountMinor`'s own doc comment. */
+  regularUnitPriceAmountMinor: number;
   unitPriceAmountMinor: number;
   quantity: number;
   lineTotalAmountMinor: number;

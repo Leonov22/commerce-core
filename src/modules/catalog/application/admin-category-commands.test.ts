@@ -45,6 +45,27 @@ function makeFakeRepository(existingSlugs: string[] = []): {
     async compareAndSetProductImage() {
       throw new Error("not used");
     },
+    async listDiscountsForProduct() {
+      throw new Error("not used");
+    },
+    async listAdminDiscounts() {
+      throw new Error("not used");
+    },
+    async findAdminDiscountById() {
+      throw new Error("not used");
+    },
+    async createProductDiscount() {
+      throw new Error("not used");
+    },
+    async updateProductDiscount() {
+      throw new Error("not used");
+    },
+    async setProductDiscountActive() {
+      throw new Error("not used");
+    },
+    async deleteProductDiscount() {
+      throw new Error("not used");
+    },
     async createCategory(input): Promise<Category> {
       createCalls.push(input);
       return {

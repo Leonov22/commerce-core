@@ -91,12 +91,59 @@ model Product {
 
   category     Category             @relation(fields: [categoryId], references: [id], onDelete: Restrict)
   translations ProductTranslation[]
+  discounts    ProductDiscount[]
 
   @@index([status])
   @@index([categoryId])
   @@index([isFeatured])
   @@index([status, sortOrder])
   @@map("products")
+}
+
+// IMP-047: a product discount — percentage or fixed-amount, time-bounded,
+// independently activatable. Deliberately per-product (not category-wide
+// or cart-wide — out of scope per IMP-047's own ticket), and deliberately
+// NOT a denormalized "promo price" column on `Product` itself: a product
+// can accumulate several discounts over time (past, current, scheduled),
+// and the EFFECTIVE one at any given moment is always derived fresh by
+// `resolveEffectivePrice` (see `domain/pricing.ts`), never stored.
+//
+// "Only one discount can be effective at a time" (IMP-047 §5.3) is
+// enforced at creation/update time by rejecting any new/edited date range
+// that overlaps an existing discount for the same product — see
+// `createProductDiscount`/`updateProductDiscount` in
+// `prisma-product-repository.ts` for why this check alone isn't sufficient
+// against a concurrent request, and how the Serializable transaction
+// closes that gap.
+enum DiscountType {
+  PERCENTAGE
+  FIXED_AMOUNT
+}
+
+model ProductDiscount {
+  id String @id @default(cuid())
+
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  type DiscountType
+  // PERCENTAGE: a whole percent, 1-99 (validated server-side). FIXED_AMOUNT:
+  // integer minor units, > 0 and < the product's regular price at the time
+  // it was set (re-validated on every write, never trusted from a stale read).
+  value Int
+
+  startsAt DateTime
+  endsAt   DateTime
+  isActive Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([productId])
+  // Supports the overlap check's own lookup (all discounts for one
+  // product) and keeps a per-product discount history ordered.
+  @@index([productId, startsAt, endsAt])
+  @@map("product_discounts")
 }
 
 model ProductTranslation {
@@ -209,6 +256,20 @@ model OrderItem {
   // deletion/status changes must never affect an existing OrderItem.
   productId   String
   productName String
+
+  // IMP-047: the product's REGULAR price at order-creation time, before
+  // any discount. `unitPriceAmountMinor` below remains the actual charged
+  // price (regular minus any then-effective discount, computed once via
+  // `resolveEffectivePrice` at checkout) — unchanged meaning, unchanged
+  // callers. Together they let an order's applied discount be shown
+  // (`regularUnitPriceAmountMinor - unitPriceAmountMinor`) without ever
+  // re-deriving it from a `Product`/`ProductDiscount` row that may have
+  // since changed or been deleted — the same immutable-snapshot guarantee
+  // this whole model already relies on. Every historical row predates
+  // discounts entirely, so its regular price IS its charged price; the
+  // migration backfills this column from the existing
+  // `unitPriceAmountMinor` for exactly that reason, never a guess.
+  regularUnitPriceAmountMinor Int
 
   unitPriceAmountMinor Int
   quantity             Int

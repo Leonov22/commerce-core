@@ -101,8 +101,17 @@ export function CheckoutSummary({
                 </p>
                 <p className="text-xs text-muted-foreground">
                   {t("summary.unitPrice", {
-                    amount: formatProductPrice(product.priceAmountMinor, product.currency, locale),
+                    amount: formatProductPrice(
+                      product.effectivePriceAmountMinor,
+                      product.currency,
+                      locale,
+                    ),
                   })}
+                  {product.activeDiscount ? (
+                    <span className="ml-1 line-through">
+                      {formatProductPrice(product.priceAmountMinor, product.currency, locale)}
+                    </span>
+                  ) : null}
                 </p>
               </div>
             </div>

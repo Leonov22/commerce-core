@@ -33,6 +33,8 @@ function makeAdminProduct(overrides: Partial<AdminProduct> = {}): AdminProduct {
     sortOrder: 0,
     imageUrl: null,
     imageAlt: null,
+    effectivePriceAmountMinor: 24000,
+    activeDiscount: null,
     name: "Studio Chair",
     meta: "",
     description: "",
@@ -109,6 +111,27 @@ function makeFakeRepository(products: Record<string, AdminProduct>): {
       const updated = { ...existing, imageUrl: image.imageUrl, imageAlt: image.imageAlt };
       products[productId] = updated;
       return updated;
+    },
+    async listDiscountsForProduct() {
+      throw new Error("not used by these tests");
+    },
+    async listAdminDiscounts() {
+      throw new Error("not used by these tests");
+    },
+    async findAdminDiscountById() {
+      throw new Error("not used by these tests");
+    },
+    async createProductDiscount() {
+      throw new Error("not used by these tests");
+    },
+    async updateProductDiscount() {
+      throw new Error("not used by these tests");
+    },
+    async setProductDiscountActive() {
+      throw new Error("not used by these tests");
+    },
+    async deleteProductDiscount() {
+      throw new Error("not used by these tests");
     },
   };
 

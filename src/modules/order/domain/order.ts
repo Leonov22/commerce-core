@@ -36,7 +36,9 @@ export interface OrderItem {
   /** Kept for traceability only — never dereferenced to reconstruct this line. */
   productId: string;
   productName: string;
-  /** Integer minor units (e.g. $240.00 -> 24000). Never a float. */
+  /** IMP-047: the product's regular price at order-creation time, before any discount. Immutable, like every other field on this snapshot. */
+  regularUnitPriceAmountMinor: number;
+  /** Integer minor units (e.g. $240.00 -> 24000). Never a float. The actual price charged — equal to `regularUnitPriceAmountMinor` when no discount applied. */
   unitPriceAmountMinor: number;
   quantity: number;
   /** Integer minor units: `unitPriceAmountMinor * quantity` at creation time. */

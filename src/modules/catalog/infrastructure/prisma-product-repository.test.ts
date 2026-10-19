@@ -229,4 +229,95 @@ describe("prismaProductRepository", () => {
       expect(cleared?.imageUrl).toBeNull();
     });
   });
+
+  /**
+   * IMP-047 (CR-047-01: concurrent overlap protection). Genuine
+   * concurrent requests against the real database — the one thing a
+   * fake `ProductRepository` cannot prove, since it never runs two
+   * calls on separate connections racing against the same rows.
+   */
+  describe("createProductDiscount — concurrent overlap protection", () => {
+    async function createTestProduct() {
+      const category = await prisma.category.findFirstOrThrow();
+      const product = await prisma.product.create({
+        data: {
+          slug: `test-discount-product-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          status: "DRAFT",
+          priceAmountMinor: 10000,
+          currency: "USD",
+          categoryId: category.id,
+          translations: {
+            create: {
+              locale: "en",
+              name: "Discount Test Product",
+              meta: "test",
+              description: "test",
+              material: "test",
+              dimensions: "test",
+            },
+          },
+        },
+      });
+      createdProductIds.push(product.id);
+      return product;
+    }
+
+    it("only one of two genuinely concurrent requests for the same, overlapping date range succeeds — the other is rejected as an overlap, never both committed", async () => {
+      const product = await createTestProduct();
+      const startsAt = new Date("2027-01-01T00:00:00.000Z");
+      const endsAt = new Date("2027-01-31T00:00:00.000Z");
+
+      const [first, second] = await Promise.all([
+        prismaProductRepository.createProductDiscount({
+          productId: product.id,
+          type: "PERCENTAGE",
+          value: 10,
+          startsAt,
+          endsAt,
+          isActive: true,
+        }),
+        prismaProductRepository.createProductDiscount({
+          productId: product.id,
+          type: "FIXED_AMOUNT",
+          value: 500,
+          startsAt,
+          endsAt,
+          isActive: true,
+        }),
+      ]);
+
+      const outcomes = [first.outcome, second.outcome].sort();
+      // Exactly one "created", exactly one "overlap" — never both
+      // "created" (which would mean two simultaneously-effective
+      // discounts silently coexisting, the exact anomaly IMP-047 §5.3
+      // forbids) and never both failing either.
+      expect(outcomes).toEqual(["created", "overlap"]);
+
+      const remaining = await prismaProductRepository.listDiscountsForProduct(product.id);
+      expect(remaining).toHaveLength(1);
+    });
+
+    it("a non-overlapping request made after a committed discount still succeeds normally", async () => {
+      const product = await createTestProduct();
+      const first = await prismaProductRepository.createProductDiscount({
+        productId: product.id,
+        type: "PERCENTAGE",
+        value: 10,
+        startsAt: new Date("2027-02-01T00:00:00.000Z"),
+        endsAt: new Date("2027-02-28T00:00:00.000Z"),
+        isActive: true,
+      });
+      expect(first.outcome).toBe("created");
+
+      const second = await prismaProductRepository.createProductDiscount({
+        productId: product.id,
+        type: "FIXED_AMOUNT",
+        value: 500,
+        startsAt: new Date("2027-03-01T00:00:00.000Z"),
+        endsAt: new Date("2027-03-31T00:00:00.000Z"),
+        isActive: true,
+      });
+      expect(second.outcome).toBe("created");
+    });
+  });
 });

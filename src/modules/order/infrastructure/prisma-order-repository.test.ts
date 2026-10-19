@@ -37,6 +37,7 @@ describe("prismaOrderRepository", () => {
         {
           productId: "1",
           productName: "Studio Chair",
+          regularUnitPriceAmountMinor: 24000,
           unitPriceAmountMinor: 24000,
           quantity: 1,
           lineTotalAmountMinor: 24000,
@@ -100,6 +101,7 @@ describe("prismaOrderRepository", () => {
           {
             productId: "1",
             productName: "Studio Chair",
+            regularUnitPriceAmountMinor: 24000,
             unitPriceAmountMinor: 24000,
             quantity: 1,
             lineTotalAmountMinor: 24000,
@@ -108,6 +110,7 @@ describe("prismaOrderRepository", () => {
           {
             productId: "3",
             productName: "Table Lamp",
+            regularUnitPriceAmountMinor: 9600,
             unitPriceAmountMinor: 9600,
             quantity: 2,
             lineTotalAmountMinor: 19200,
@@ -132,6 +135,7 @@ describe("prismaOrderRepository", () => {
           {
             productId: "1",
             productName: "Studio Chair",
+            regularUnitPriceAmountMinor: 24000,
             unitPriceAmountMinor: 24000,
             quantity: 1,
             lineTotalAmountMinor: 24000,
@@ -159,6 +163,7 @@ describe("prismaOrderRepository", () => {
           {
             productId: "no-longer-exists",
             productName: "Discontinued Item",
+            regularUnitPriceAmountMinor: 1000,
             unitPriceAmountMinor: 1000,
             quantity: 1,
             lineTotalAmountMinor: 1000,
@@ -179,6 +184,7 @@ describe("prismaOrderRepository", () => {
             {
               productId: "1",
               productName: "Studio Chair",
+              regularUnitPriceAmountMinor: 24000,
               unitPriceAmountMinor: 24000,
               quantity: 0,
               lineTotalAmountMinor: 0,
@@ -206,6 +212,7 @@ describe("prismaOrderRepository", () => {
             {
               productId: "1",
               productName: "Studio Chair",
+              regularUnitPriceAmountMinor: 24000,
               unitPriceAmountMinor: 24000,
               quantity: 1,
               lineTotalAmountMinor: 24000,
@@ -214,6 +221,7 @@ describe("prismaOrderRepository", () => {
             {
               productId: "3",
               productName: "Table Lamp",
+              regularUnitPriceAmountMinor: 9600,
               unitPriceAmountMinor: 9600,
               quantity: 0, // violates order_items_quantity_at_least_one
               lineTotalAmountMinor: 0,
@@ -278,6 +286,7 @@ describe("prismaOrderRepository — order lifecycle", () => {
         {
           productId: "1",
           productName: "Studio Chair",
+          regularUnitPriceAmountMinor: 24000,
           unitPriceAmountMinor: 24000,
           quantity: 1,
           lineTotalAmountMinor: 24000,
@@ -439,6 +448,7 @@ describe("prismaOrderRepository — checkout idempotency (IMP-031)", () => {
         {
           productId: "1",
           productName: "Studio Chair",
+          regularUnitPriceAmountMinor: 24000,
           unitPriceAmountMinor: 24000,
           quantity: 1,
           lineTotalAmountMinor: 24000,
@@ -664,6 +674,7 @@ describe("prismaOrderRepository — customer order history", () => {
         {
           productId: "1",
           productName: "Studio Chair",
+          regularUnitPriceAmountMinor: 24000,
           unitPriceAmountMinor: 24000,
           quantity: 1,
           lineTotalAmountMinor: 24000,
@@ -874,6 +885,7 @@ describe("prismaOrderRepository — customer order history", () => {
           {
             productId: "no-longer-exists",
             productName: "Discontinued Item",
+            regularUnitPriceAmountMinor: 1000,
             unitPriceAmountMinor: 1000,
             quantity: 1,
             lineTotalAmountMinor: 1000,

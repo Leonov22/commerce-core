@@ -1,15 +1,24 @@
 import "server-only";
+import { Prisma } from "@/generated/prisma/client";
 import { prisma } from "@/modules/catalog/infrastructure/prisma-client";
+import { resolveEffectivePrice, isDiscountEffective } from "@/modules/catalog/domain/pricing";
 import type {
   ProductRepository,
   ProductListFilter,
   AdminProductListOptions,
   AdminProductListPage,
   AdminProductInput,
+  AdminDiscountInput,
+  AdminDiscountListOptions,
+  AdminDiscountListPage,
+  AdminDiscountListItem,
+  CreateProductDiscountResult,
+  UpdateProductDiscountResult,
 } from "@/modules/catalog/repositories/product-repository";
 import type { Product, ProductStatus, ProductBadge } from "@/modules/catalog/domain/product";
 import type { Category } from "@/modules/catalog/domain/category";
 import type { AdminProduct, AdminProductListItem } from "@/modules/catalog/domain/admin-product";
+import type { ProductDiscount, DiscountType } from "@/modules/catalog/domain/discount";
 
 /** This project has exactly one locale today — see `admin-product.ts`'s own doc comment on why the admin shape is flattened to it rather than generalized. */
 const ADMIN_LOCALE = "en";
@@ -17,6 +26,7 @@ const ADMIN_LOCALE = "en";
 const PRODUCT_INCLUDE = {
   category: { select: { slug: true } },
   translations: true,
+  discounts: true,
 } as const;
 
 async function fetchOneActiveProduct(id: string) {
@@ -28,6 +38,27 @@ async function fetchOneActiveProduct(id: string) {
 
 type ProductRow = NonNullable<Awaited<ReturnType<typeof fetchOneActiveProduct>>>;
 
+/** Shared by every row shape that includes a `discounts: ProductDiscount[]` relation (storefront and admin alike) — one mapping, never duplicated. */
+function toDomainDiscount(row: {
+  id: string;
+  productId: string;
+  type: string;
+  value: number;
+  startsAt: Date;
+  endsAt: Date;
+  isActive: boolean;
+}): ProductDiscount {
+  return {
+    id: row.id,
+    productId: row.productId,
+    type: row.type as DiscountType,
+    value: row.value,
+    startsAt: row.startsAt,
+    endsAt: row.endsAt,
+    isActive: row.isActive,
+  };
+}
+
 function toDomainProduct(row: ProductRow, locale: string): Product | null {
   const translation = row.translations.find((t) => t.locale === locale) ?? row.translations[0];
   if (!translation) {
@@ -35,6 +66,12 @@ function toDomainProduct(row: ProductRow, locale: string): Product | null {
     // display — treat it as unavailable rather than showing empty fields.
     return null;
   }
+
+  const { effectivePriceAmountMinor, activeDiscount } = resolveEffectivePrice(
+    row.priceAmountMinor,
+    row.discounts.map(toDomainDiscount),
+    new Date(),
+  );
 
   return {
     id: row.id,
@@ -48,6 +85,8 @@ function toDomainProduct(row: ProductRow, locale: string): Product | null {
     sortOrder: row.sortOrder,
     imageUrl: row.imageUrl,
     imageAlt: row.imageAlt,
+    effectivePriceAmountMinor,
+    activeDiscount,
     translation: {
       locale: translation.locale,
       name: translation.name,
@@ -85,6 +124,7 @@ function toDomainCategory(row: CategoryRow, locale: string): Category | null {
 const ADMIN_PRODUCT_INCLUDE = {
   category: { select: { id: true, translations: { where: { locale: ADMIN_LOCALE } } } },
   translations: { where: { locale: ADMIN_LOCALE } },
+  discounts: true,
 } as const;
 
 type AdminProductRow = NonNullable<
@@ -100,6 +140,11 @@ function toAdminProduct(row: AdminProductRow): AdminProduct {
   // the whole admin list unusable.
   const translation = row.translations[0];
   const categoryTranslation = row.category.translations[0];
+  const { effectivePriceAmountMinor, activeDiscount } = resolveEffectivePrice(
+    row.priceAmountMinor,
+    row.discounts.map(toDomainDiscount),
+    new Date(),
+  );
   return {
     id: row.id,
     slug: row.slug,
@@ -113,6 +158,8 @@ function toAdminProduct(row: AdminProductRow): AdminProduct {
     sortOrder: row.sortOrder,
     imageUrl: row.imageUrl,
     imageAlt: row.imageAlt,
+    effectivePriceAmountMinor,
+    activeDiscount,
     name: translation?.name ?? "",
     meta: translation?.meta ?? "",
     description: translation?.description ?? "",
@@ -126,6 +173,11 @@ function toAdminProduct(row: AdminProductRow): AdminProduct {
 function toAdminProductListItem(row: AdminProductRow): AdminProductListItem {
   const translation = row.translations[0];
   const categoryTranslation = row.category.translations[0];
+  const { effectivePriceAmountMinor, activeDiscount } = resolveEffectivePrice(
+    row.priceAmountMinor,
+    row.discounts.map(toDomainDiscount),
+    new Date(),
+  );
   return {
     id: row.id,
     slug: row.slug,
@@ -135,6 +187,8 @@ function toAdminProductListItem(row: AdminProductRow): AdminProductListItem {
     categoryName: categoryTranslation?.name ?? "",
     name: translation?.name ?? "",
     updatedAt: row.updatedAt,
+    effectivePriceAmountMinor,
+    activeDiscount,
   };
 }
 
@@ -387,4 +441,213 @@ export const prismaProductRepository: ProductRepository = {
     });
     return toAdminProduct(row);
   },
+
+  async listDiscountsForProduct(productId: string): Promise<ProductDiscount[]> {
+    const rows = await prisma.productDiscount.findMany({
+      where: { productId },
+      orderBy: { startsAt: "asc" },
+    });
+    return rows.map(toDomainDiscount);
+  },
+
+  async listAdminDiscounts(options: AdminDiscountListOptions): Promise<AdminDiscountListPage> {
+    const { page, pageSize } = options;
+    const [rows, total] = await Promise.all([
+      prisma.productDiscount.findMany({
+        include: { product: { include: { translations: { where: { locale: ADMIN_LOCALE } } } } },
+        orderBy: { startsAt: "desc" },
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      }),
+      prisma.productDiscount.count(),
+    ]);
+
+    const now = new Date();
+    const items: AdminDiscountListItem[] = rows.map((row) => {
+      const discount = toDomainDiscount(row);
+      return {
+        id: discount.id,
+        productId: discount.productId,
+        productName: row.product.translations[0]?.name ?? "",
+        type: discount.type,
+        value: discount.value,
+        startsAt: discount.startsAt,
+        endsAt: discount.endsAt,
+        isActive: discount.isActive,
+        isEffectiveNow: isDiscountEffective(discount, now),
+      };
+    });
+
+    return { items, total, page, pageSize };
+  },
+
+  async findAdminDiscountById(id: string): Promise<ProductDiscount | null> {
+    const row = await prisma.productDiscount.findUnique({ where: { id } });
+    return row ? toDomainDiscount(row) : null;
+  },
+
+  async createProductDiscount(input: AdminDiscountInput): Promise<CreateProductDiscountResult> {
+    try {
+      return await prisma.$transaction(
+        async (tx) => {
+          const product = await tx.product.findUnique({ where: { id: input.productId } });
+          if (!product) {
+            return { outcome: "productNotFound" as const };
+          }
+
+          const siblings = await tx.productDiscount.findMany({
+            where: { productId: input.productId },
+          });
+          if (
+            siblings.some((sibling) =>
+              rangesOverlap(input.startsAt, input.endsAt, sibling.startsAt, sibling.endsAt),
+            )
+          ) {
+            return { outcome: "overlap" as const };
+          }
+
+          const created = await tx.productDiscount.create({
+            data: {
+              productId: input.productId,
+              type: input.type,
+              value: input.value,
+              startsAt: input.startsAt,
+              endsAt: input.endsAt,
+              isActive: input.isActive,
+            },
+          });
+          return { outcome: "created" as const, discount: toDomainDiscount(created) };
+        },
+        // CR-047-01: Serializable isolation is what actually prevents two
+        // concurrent admin requests from both reading "no overlap" and
+        // both inserting — see this method's own doc comment on
+        // `ProductRepository` for why an application-level pre-check
+        // alone cannot close this race. Under Serializable isolation,
+        // Postgres detects the write-skew itself and aborts one of the
+        // two transactions with a serialization failure (caught below).
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+    } catch (error) {
+      if (isSerializationFailure(error)) {
+        return { outcome: "overlap" };
+      }
+      throw error;
+    }
+  },
+
+  async updateProductDiscount(
+    id: string,
+    input: Omit<AdminDiscountInput, "productId">,
+  ): Promise<UpdateProductDiscountResult> {
+    try {
+      return await prisma.$transaction(
+        async (tx) => {
+          const existing = await tx.productDiscount.findUnique({ where: { id } });
+          if (!existing) {
+            return { outcome: "notFound" as const };
+          }
+
+          const siblings = await tx.productDiscount.findMany({
+            where: { productId: existing.productId, id: { not: id } },
+          });
+          if (
+            siblings.some((sibling) =>
+              rangesOverlap(input.startsAt, input.endsAt, sibling.startsAt, sibling.endsAt),
+            )
+          ) {
+            return { outcome: "overlap" as const };
+          }
+
+          const updated = await tx.productDiscount.update({
+            where: { id },
+            data: {
+              type: input.type,
+              value: input.value,
+              startsAt: input.startsAt,
+              endsAt: input.endsAt,
+              isActive: input.isActive,
+            },
+          });
+          return { outcome: "updated" as const, discount: toDomainDiscount(updated) };
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+    } catch (error) {
+      if (isSerializationFailure(error)) {
+        return { outcome: "overlap" };
+      }
+      throw error;
+    }
+  },
+
+  async setProductDiscountActive(id: string, isActive: boolean): Promise<ProductDiscount | null> {
+    const existing = await prisma.productDiscount.findUnique({ where: { id } });
+    if (!existing) {
+      return null;
+    }
+    const updated = await prisma.productDiscount.update({ where: { id }, data: { isActive } });
+    return toDomainDiscount(updated);
+  },
+
+  async deleteProductDiscount(id: string): Promise<boolean> {
+    try {
+      await prisma.productDiscount.delete({ where: { id } });
+      return true;
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2025") {
+        // "Record to delete does not exist" — already gone; deletion is idempotent.
+        return false;
+      }
+      throw error;
+    }
+  },
 };
+
+function rangesOverlap(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date): boolean {
+  return aStart <= bEnd && bStart <= aEnd;
+}
+
+/**
+ * Postgres's own write-skew detection under Serializable isolation.
+ * Confirmed empirically (a genuine concurrent-write integration test
+ * against the real database — see `prisma-product-repository.test.ts`'s
+ * own "concurrent overlap protection" tests) to surface as TWO different
+ * shapes depending on how deep into the stack it's caught, and this
+ * checks for both rather than assuming only one:
+ *
+ *   1. `Prisma.PrismaClientKnownRequestError` with code `P2034`
+ *      ("Transaction failed due to a write conflict or a deadlock") —
+ *      Prisma's documented, query-engine-level wrapping.
+ *   2. A raw `DriverAdapterError` (from `@prisma/driver-adapter-utils`,
+ *      underneath `@prisma/adapter-pg`) whose `cause.kind` is
+ *      `"TransactionWriteConflict"` — observed in practice with this
+ *      project's Prisma 7 + driver-adapter setup, propagating
+ *      UNWRAPPED out of `prisma.$transaction(...)` rather than being
+ *      re-wrapped into (1) first. Duck-typed (not `instanceof`) since
+ *      `DriverAdapterError` isn't part of `@/generated/prisma/client`'s
+ *      own public `Prisma` namespace.
+ *
+ * Both outcomes are treated identically by every caller above — from
+ * the business perspective, both mean "a conflicting discount already
+ * exists for this product," one just caught one layer later than the
+ * in-transaction check.
+ */
+function isSerializationFailure(error: unknown): boolean {
+  if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {
+    return true;
+  }
+  if (
+    error !== null &&
+    typeof error === "object" &&
+    "name" in error &&
+    error.name === "DriverAdapterError" &&
+    "cause" in error &&
+    typeof error.cause === "object" &&
+    error.cause !== null &&
+    "kind" in error.cause &&
+    error.cause.kind === "TransactionWriteConflict"
+  ) {
+    return true;
+  }
+  return false;
+}

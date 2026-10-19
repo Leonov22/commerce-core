@@ -5,7 +5,10 @@ import { Link } from "@/core/i18n/navigation";
 interface ProductCardProps {
   name: string;
   meta: string;
+  /** The price actually charged — the effective (possibly discounted) price. */
   price: string;
+  /** IMP-047: the regular, pre-discount price — pass only when a discount is currently active; rendered struck-through next to `price`. */
+  regularPrice?: string;
   badge?: string;
   imageLabel: string;
   /** IMP-046: the product's uploaded image, if any. `null`/omitted falls back to the existing placeholder. */
@@ -18,6 +21,7 @@ export function ProductCard({
   name,
   meta,
   price,
+  regularPrice,
   badge,
   imageLabel,
   imageUrl,
@@ -57,7 +61,12 @@ export function ProductCard({
 
       <h3 className="mt-4 text-sm font-medium">{name}</h3>
       <p className="mt-1 text-sm text-muted-foreground">{meta}</p>
-      <p className="mt-2 text-sm font-medium">{price}</p>
+      <p className="mt-2 flex items-baseline gap-2 text-sm font-medium">
+        <span className={regularPrice ? "text-destructive" : undefined}>{price}</span>
+        {regularPrice ? (
+          <span className="text-xs text-muted-foreground line-through">{regularPrice}</span>
+        ) : null}
+      </p>
     </>
   );
 

@@ -5,6 +5,8 @@
  * the other way around.
  */
 
+import type { ProductDiscount } from "@/modules/catalog/domain/discount";
+
 export type ProductStatus = "DRAFT" | "ACTIVE" | "ARCHIVED";
 
 export type ProductBadge = "NEW" | "LIMITED";
@@ -33,6 +35,17 @@ export interface Product {
   imageUrl: string | null;
   /** Admin-set alt text; `null` means the storefront should fall back to the product's own name. */
   imageAlt: string | null;
+  /**
+   * IMP-047: the price after the currently-effective discount, computed
+   * once by `resolveEffectivePrice` at read time — equal to
+   * `priceAmountMinor` when no discount currently applies. Every caller
+   * that charges or displays a price uses THIS field, never
+   * `priceAmountMinor` directly (which remains the regular price, for
+   * display/comparison only).
+   */
+  effectivePriceAmountMinor: number;
+  /** The discount actually producing `effectivePriceAmountMinor`, or `null`. */
+  activeDiscount: ProductDiscount | null;
   /** Translation resolved for the locale that was requested. */
   translation: ProductTranslation;
 }

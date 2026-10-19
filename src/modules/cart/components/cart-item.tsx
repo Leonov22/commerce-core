@@ -31,6 +31,10 @@ export function CartItem({
   const meta = isLoading ? undefined : product?.meta;
   const price =
     !isLoading && product
+      ? formatProductPrice(product.effectivePriceAmountMinor, product.currency, locale)
+      : undefined;
+  const regularPrice =
+    !isLoading && product?.activeDiscount
       ? formatProductPrice(product.priceAmountMinor, product.currency, locale)
       : undefined;
 
@@ -66,7 +70,14 @@ export function CartItem({
             <p className="text-sm font-medium">{name}</p>
             {meta ? <p className="mt-1 text-sm text-muted-foreground">{meta}</p> : null}
           </div>
-          {price ? <p className="text-sm font-medium">{price}</p> : null}
+          {price ? (
+            <p className="flex items-baseline gap-2 text-sm font-medium">
+              <span className={regularPrice ? "text-destructive" : undefined}>{price}</span>
+              {regularPrice ? (
+                <span className="text-xs text-muted-foreground line-through">{regularPrice}</span>
+              ) : null}
+            </p>
+          ) : null}
         </div>
 
         <div className="mt-4 flex items-center justify-between gap-4">

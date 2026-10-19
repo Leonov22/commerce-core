@@ -205,9 +205,18 @@ async function createNewOrder(
     return {
       productId: product.id,
       productName: product.translation.name,
-      unitPriceAmountMinor: product.priceAmountMinor,
+      // IMP-047: `effectivePriceAmountMinor` is the ONE shared
+      // server-side price calculation (`resolveEffectivePrice`, resolved
+      // inside Catalog) — this is the only place Order creation ever
+      // reads a price from, never `priceAmountMinor` directly, and never
+      // anything the client submitted. `regularUnitPriceAmountMinor`
+      // captures the pre-discount price in the same immutable snapshot,
+      // so a later discount/price change never alters this order's
+      // own history.
+      regularUnitPriceAmountMinor: product.priceAmountMinor,
+      unitPriceAmountMinor: product.effectivePriceAmountMinor,
       quantity: item.quantity,
-      lineTotalAmountMinor: product.priceAmountMinor * item.quantity,
+      lineTotalAmountMinor: product.effectivePriceAmountMinor * item.quantity,
       currency: product.currency,
     };
   });

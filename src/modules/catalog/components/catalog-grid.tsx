@@ -27,7 +27,12 @@ export function CatalogGrid({ products }: CatalogGridProps) {
           key={product.id}
           name={product.translation.name}
           meta={product.translation.meta}
-          price={formatProductPrice(product.priceAmountMinor, product.currency, locale)}
+          price={formatProductPrice(product.effectivePriceAmountMinor, product.currency, locale)}
+          regularPrice={
+            product.activeDiscount
+              ? formatProductPrice(product.priceAmountMinor, product.currency, locale)
+              : undefined
+          }
           badge={
             product.badge === "NEW"
               ? t("newBadge")

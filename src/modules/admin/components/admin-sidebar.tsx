@@ -15,7 +15,7 @@ const NAV_ITEMS: AdminNavItem[] = [
   { key: "dashboard", label: "Dashboard", href: "/admin", available: true },
   { key: "products", label: "Products", href: "/admin/products", available: true },
   { key: "categories", label: "Categories", href: "/admin/categories", available: true },
-  { key: "discounts", label: "Discounts", href: "/admin/discounts", available: false },
+  { key: "discounts", label: "Discounts", href: "/admin/discounts", available: true },
   { key: "orders", label: "Orders", href: "/admin/orders", available: false },
   { key: "inventory", label: "Inventory", href: "/admin/inventory", available: false },
   { key: "customers", label: "Customers", href: "/admin/customers", available: false },
@@ -24,9 +24,9 @@ const NAV_ITEMS: AdminNavItem[] = [
 ];
 
 /**
- * Sidebar navigation for the Admin Panel (IMP-043). Only Dashboard,
- * Products, and Categories are functional this milestone — every other
- * section is rendered as a visibly disabled item (not a working link, not
+ * Sidebar navigation for the Admin Panel. Dashboard, Products, Categories
+ * (IMP-043), and Discounts (IMP-047) are functional — every other section
+ * is rendered as a visibly disabled item (not a working link, not
  * omitted entirely) so the planned structure is legible without ever
  * routing to a page that doesn't exist. Adding a real page for one of
  * these later is a one-line change (`available: true`), never a layout

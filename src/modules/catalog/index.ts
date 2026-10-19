@@ -12,14 +12,18 @@ import * as adminProductQueries from "@/modules/catalog/application/admin-produc
 import * as adminProductCommands from "@/modules/catalog/application/admin-product-commands";
 import * as adminCategoryCommands from "@/modules/catalog/application/admin-category-commands";
 import * as adminProductImageCommands from "@/modules/catalog/application/admin-product-image-commands";
+import * as adminDiscountCommands from "@/modules/catalog/application/admin-discount-commands";
+import * as adminDiscountQueries from "@/modules/catalog/application/admin-discount-queries";
 import { deleteProductImageBlob as deleteProductImageBlobImpl } from "@/modules/catalog/infrastructure/product-image-blob-storage";
 import type {
   ProductListFilter,
   AdminProductListOptions,
+  AdminDiscountListOptions,
 } from "@/modules/catalog/repositories/product-repository";
 import type { RawAdminProductInput } from "@/modules/catalog/application/admin-product-commands";
 import type { RawAdminCategoryInput } from "@/modules/catalog/application/admin-category-commands";
 import type { ConfirmProductImageUploadInput } from "@/modules/catalog/application/admin-product-image-commands";
+import type { RawAdminDiscountInput } from "@/modules/catalog/application/admin-discount-commands";
 
 export type {
   Product,
@@ -58,6 +62,20 @@ export type {
   RemoveProductImageResult,
   AdminProductImageError,
 } from "@/modules/catalog/application/admin-product-image-commands";
+export type { DiscountType, ProductDiscount } from "@/modules/catalog/domain/discount";
+export type {
+  AdminDiscountListOptions,
+  AdminDiscountListPage,
+  AdminDiscountListItem,
+} from "@/modules/catalog/repositories/product-repository";
+export type {
+  RawAdminDiscountInput,
+  AdminDiscountValidationError,
+  CreateAdminDiscountResult,
+  UpdateAdminDiscountResult,
+  SetAdminDiscountActiveResult,
+  RemoveAdminDiscountResult,
+} from "@/modules/catalog/application/admin-discount-commands";
 
 export function getProductById(id: string, locale: string) {
   return catalogQueries.getProductById(prismaProductRepository, id, locale);
@@ -106,4 +124,28 @@ export function removeAdminProductImage(productId: string) {
 /** IMP-046: re-exported so route code never reaches into `@/modules/catalog/infrastructure` directly. */
 export function deleteProductImageBlob(url: string) {
   return deleteProductImageBlobImpl(url);
+}
+
+export function listAdminDiscounts(options: AdminDiscountListOptions) {
+  return adminDiscountQueries.listAdminDiscounts(prismaProductRepository, options);
+}
+
+export function getAdminDiscount(id: string) {
+  return adminDiscountQueries.getAdminDiscount(prismaProductRepository, id);
+}
+
+export function createAdminDiscount(input: RawAdminDiscountInput) {
+  return adminDiscountCommands.createAdminDiscount(prismaProductRepository, input);
+}
+
+export function updateAdminDiscount(id: string, input: RawAdminDiscountInput) {
+  return adminDiscountCommands.updateAdminDiscount(prismaProductRepository, id, input);
+}
+
+export function setAdminDiscountActive(id: string, isActive: boolean) {
+  return adminDiscountCommands.setAdminDiscountActive(prismaProductRepository, id, isActive);
+}
+
+export function removeAdminDiscount(id: string) {
+  return adminDiscountCommands.removeAdminDiscount(prismaProductRepository, id);
 }

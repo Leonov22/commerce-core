@@ -19,7 +19,18 @@ export async function ProductDetailsView({ product, categoryName }: ProductDetai
 
   const name = product.translation.name;
   const meta = product.translation.meta;
-  const price = formatProductPrice(product.priceAmountMinor, product.currency, locale);
+  const price = formatProductPrice(product.effectivePriceAmountMinor, product.currency, locale);
+  const regularPrice = product.activeDiscount
+    ? formatProductPrice(product.priceAmountMinor, product.currency, locale)
+    : null;
+  const discountLabel = product.activeDiscount
+    ? product.activeDiscount.type === "PERCENTAGE"
+      ? `${product.activeDiscount.value}% off`
+      : `${formatProductPrice(product.activeDiscount.value, product.currency, locale)} off`
+    : null;
+  const discountPeriod = product.activeDiscount
+    ? `${new Intl.DateTimeFormat(locale, { dateStyle: "medium" }).format(product.activeDiscount.startsAt)} – ${new Intl.DateTimeFormat(locale, { dateStyle: "medium" }).format(product.activeDiscount.endsAt)}`
+    : null;
   const badge =
     product.badge === "NEW"
       ? tCatalog("newBadge")
@@ -81,7 +92,26 @@ export async function ProductDetailsView({ product, categoryName }: ProductDetai
             ) : null}
             <h1 className="mt-3 text-3xl font-semibold tracking-tight sm:text-4xl">{name}</h1>
             <p className="mt-2 text-sm text-muted-foreground">{meta}</p>
-            <p className="mt-4 text-xl font-medium">{price}</p>
+            <p className="mt-4 flex items-baseline gap-3">
+              <span
+                className={
+                  regularPrice ? "text-xl font-medium text-destructive" : "text-xl font-medium"
+                }
+              >
+                {price}
+              </span>
+              {regularPrice ? (
+                <span className="text-sm text-muted-foreground line-through">{regularPrice}</span>
+              ) : null}
+              {discountLabel ? (
+                <span className="rounded-full bg-destructive/10 px-2.5 py-0.5 text-xs font-medium text-destructive">
+                  {discountLabel}
+                </span>
+              ) : null}
+            </p>
+            {discountPeriod ? (
+              <p className="mt-1 text-xs text-muted-foreground">Offer valid {discountPeriod}</p>
+            ) : null}
             <p className="mt-6 max-w-md leading-relaxed text-muted-foreground">
               {product.translation.description}
             </p>

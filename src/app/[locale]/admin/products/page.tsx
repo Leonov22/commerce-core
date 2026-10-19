@@ -162,6 +162,7 @@ export default async function AdminProductsPage({ searchParams }: Props) {
                 <th className="px-4 py-3">Name</th>
                 <th className="px-4 py-3">Slug</th>
                 <th className="px-4 py-3">Price</th>
+                <th className="px-4 py-3">Effective price</th>
                 <th className="px-4 py-3">Status</th>
                 <th className="px-4 py-3">Category</th>
                 <th className="px-4 py-3">Updated</th>
@@ -181,6 +182,19 @@ export default async function AdminProductsPage({ searchParams }: Props) {
                   <td className="px-4 py-3 text-muted-foreground">{product.slug}</td>
                   <td className="px-4 py-3">
                     {formatProductPrice(product.priceAmountMinor, product.currency, "en")}
+                  </td>
+                  <td className="px-4 py-3">
+                    {product.activeDiscount ? (
+                      <span className="font-medium text-primary">
+                        {formatProductPrice(
+                          product.effectivePriceAmountMinor,
+                          product.currency,
+                          "en",
+                        )}
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground">—</span>
+                    )}
                   </td>
                   <td className="px-4 py-3">
                     <Badge tone={statusTone(product.status)}>{product.status}</Badge>

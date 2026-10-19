@@ -1,4 +1,5 @@
 import type { ProductStatus, ProductBadge } from "@/modules/catalog/domain/product";
+import type { ProductDiscount } from "@/modules/catalog/domain/discount";
 
 /**
  * Admin-facing projection of the same `Product` aggregate the storefront's
@@ -29,6 +30,9 @@ export interface AdminProduct {
   /** IMP-046: see `Product.imageUrl`'s own doc comment — same meaning, same Vercel Blob URL. */
   imageUrl: string | null;
   imageAlt: string | null;
+  /** IMP-047: see `Product.effectivePriceAmountMinor`'s own doc comment. */
+  effectivePriceAmountMinor: number;
+  activeDiscount: ProductDiscount | null;
   name: string;
   meta: string;
   description: string;
@@ -47,4 +51,7 @@ export interface AdminProductListItem {
   categoryName: string;
   name: string;
   updatedAt: Date;
+  /** IMP-047: "Effective promotional price, when applicable" in the admin product list. */
+  effectivePriceAmountMinor: number;
+  activeDiscount: ProductDiscount | null;
 }

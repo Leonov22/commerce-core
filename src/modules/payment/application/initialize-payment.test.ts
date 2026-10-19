@@ -59,6 +59,7 @@ function baseOrderInput(overrides: Partial<NewOrderInput> = {}): NewOrderInput {
       {
         productId: "1",
         productName: "Studio Chair",
+        regularUnitPriceAmountMinor: 24000,
         unitPriceAmountMinor: 24000,
         quantity: 1,
         lineTotalAmountMinor: 24000,

@@ -1,6 +1,7 @@
 import type { Product, ProductStatus, ProductBadge } from "@/modules/catalog/domain/product";
 import type { Category } from "@/modules/catalog/domain/category";
 import type { AdminProduct, AdminProductListItem } from "@/modules/catalog/domain/admin-product";
+import type { ProductDiscount, DiscountType } from "@/modules/catalog/domain/discount";
 
 export interface ProductListFilter {
   categorySlug?: string;
@@ -64,6 +65,58 @@ export interface AdminProductInput {
 }
 
 /**
+ * IMP-047: the fields an administrator sets when creating or editing a
+ * discount. `productId` is immutable once created (moving a discount to a
+ * different product is not a supported operation) — `updateProductDiscount`
+ * never accepts a new `productId`, only `createProductDiscount` does.
+ */
+export interface AdminDiscountInput {
+  productId: string;
+  type: DiscountType;
+  value: number;
+  startsAt: Date;
+  endsAt: Date;
+  isActive: boolean;
+}
+
+export interface AdminDiscountListItem {
+  id: string;
+  productId: string;
+  productName: string;
+  type: DiscountType;
+  value: number;
+  startsAt: Date;
+  endsAt: Date;
+  isActive: boolean;
+  /** Computed server-side at list time via `isDiscountEffective` — whether this exact discount is the one currently being applied. */
+  isEffectiveNow: boolean;
+}
+
+export interface AdminDiscountListOptions {
+  /** 1-based. */
+  page: number;
+  pageSize: number;
+}
+
+export interface AdminDiscountListPage {
+  items: AdminDiscountListItem[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
+export type CreateProductDiscountResult =
+  | { outcome: "created"; discount: ProductDiscount }
+  | { outcome: "productNotFound" }
+  /** A discount already exists for this product whose [startsAt, endsAt] window intersects the requested one — including a concurrent request that only lost the race inside the database itself (see the Prisma implementation's own doc comment). */
+  | { outcome: "overlap" };
+
+export type UpdateProductDiscountResult =
+  | { outcome: "updated"; discount: ProductDiscount }
+  | { outcome: "notFound" }
+  | { outcome: "overlap" };
+
+/**
  * Read-only abstraction the Catalog application layer depends on. It never
  * depends on the Prisma implementation directly — only on this interface.
  *
@@ -122,4 +175,36 @@ export interface ProductRepository {
     expectedCurrentImageUrl: string | null,
     image: { imageUrl: string | null; imageAlt: string | null },
   ): Promise<AdminProduct | null>;
+
+  /**
+   * IMP-047: every discount configured for one product, regardless of
+   * active state or date — the raw material `resolveEffectivePrice`
+   * filters down to "the one effective right now", never pre-filtered
+   * here. Used both by the admin discount form (to show a product's
+   * discount history) and by the overlap check inside
+   * `createProductDiscount`/`updateProductDiscount`.
+   */
+  listDiscountsForProduct(productId: string): Promise<ProductDiscount[]>;
+  /** Every discount across every product, joined with the product's name for display — the admin Discounts list. */
+  listAdminDiscounts(options: AdminDiscountListOptions): Promise<AdminDiscountListPage>;
+  findAdminDiscountById(id: string): Promise<ProductDiscount | null>;
+
+  /**
+   * Atomic: checks for an overlapping discount on the same product AND
+   * inserts the new one as one Serializable-isolation transaction — see
+   * the Prisma implementation's own doc comment for why Serializable
+   * isolation (not just an application-level pre-check) is what actually
+   * closes the race between two concurrent admin requests for the same
+   * product.
+   */
+  createProductDiscount(input: AdminDiscountInput): Promise<CreateProductDiscountResult>;
+  /** Same atomicity guarantee as `createProductDiscount`, excluding the discount's own id from the overlap check against its sibling discounts. */
+  updateProductDiscount(
+    id: string,
+    input: Omit<AdminDiscountInput, "productId">,
+  ): Promise<UpdateProductDiscountResult>;
+  /** Flips `isActive` only — never re-validated against overlap, since the discount already occupies this date range regardless of its active state (see `createProductDiscount`'s own doc comment on why overlap is checked against ALL discounts, not just active ones). Returns `null` if no discount exists with this id. */
+  setProductDiscountActive(id: string, isActive: boolean): Promise<ProductDiscount | null>;
+  /** Always safe: `OrderItem` never references `ProductDiscount` by foreign key — a historical order's `regularUnitPriceAmountMinor`/`unitPriceAmountMinor` snapshot is already fully immutable and independent of this row's continued existence. Returns `false` if no discount existed with this id. */
+  deleteProductDiscount(id: string): Promise<boolean>;
 }
