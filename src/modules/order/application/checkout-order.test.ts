@@ -31,23 +31,35 @@ import { prisma as catalogPrisma } from "@/modules/catalog/infrastructure/prisma
  * factory that closed over an un-hoisted `const` would hit it before
  * initialization.
  */
-const { OVERFLOW_PRODUCT_ID, MIXED_CURRENCY_PRODUCT_ID, unavailableProductIds } = vi.hoisted(
-  () => ({
-    OVERFLOW_PRODUCT_ID: "qa-overflow-fixture",
-    // PR2-F02: a reserved id resolving to a different currency ("EUR")
-    // than the real seeded products (currently "USD") — lets a test prove
-    // the mixed-currency rejection below without depending on the real
-    // Catalog ever actually holding products in two currencies at once.
-    MIXED_CURRENCY_PRODUCT_ID: "qa-mixed-currency-fixture",
-    // CR-031-02: a mutable set of product ids the mock pretends Catalog can no
-    // longer resolve — lets a test simulate "this product became unavailable
-    // between the original submission and a later retry" without touching
-    // real seeded data. Tests that use this must always remove their id(s)
-    // afterward (a `finally` block), since this set is shared module state
-    // across every test in this file.
-    unavailableProductIds: new Set<string>(),
-  }),
-);
+const {
+  OVERFLOW_PRODUCT_ID,
+  MIXED_CURRENCY_PRODUCT_ID,
+  unavailableProductIds,
+  reserveStockThrowForProductIds,
+  releaseReservationThrowForProductIds,
+} = vi.hoisted(() => ({
+  OVERFLOW_PRODUCT_ID: "qa-overflow-fixture",
+  // PR2-F02: a reserved id resolving to a different currency ("EUR")
+  // than the real seeded products (currently "USD") — lets a test prove
+  // the mixed-currency rejection below without depending on the real
+  // Catalog ever actually holding products in two currencies at once.
+  MIXED_CURRENCY_PRODUCT_ID: "qa-mixed-currency-fixture",
+  // CR-031-02: a mutable set of product ids the mock pretends Catalog can no
+  // longer resolve — lets a test simulate "this product became unavailable
+  // between the original submission and a later retry" without touching
+  // real seeded data. Tests that use this must always remove their id(s)
+  // afterward (a `finally` block), since this set is shared module state
+  // across every test in this file.
+  unavailableProductIds: new Set<string>(),
+  // CR-2 remediation: mutable sets of product ids for which the mock makes
+  // `reserveStock`/`releaseReservation` THROW instead of delegating to the
+  // real Catalog inventory repository — lets a test simulate an unexpected
+  // infrastructure fault partway through a multi-item checkout without
+  // needing to break the real database. Tests that use these must always
+  // remove their id(s) afterward (shared module state across this file).
+  reserveStockThrowForProductIds: new Set<string>(),
+  releaseReservationThrowForProductIds: new Set<string>(),
+}));
 
 /**
  * Real seeded Catalog prices ($86-$310) can never drive
@@ -126,6 +138,18 @@ vi.mock("@/modules/catalog", async (importOriginal) => {
       }
       const resolved = await actual.getProductsByIds(ids, locale);
       return resolved.filter((product) => !unavailableProductIds.has(product.id));
+    },
+    reserveStock: async (input: Parameters<typeof actual.reserveStock>[0]) => {
+      if (reserveStockThrowForProductIds.has(input.productId)) {
+        throw new Error(`QA-injected reserveStock failure for ${input.productId}`);
+      }
+      return actual.reserveStock(input);
+    },
+    releaseReservation: async (orderId: string, productId: string) => {
+      if (releaseReservationThrowForProductIds.has(productId)) {
+        throw new Error(`QA-injected releaseReservation failure for ${productId}`);
+      }
+      return actual.releaseReservation(orderId, productId);
     },
   };
 });
@@ -1282,6 +1306,166 @@ describe("createOrderFromCheckout — stock reservation integration (IMP-048 Inc
     });
     expect(reservation.status).toBe("ACTIVE");
     expect(reservation.quantity).toBe(2);
+  });
+
+  it("CR-1: aggregates duplicate product IDs into one reservation and refuses checkout when the combined quantity exceeds available stock", async () => {
+    const product = await createTrackedTestProduct(3);
+    const result = await createOrderFromCheckout(
+      prismaOrderRepository,
+      testOrderPayload([
+        { productId: product.id, quantity: 2 },
+        { productId: product.id, quantity: 2 },
+      ]),
+    );
+    // Combined requested quantity is 4; stock is only 3 — must not
+    // succeed with an under-reserved order.
+    expect(result).toEqual({
+      ok: false,
+      error: "INSUFFICIENT_STOCK",
+      productIds: [product.id],
+    });
+
+    const reservationCount = await catalogPrisma.stockReservation.count({
+      where: { productId: product.id },
+    });
+    expect(reservationCount).toBe(0);
+  });
+
+  it("CR-1: aggregates duplicate product IDs into a single OrderItem whose quantity is charged, ordered, and reserved identically", async () => {
+    const product = await createTrackedTestProduct(10);
+    const result = await createOrderFromCheckout(
+      prismaOrderRepository,
+      testOrderPayload([
+        { productId: product.id, quantity: 2 },
+        { productId: product.id, quantity: 3 },
+      ]),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    createdOrderIds.push(result.order.id);
+
+    const itemsForProduct = result.order.items.filter((item) => item.productId === product.id);
+    expect(itemsForProduct).toHaveLength(1);
+    expect(itemsForProduct[0]?.quantity).toBe(5);
+    expect(itemsForProduct[0]?.lineTotalAmountMinor).toBe(5 * product.priceAmountMinor);
+
+    const reservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
+      where: { orderId_productId: { orderId: result.order.id, productId: product.id } },
+    });
+    expect(reservation.quantity).toBe(5);
+  });
+
+  it("CR-2: a reservation operation that throws after an earlier item was already reserved is compensated, and the original error is preserved", async () => {
+    const succeedsProduct = await createTrackedTestProduct(5);
+    const throwsProduct = await createTrackedTestProduct(5);
+    reserveStockThrowForProductIds.add(throwsProduct.id);
+    try {
+      await expect(
+        createOrderFromCheckout(
+          prismaOrderRepository,
+          testOrderPayload([
+            { productId: succeedsProduct.id, quantity: 1 },
+            { productId: throwsProduct.id, quantity: 1 },
+          ]),
+        ),
+      ).rejects.toThrow(/QA-injected reserveStock failure/);
+    } finally {
+      reserveStockThrowForProductIds.delete(throwsProduct.id);
+    }
+
+    const order = await prisma.order.findFirstOrThrow({
+      where: { items: { some: { productId: succeedsProduct.id } } },
+      orderBy: { createdAt: "desc" },
+    });
+    createdOrderIds.push(order.id);
+    // Compensation still ran despite the throw: the order was cancelled
+    // and the earlier successful reservation was released.
+    expect(order.status).toBe("CANCELLED");
+
+    const reservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
+      where: { orderId_productId: { orderId: order.id, productId: succeedsProduct.id } },
+    });
+    expect(reservation.status).toBe("RELEASED");
+  });
+
+  it("CR-2: a release operation that throws during compensation does not crash checkout — it still reports INSUFFICIENT_STOCK and still attempts to cancel the order", async () => {
+    const succeedsProduct = await createTrackedTestProduct(5);
+    const insufficientProduct = await createTrackedTestProduct(0);
+    releaseReservationThrowForProductIds.add(succeedsProduct.id);
+    try {
+      const result = await createOrderFromCheckout(
+        prismaOrderRepository,
+        testOrderPayload([
+          { productId: succeedsProduct.id, quantity: 1 },
+          { productId: insufficientProduct.id, quantity: 1 },
+        ]),
+      );
+      expect(result).toEqual({
+        ok: false,
+        error: "INSUFFICIENT_STOCK",
+        productIds: [insufficientProduct.id],
+      });
+    } finally {
+      releaseReservationThrowForProductIds.delete(succeedsProduct.id);
+    }
+
+    const order = await prisma.order.findFirstOrThrow({
+      where: { items: { some: { productId: succeedsProduct.id } } },
+      orderBy: { createdAt: "desc" },
+    });
+    createdOrderIds.push(order.id);
+    // Best-effort cancellation still happens even though releasing the
+    // sibling reservation threw.
+    expect(order.status).toBe("CANCELLED");
+
+    // The reservation itself is left ACTIVE (release failed) — this is
+    // the "observable, not silently lost" unresolved state CR-2 calls
+    // for; it is surfaced via the logged error, never hidden behind a
+    // fabricated success.
+    const reservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
+      where: { orderId_productId: { orderId: order.id, productId: succeedsProduct.id } },
+    });
+    expect(reservation.status).toBe("ACTIVE");
+  });
+
+  it("CR-3: a concurrent transition to PAID while checkout is handling a reservation failure is reported as success, never a fabricated INSUFFICIENT_STOCK, and its reservation is not released", async () => {
+    const paidRaceProduct = await createTrackedTestProduct(5);
+    const insufficientProduct = await createTrackedTestProduct(0);
+
+    let flipped = false;
+    const racingRepository: OrderRepository = {
+      ...prismaOrderRepository,
+      findById: async (orderId: string) => {
+        if (!flipped) {
+          flipped = true;
+          // Simulate a concurrent process (e.g. a future payment flow)
+          // completing this Order's payment exactly as cleanup's own
+          // re-read runs.
+          await prisma.order.update({ where: { id: orderId }, data: { status: "PAID" } });
+        }
+        return prismaOrderRepository.findById(orderId);
+      },
+    };
+
+    const result = await createOrderFromCheckout(
+      racingRepository,
+      testOrderPayload([
+        { productId: paidRaceProduct.id, quantity: 1 },
+        { productId: insufficientProduct.id, quantity: 1 },
+      ]),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    createdOrderIds.push(result.order.id);
+    expect(result.order.status).toBe("PAID");
+
+    // The already-successful reservation must NOT have been released —
+    // it belongs to whatever process moved the Order to PAID, not to
+    // this cleanup.
+    const reservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
+      where: { orderId_productId: { orderId: result.order.id, productId: paidRaceProduct.id } },
+    });
+    expect(reservation.status).toBe("ACTIVE");
   });
 });
 

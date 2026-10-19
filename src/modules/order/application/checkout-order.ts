@@ -134,6 +134,46 @@ export function isWithinSafeAmountRange(amountMinor: number): boolean {
 const STOCK_RESERVATION_TTL_MS = 15 * 60 * 1000;
 
 /**
+ * CR-1: merges duplicate `productId` entries in a checkout submission
+ * into one line per product, summing quantity. Applied once, at the very
+ * entrypoint (`createOrderFromCheckout`), before quantity validation,
+ * pricing, order creation, and inventory reservation — so every
+ * downstream step, including the idempotency fingerprint, sees exactly
+ * one line per distinct product, and the quantity charged, ordered, and
+ * reserved can never diverge. Without this, two lines for the same
+ * product each resolve and charge their own quantity, but
+ * `reserveStockForOrder` below only ever reserves the FIRST line's
+ * quantity for that `(orderId, productId)` pair — the second call sees
+ * `"alreadyReserved"` and is silently treated as success, under-reserving
+ * relative to what was actually charged.
+ *
+ * The existing cart/API contract already allowed a client to submit the
+ * same `productId` more than once (nothing validated against it before);
+ * merging is the smallest correction that closes this without changing
+ * that contract's shape — a client that accidentally sends two lines for
+ * one product still gets a normal, correctly-priced, correctly-reserved
+ * checkout, not a rejection.
+ */
+function aggregateCheckoutItems(items: CheckoutOrderItemRequest[]): CheckoutOrderItemRequest[] {
+  const quantityByProductId = new Map<string, number>();
+  const productIdsInFirstSeenOrder: string[] = [];
+  for (const item of items) {
+    const existingQuantity = quantityByProductId.get(item.productId);
+    if (existingQuantity === undefined) {
+      productIdsInFirstSeenOrder.push(item.productId);
+      quantityByProductId.set(item.productId, item.quantity);
+    } else {
+      quantityByProductId.set(item.productId, existingQuantity + item.quantity);
+    }
+  }
+  return productIdsInFirstSeenOrder.map((productId) => ({
+    productId,
+    // Non-null: every id in `productIdsInFirstSeenOrder` was just set above.
+    quantity: quantityByProductId.get(productId)!,
+  }));
+}
+
+/**
  * Attempts to reserve every item of an already-persisted, still-PENDING
  * Order, one at a time, stopping at the first item that cannot be
  * secured. Untracked products (the only kind that exist today — see
@@ -192,18 +232,127 @@ async function releaseAllReservationsForOrder(order: Order): Promise<void> {
 }
 
 /**
- * IMP-048 Increment 3: the one place a resolved Order (freshly created,
- * or found via an idempotency replay) is secured against inventory
- * before `createOrderFromCheckout` hands it back to its caller.
+ * CR-2 / CR-3: the one place reservation cleanup (release + cancel)
+ * actually happens — used both when `reserveStockForOrder` cleanly
+ * reports a business-outcome failure and when it THROWS (an unexpected
+ * fault, e.g. a transient database error). Never throws itself: every
+ * internal failure is logged loudly (`console.error`, matching this
+ * codebase's existing convention — see `stripe-webhook.ts`/
+ * `process-stripe-webhook-event.ts`) rather than silently swallowed, so
+ * cleanup failures are observable instead of disappearing. The caller
+ * always gets back the best currently-known Order state and decides what
+ * to report from that, never from a stale assumption.
  *
- * - `PENDING`: the normal case — attempt to reserve every item. On
- *   failure, release whatever this attempt reserved and cancel the
- *   Order via the existing, atomic `changeOrderStatus` lifecycle
- *   primitive (never an ad hoc status write) — which itself safely
- *   no-ops if some other concurrent call already moved the Order away
- *   from `PENDING` by the time this runs, satisfying "never cancel an
- *   Order that already progressed to a non-pending state" without this
- *   function needing its own extra guard for that race.
+ * CR-3: re-reads the Order's authoritative state FIRST and never
+ * releases or cancels an Order that has already moved away from
+ * `PENDING` (e.g. a concurrent payment success/failure elsewhere) — that
+ * Order's reservations belong to whichever process moved it, not to this
+ * cleanup. If `changeOrderStatus` itself reports the narrower race
+ * (`ORDER_STATUS_CHANGED` — the Order moved on between this function's
+ * own re-read and its cancel attempt), it resolves by reading once more
+ * rather than looping indefinitely: the lifecycle only ever moves
+ * forward once (CR-030), so a second read is sufficient in practice.
+ *
+ * Deliberately does not introduce a cross-module transaction or any ad
+ * hoc status write — reconciliation uses only the existing, atomic
+ * `changeOrderStatus`/`OrderRepository.findById` primitives already
+ * established by CR-030. If those primitives ever report something this
+ * function doesn't recognize, it logs loudly and returns the
+ * last-known Order rather than inventing a new mechanism.
+ */
+async function cleanupReservationsAndReconcileOrder(
+  repository: OrderRepository,
+  order: Order,
+): Promise<Order> {
+  let current: Order | null = order;
+  try {
+    current = await repository.findById(order.id);
+  } catch (readError) {
+    console.error(
+      "[order/checkout-order] could not re-read order before reservation cleanup — proceeding with the last-known state",
+      { orderId: order.id, readError },
+    );
+  }
+  if (!current) {
+    console.error(
+      "[order/checkout-order] order not found during reservation cleanup — nothing to reconcile",
+      { orderId: order.id },
+    );
+    return order;
+  }
+  if (current.status !== "PENDING") {
+    // Already moved on (e.g. a concurrent payment success/failure) —
+    // never release or cancel; its reservations belong to whichever
+    // process moved it, not to this cleanup.
+    return current;
+  }
+
+  try {
+    await releaseAllReservationsForOrder(current);
+  } catch (releaseError) {
+    console.error(
+      "[order/checkout-order] failed to release one or more reservations during cleanup — manual reconciliation required",
+      { orderId: current.id, releaseError },
+    );
+  }
+
+  let cancelResult;
+  try {
+    cancelResult = await changeOrderStatus(repository, current.id, "CANCELLED");
+  } catch (cancelThrow) {
+    console.error(
+      "[order/checkout-order] changeOrderStatus itself threw during reservation cleanup — manual reconciliation required",
+      { orderId: current.id, cancelThrow },
+    );
+    return current;
+  }
+
+  if (cancelResult.ok) {
+    return cancelResult.order;
+  }
+
+  if (cancelResult.error === "ORDER_STATUS_CHANGED") {
+    try {
+      const latest = await repository.findById(current.id);
+      if (latest) {
+        return latest;
+      }
+    } catch (rereadError) {
+      console.error(
+        "[order/checkout-order] could not re-read order after a status-change race during cleanup",
+        { orderId: current.id, rereadError },
+      );
+    }
+    return current;
+  }
+
+  console.error(
+    "[order/checkout-order] unexpected changeOrderStatus outcome during reservation cleanup",
+    { orderId: current.id, error: cancelResult.error },
+  );
+  return current;
+}
+
+/**
+ * IMP-048 Increment 3 (+ CR-2/CR-3 remediation): the one place a resolved
+ * Order (freshly created, or found via an idempotency replay) is secured
+ * against inventory before `createOrderFromCheckout` hands it back to
+ * its caller.
+ *
+ * - `PENDING`: the normal case — attempt to reserve every item.
+ *   - CR-2: if `reserveStockForOrder` itself THROWS (an unexpected fault,
+ *     not a normal business outcome), the original error is never
+ *     silently lost — cleanup is attempted via
+ *     `cleanupReservationsAndReconcileOrder` (logging, never throwing,
+ *     itself) and the ORIGINAL error is always re-thrown afterward, so
+ *     an unexpected fault still surfaces as one to the caller rather
+ *     than being laundered into a normal `INSUFFICIENT_STOCK` result.
+ *   - On a clean `{ ok: false }` business-outcome failure, the same
+ *     cleanup runs; CR-3: if that cleanup discovers the Order has
+ *     actually already reached `PAID` (a concurrent process completed it
+ *     before cleanup ran), this reports that real, successful outcome —
+ *     never a fabricated `INSUFFICIENT_STOCK` for an Order that actually
+ *     succeeded.
  * - `CANCELLED`: only this function ever cancels a `PENDING` Order
  *   today (no payment integration exists yet in this codebase), and
  *   only for `INSUFFICIENT_STOCK` — so a replay that resolves to an
@@ -226,15 +375,31 @@ async function securePendingReservationsAndFinalize(
   if (order.status === "CANCELLED") {
     return { ok: false, error: "INSUFFICIENT_STOCK", productIds: [] };
   }
-  if (order.status === "PENDING") {
-    const reservation = await reserveStockForOrder(order);
-    if (!reservation.ok) {
-      await releaseAllReservationsForOrder(order);
-      await changeOrderStatus(repository, order.id, "CANCELLED");
-      return { ok: false, error: "INSUFFICIENT_STOCK", productIds: reservation.failedProductIds };
-    }
+  if (order.status !== "PENDING") {
+    return created === undefined ? { ok: true, order } : { ok: true, order, created };
   }
-  return created === undefined ? { ok: true, order } : { ok: true, order, created };
+
+  let reservation: Awaited<ReturnType<typeof reserveStockForOrder>>;
+  try {
+    reservation = await reserveStockForOrder(order);
+  } catch (reservationError) {
+    console.error(
+      "[order/checkout-order] reserveStockForOrder threw — attempting compensation before re-raising",
+      { orderId: order.id, reservationError },
+    );
+    await cleanupReservationsAndReconcileOrder(repository, order);
+    throw reservationError;
+  }
+
+  if (reservation.ok) {
+    return created === undefined ? { ok: true, order } : { ok: true, order, created };
+  }
+
+  const finalOrder = await cleanupReservationsAndReconcileOrder(repository, order);
+  if (finalOrder.status === "PAID") {
+    return { ok: true, order: finalOrder };
+  }
+  return { ok: false, error: "INSUFFICIENT_STOCK", productIds: reservation.failedProductIds };
 }
 
 /**
@@ -257,11 +422,20 @@ async function securePendingReservationsAndFinalize(
  */
 export async function createOrderFromCheckout(
   repository: OrderRepository,
-  request: CheckoutOrderRequest,
+  rawRequest: CheckoutOrderRequest,
 ): Promise<CreateOrderFromCheckoutResult> {
-  if (request.items.length === 0) {
+  if (rawRequest.items.length === 0) {
     return { ok: false, error: "EMPTY_CART" };
   }
+
+  // CR-1: merge duplicate productId lines before anything else — see
+  // `aggregateCheckoutItems`'s own doc comment for why this must happen
+  // first, ahead of quantity validation (so the ceiling applies to the
+  // real per-product total, not a bypassable per-line value).
+  const request: CheckoutOrderRequest = {
+    ...rawRequest,
+    items: aggregateCheckoutItems(rawRequest.items),
+  };
 
   // Checked before any arithmetic — an out-of-range quantity must never
   // reach `priceAmountMinor * quantity` below.

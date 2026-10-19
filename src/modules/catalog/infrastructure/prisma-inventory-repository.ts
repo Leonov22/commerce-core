@@ -157,11 +157,28 @@ export const prismaInventoryRepository: InventoryRepository = {
         where: { orderId_productId: { orderId: input.orderId, productId: input.productId } },
       });
       if (existing) {
-        if (existing.status === "ACTIVE") {
+        if (existing.status === "ACTIVE" && existing.expiresAt > new Date()) {
           return {
             outcome: "alreadyReserved" as const,
             reservation: toDomainReservation(existing),
           };
+        }
+        if (existing.status === "ACTIVE") {
+          // CR-4: still literally ACTIVE in the database, but its
+          // wall-clock `expiresAt` has already passed and nothing has
+          // swept it yet. We already hold this product's row lock here,
+          // so this is the correct place to perform that real, atomic
+          // ACTIVE -> EXPIRED transition for this one row — it must never
+          // be reported as a successful reservation, and the pair is now
+          // permanently terminal (never revived), exactly like the
+          // RELEASED/CONSUMED rows handled just below. Deliberately makes
+          // the outcome identical whether or not some other operation's
+          // sweep already flipped this exact row first.
+          const expired = await tx.stockReservation.update({
+            where: { id: existing.id },
+            data: { status: "EXPIRED" },
+          });
+          return { outcome: "alreadyFinal" as const, reservation: toDomainReservation(expired) };
         }
         return { outcome: "alreadyFinal" as const, reservation: toDomainReservation(existing) };
       }

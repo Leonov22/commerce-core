@@ -179,6 +179,47 @@ describe("prismaInventoryRepository", () => {
       });
       expect(count).toBe(1);
     });
+
+    it("CR-4: never treats an ACTIVE reservation whose expiresAt is already in the past as a valid successful reservation, whether or not a sweep already ran", async () => {
+      const product = await createTestProduct({ stockQuantity: 5 });
+      const orderId = testOrderId();
+      const stale = await prisma.stockReservation.create({
+        data: {
+          orderId,
+          productId: product.id,
+          quantity: 1,
+          status: "ACTIVE",
+          // Still literally ACTIVE in the database, but its wall-clock
+          // expiry has already passed — simulates nothing having swept
+          // it yet.
+          expiresAt: new Date(Date.now() - 60_000),
+        },
+      });
+
+      const result = await prismaInventoryRepository.reserveStock({
+        orderId,
+        productId: product.id,
+        quantity: 1,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      // Deterministic: never "alreadyReserved" for an expired row, and
+      // never a second row — the pair becomes permanently terminal here.
+      expect(result.outcome).toBe("alreadyFinal");
+      if (result.outcome === "alreadyFinal") {
+        expect(result.reservation.id).toBe(stale.id);
+        expect(result.reservation.status).toBe("EXPIRED");
+      }
+
+      const persisted = await prisma.stockReservation.findUniqueOrThrow({
+        where: { id: stale.id },
+      });
+      expect(persisted.status).toBe("EXPIRED");
+
+      const count = await prisma.stockReservation.count({
+        where: { orderId, productId: product.id },
+      });
+      expect(count).toBe(1);
+    });
   });
 
   describe("reserveStock — untracked product compatibility", () => {
