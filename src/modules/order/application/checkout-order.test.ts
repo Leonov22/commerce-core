@@ -6,7 +6,11 @@ import {
   MAX_AMOUNT_MINOR,
   isWithinSafeAmountRange,
 } from "@/modules/order/application/checkout-order";
-import type { CheckoutOrderCustomer } from "@/modules/order/application/checkout-order";
+import type {
+  CheckoutOrderCustomer,
+  CheckoutOrderItemRequest,
+} from "@/modules/order/application/checkout-order";
+import { computeCheckoutSubmissionFingerprint } from "@/modules/order/application/idempotency";
 import type {
   OrderRepository,
   NewOrderInput,
@@ -17,6 +21,7 @@ import type { Order } from "@/modules/order/domain/order";
 import type { Product } from "@/modules/catalog/domain/product";
 import { prismaOrderRepository } from "@/modules/order/infrastructure/prisma-order-repository";
 import { prisma } from "@/modules/order/infrastructure/prisma-client";
+import { prisma as catalogPrisma } from "@/modules/catalog/infrastructure/prisma-client";
 
 /**
  * `qa-overflow-fixture` is a reserved id intercepted by the `@/modules/catalog`
@@ -150,11 +155,19 @@ function makeFakeRepository(): {
   // same key never persists a second Order, it only resolves against
   // whichever one is already in this map.
   const byIdempotencyKey = new Map<string, { order: Order; hash: string }>();
+  // IMP-048 Increment 3: backs `findById`/`updateStatusIfCurrent` — every
+  // order this fake ever builds (via either `create` or
+  // `createIdempotent`) is registered here, so a checkout that goes on to
+  // cancel itself (an insufficient-stock reservation failure) can be
+  // looked up and conditionally transitioned exactly like the real
+  // repository would, rather than throwing on a method no earlier test
+  // needed.
+  const ordersById = new Map<string, Order>();
   let nextOrderId = 0;
 
   function buildOrder(input: NewOrderInput, id: string): Order {
     const now = new Date();
-    return {
+    const order: Order = {
       id,
       status: input.status ?? "PENDING",
       firstName: input.firstName,
@@ -174,6 +187,8 @@ function makeFakeRepository(): {
         ...item,
       })),
     };
+    ordersById.set(id, order);
+    return order;
   }
 
   const repository: OrderRepository = {
@@ -182,26 +197,40 @@ function makeFakeRepository(): {
       return buildOrder(input, "fake-order-id");
     },
     // Not exercised by this file's tests (IMP-026/026-FIX/026-FIX-TESTS
-    // predate customer order history and order lifecycle) — present only
-    // to satisfy `OrderRepository`'s shape.
+    // predate customer order history) — present only to satisfy
+    // `OrderRepository`'s shape.
     async findManyByUserId() {
       throw new Error("not used by these tests");
     },
     async findByIdForUser() {
       throw new Error("not used by these tests");
     },
-    async findById() {
-      throw new Error("not used by these tests");
+    async findById(orderId) {
+      return ordersById.get(orderId) ?? null;
     },
-    async updateStatusIfCurrent() {
-      throw new Error("not used by these tests");
+    async updateStatusIfCurrent(orderId, expectedStatus, nextStatus) {
+      const order = ordersById.get(orderId);
+      if (!order || order.status !== expectedStatus) {
+        return null;
+      }
+      const updated: Order = { ...order, status: nextStatus, updatedAt: new Date() };
+      ordersById.set(orderId, updated);
+      return updated;
     },
     async createIdempotent(input): Promise<CreateIdempotentOrderResult> {
       createIdempotentCalls.push(input);
       const existing = byIdempotencyKey.get(input.idempotencyKey);
       if (existing) {
         if (existing.hash === input.idempotencyRequestHash) {
-          return { outcome: "duplicate", order: existing.order };
+          // Re-read from `ordersById` rather than the snapshot captured
+          // at creation time — `updateStatusIfCurrent` (e.g. this
+          // Order's own reservation-failure cancellation) only updates
+          // that map, so this must too, or a replay would see a stale
+          // status.
+          return {
+            outcome: "duplicate",
+            order: ordersById.get(existing.order.id) ?? existing.order,
+          };
         }
         return { outcome: "conflict" };
       }
@@ -212,7 +241,11 @@ function makeFakeRepository(): {
     },
     async findIdempotencyRecord(idempotencyKey: string) {
       const existing = byIdempotencyKey.get(idempotencyKey);
-      return existing ? { order: existing.order, idempotencyRequestHash: existing.hash } : null;
+      if (!existing) {
+        return null;
+      }
+      const order = ordersById.get(existing.order.id) ?? existing.order;
+      return { order, idempotencyRequestHash: existing.hash };
     },
   };
   return { repository, calls, createIdempotentCalls };
@@ -991,6 +1024,264 @@ describe("createOrderFromCheckout — idempotency (IMP-031), real repository + r
 
     const matching = await prisma.order.findMany({ where: { idempotencyKey: key } });
     expect(matching).toHaveLength(1);
+  });
+});
+
+/**
+ * IMP-048 Increment 3 — stock reservation integration. Real
+ * `prismaOrderRepository` + real Catalog inventory, exactly like the
+ * "real repository + real Catalog + real concurrency" block above: this
+ * is a genuine cross-module integration (Order's own atomic
+ * `changeOrderStatus` lifecycle primitive, Catalog's own reservation
+ * rows), not something a fake on either side could prove.
+ */
+describe("createOrderFromCheckout — stock reservation integration (IMP-048 Increment 3)", () => {
+  const createdOrderIds: string[] = [];
+  const createdProductIds: string[] = [];
+
+  afterAll(async () => {
+    if (createdOrderIds.length > 0) {
+      await prisma.order.deleteMany({ where: { id: { in: createdOrderIds } } });
+    }
+    if (createdProductIds.length > 0) {
+      await catalogPrisma.stockReservation.deleteMany({
+        where: { productId: { in: createdProductIds } },
+      });
+      await catalogPrisma.product.deleteMany({ where: { id: { in: createdProductIds } } });
+    }
+    await catalogPrisma.$disconnect();
+  });
+
+  async function createTrackedTestProduct(stockQuantity: number) {
+    const category = await catalogPrisma.category.findFirstOrThrow();
+    const product = await catalogPrisma.product.create({
+      data: {
+        slug: `test-checkout-inventory-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        status: "ACTIVE",
+        priceAmountMinor: 5000,
+        currency: "USD",
+        categoryId: category.id,
+        trackInventory: true,
+        stockQuantity,
+        translations: {
+          create: {
+            locale: "en",
+            name: "Checkout Inventory Test Product",
+            meta: "test",
+            description: "test",
+            material: "test",
+            dimensions: "test",
+          },
+        },
+      },
+    });
+    createdProductIds.push(product.id);
+    return product;
+  }
+
+  function testOrderPayload(items: CheckoutOrderItemRequest[], idempotencyKey?: string) {
+    return {
+      customer: validCustomer,
+      items,
+      deliveryAmountMinor: 800,
+      locale: "en",
+      idempotencyKey,
+    };
+  }
+
+  it("reserves stock for a tracked product, keyed to the persisted order id", async () => {
+    const product = await createTrackedTestProduct(5);
+    const result = await createOrderFromCheckout(
+      prismaOrderRepository,
+      testOrderPayload([{ productId: product.id, quantity: 2 }]),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    createdOrderIds.push(result.order.id);
+
+    const reservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
+      where: { orderId_productId: { orderId: result.order.id, productId: product.id } },
+    });
+    expect(reservation.status).toBe("ACTIVE");
+    expect(reservation.quantity).toBe(2);
+  });
+
+  it("an untracked product's checkout is unaffected — no reservation row is created", async () => {
+    const category = await catalogPrisma.category.findFirstOrThrow();
+    const product = await catalogPrisma.product.create({
+      data: {
+        slug: `test-checkout-untracked-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        status: "ACTIVE",
+        priceAmountMinor: 5000,
+        currency: "USD",
+        categoryId: category.id,
+        trackInventory: false,
+        translations: {
+          create: {
+            locale: "en",
+            name: "Checkout Untracked Test Product",
+            meta: "test",
+            description: "test",
+            material: "test",
+            dimensions: "test",
+          },
+        },
+      },
+    });
+    createdProductIds.push(product.id);
+
+    const result = await createOrderFromCheckout(
+      prismaOrderRepository,
+      testOrderPayload([{ productId: product.id, quantity: 1 }]),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    createdOrderIds.push(result.order.id);
+
+    const count = await catalogPrisma.stockReservation.count({
+      where: { orderId: result.order.id, productId: product.id },
+    });
+    expect(count).toBe(0);
+  });
+
+  it("insufficient stock on one item cancels the order and releases the reservation already created for a sibling item", async () => {
+    const sufficientProduct = await createTrackedTestProduct(5);
+    const insufficientProduct = await createTrackedTestProduct(0);
+
+    const result = await createOrderFromCheckout(
+      prismaOrderRepository,
+      testOrderPayload([
+        { productId: sufficientProduct.id, quantity: 2 },
+        { productId: insufficientProduct.id, quantity: 1 },
+      ]),
+    );
+    expect(result).toEqual({
+      ok: false,
+      error: "INSUFFICIENT_STOCK",
+      productIds: [insufficientProduct.id],
+    });
+
+    // The order was persisted (so it has an id to clean up) but must now
+    // be CANCELLED, never left PENDING.
+    const orders = await prisma.order.findMany({
+      where: { items: { some: { productId: sufficientProduct.id } } },
+    });
+    expect(orders).toHaveLength(1);
+    createdOrderIds.push(orders[0]!.id);
+    expect(orders[0]!.status).toBe("CANCELLED");
+
+    const sufficientReservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
+      where: {
+        orderId_productId: { orderId: orders[0]!.id, productId: sufficientProduct.id },
+      },
+    });
+    expect(sufficientReservation.status).toBe("RELEASED");
+
+    const insufficientReservationCount = await catalogPrisma.stockReservation.count({
+      where: { orderId: orders[0]!.id, productId: insufficientProduct.id },
+    });
+    expect(insufficientReservationCount).toBe(0);
+  });
+
+  it("an idempotent replay after an insufficient-stock cancellation consistently reports INSUFFICIENT_STOCK without reviving the released reservation", async () => {
+    const sufficientProduct = await createTrackedTestProduct(5);
+    const insufficientProduct = await createTrackedTestProduct(0);
+    const key = `idem-insufficient-stock-${Date.now()}`;
+    const payload = testOrderPayload(
+      [
+        { productId: sufficientProduct.id, quantity: 1 },
+        { productId: insufficientProduct.id, quantity: 1 },
+      ],
+      key,
+    );
+
+    const first = await createOrderFromCheckout(prismaOrderRepository, payload);
+    expect(first.ok).toBe(false);
+    if (first.ok) return;
+    expect(first.error).toBe("INSUFFICIENT_STOCK");
+
+    const order = await prisma.order.findFirstOrThrow({ where: { idempotencyKey: key } });
+    createdOrderIds.push(order.id);
+    expect(order.status).toBe("CANCELLED");
+
+    const second = await createOrderFromCheckout(prismaOrderRepository, payload);
+    // Consistently re-reports the same original failure — never a
+    // fabricated success, and never a second attempt to reserve/release
+    // the already-terminal sibling reservation.
+    expect(second).toEqual({ ok: false, error: "INSUFFICIENT_STOCK", productIds: [] });
+
+    const sufficientReservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
+      where: {
+        orderId_productId: { orderId: order.id, productId: sufficientProduct.id },
+      },
+    });
+    expect(sufficientReservation.status).toBe("RELEASED");
+  });
+
+  it("resumes an interrupted reservation process: a replay completes a reservation an earlier attempt never got to create", async () => {
+    const product = await createTrackedTestProduct(5);
+    const key = `idem-resume-${Date.now()}`;
+    const items: CheckoutOrderItemRequest[] = [{ productId: product.id, quantity: 2 }];
+
+    // Simulates a crash between order persistence and stock reservation:
+    // the order (and its idempotency claim) is created directly through
+    // the repository, exactly as `createOrderFromCheckout` itself would,
+    // but deliberately skipping the reservation step entirely.
+    const idempotencyRequestHash = computeCheckoutSubmissionFingerprint({
+      customer: validCustomer,
+      items,
+      deliveryAmountMinor: 800,
+      locale: "en",
+      userId: null,
+    });
+    const createResult = await prismaOrderRepository.createIdempotent({
+      status: "PENDING",
+      firstName: validCustomer.firstName,
+      lastName: validCustomer.lastName,
+      email: validCustomer.email,
+      phone: validCustomer.phone,
+      userId: null,
+      subtotalAmountMinor: 10000,
+      deliveryAmountMinor: 800,
+      totalAmountMinor: 10800,
+      currency: "USD",
+      items: [
+        {
+          productId: product.id,
+          productName: product.slug,
+          regularUnitPriceAmountMinor: 5000,
+          unitPriceAmountMinor: 5000,
+          quantity: 2,
+          lineTotalAmountMinor: 10000,
+          currency: "USD",
+        },
+      ],
+      idempotencyKey: key,
+      idempotencyRequestHash,
+    });
+    expect(createResult.outcome).toBe("created");
+    if (createResult.outcome !== "created") return;
+    createdOrderIds.push(createResult.order.id);
+
+    const beforeResume = await catalogPrisma.stockReservation.count({
+      where: { orderId: createResult.order.id, productId: product.id },
+    });
+    expect(beforeResume).toBe(0);
+
+    const resumed = await createOrderFromCheckout(
+      prismaOrderRepository,
+      testOrderPayload(items, key),
+    );
+    expect(resumed.ok).toBe(true);
+    if (!resumed.ok) return;
+    expect(resumed.order.id).toBe(createResult.order.id);
+    expect(resumed.created).toBe(false);
+
+    const reservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
+      where: { orderId_productId: { orderId: createResult.order.id, productId: product.id } },
+    });
+    expect(reservation.status).toBe("ACTIVE");
+    expect(reservation.quantity).toBe(2);
   });
 });
 

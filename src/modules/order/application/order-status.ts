@@ -4,10 +4,13 @@ import type { Order, OrderStatus } from "@/modules/order/domain/order";
 
 /**
  * Order lifecycle write use case (IMP-030 / CR-030). Establishes the
- * contract a future Payments/Admin module will call — no such caller
- * exists yet, and none is added here. Never exposed to Customer-facing
- * transport: status is read-only for Customers (see `@/modules/order`'s
- * public exports — nothing customer-facing calls this).
+ * contract a future Payments/Admin module will call. IMP-048 Increment 3
+ * adds its first real caller: `checkout-order.ts`'s own
+ * `securePendingReservationsAndFinalize` uses this to cancel a just-created
+ * PENDING order when a stock reservation for one of its items cannot be
+ * secured — still never exposed to Customer-facing transport directly;
+ * status itself stays read-only for Customers (see `@/modules/order`'s
+ * public exports — nothing customer-facing calls this directly).
  *
  * No Prisma, no HTTP, no authentication concerns — orchestration only,
  * exactly like `checkout-order.ts` and `customer-orders.ts`.

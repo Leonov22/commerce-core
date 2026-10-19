@@ -85,13 +85,28 @@ model Product {
   imageUrl String?
   imageAlt String?
 
+  // IMP-048: inventory tracking (Increment 1 — schema only; no
+  // read/write logic lands until a separately-approved increment).
+  // `trackInventory` defaults to false for every existing product —
+  // zero behavior change until an admin explicitly opts a product in.
+  // `stockQuantity` is the current on-hand, not-yet-irrevocably-sold
+  // count (see `StockReservation`'s own doc comment for how "available"
+  // is derived from this, never stored directly). Also enforced by a
+  // database CHECK constraint (>= 0) added by hand in this migration —
+  // Prisma's schema DSL has no `@check` syntax, so this constraint
+  // exists only in `migration.sql`, not expressible here.
+  trackInventory Boolean @default(false)
+  stockQuantity  Int     @default(0)
+
   publishedAt DateTime?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
-  category     Category             @relation(fields: [categoryId], references: [id], onDelete: Restrict)
-  translations ProductTranslation[]
-  discounts    ProductDiscount[]
+  category          Category             @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  translations      ProductTranslation[]
+  discounts         ProductDiscount[]
+  stockReservations StockReservation[]
+  stockAdjustments  StockAdjustment[]
 
   @@index([status])
   @@index([categoryId])
@@ -436,4 +451,156 @@ model User {
   orders Order[]
 
   @@map("users")
+}
+
+// =============================================================================
+// Inventory — reservation-based stock tracking (IMP-048)
+//
+// Increment 1: schema only. No application code reads or writes these
+// models yet — that lands in a separately-approved increment. Introduced
+// now so the migration itself (additive, safe, reviewed in isolation) is
+// not entangled with any behavior change.
+//
+// Three distinct quantities, one authoritative source each:
+//   - on-hand  = Product.stockQuantity — changed only by admin
+//     adjustments and by a reservation's own CONSUMED transition
+//     (never by checkout directly).
+//   - reserved = SUM(quantity) over StockReservation rows with
+//     status = ACTIVE for a product — read from these rows themselves,
+//     deliberately never a denormalized counter on Product (avoids the
+//     drift a redundant counter would risk).
+//   - available = on-hand - reserved, computed at decision time, never
+//     stored.
+//
+// A StockReservation row is permanent for its (orderId, productId) pair:
+// it is created at most once per pair (enforced below) and, once it
+// leaves ACTIVE, that terminal state (EXPIRED, RELEASED, or CONSUMED) is
+// never revisited and no second row is ever created for the same pair.
+// `orderId` is deliberately a plain field, not a foreign key — Order is
+// a different module's own Prisma usage even though it shares this one
+// schema file, and the reservation must be checkable/insertable before
+// the Order row it belongs to necessarily exists yet (see the Increment
+// 3 checkout-integration plan). This mirrors the same cross-module,
+// non-FK correlation `PaymentWebhookEvent.paymentId` already uses for
+// an analogous reason.
+// =============================================================================
+
+enum StockReservationStatus {
+  ACTIVE
+  EXPIRED
+  RELEASED
+  CONSUMED
+}
+
+model StockReservation {
+  id String @id @default(cuid())
+
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  // Correlates to Order.id — see this section's own doc comment for why
+  // this is not a foreign key.
+  orderId String
+  // Also enforced by a database CHECK constraint (> 0) in
+  // `migration.sql` — not expressible in Prisma's schema DSL.
+  quantity Int
+
+  status    StockReservationStatus @default(ACTIVE)
+  expiresAt DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  inventoryException InventoryException?
+
+  // At most one reservation per order per product, ever — this is not
+  // only a concurrency safeguard (it is, for the idempotent-insert
+  // protocol a later increment implements) but a direct expression of
+  // the "permanent 1:1 pair" invariant this section's own doc comment
+  // describes.
+  @@unique([orderId, productId])
+  // Supports the per-product availability aggregate (productId + status).
+  @@index([productId, status])
+  // Supports the inline expiry sweep's own lookup (status + expiresAt).
+  @@index([status, expiresAt])
+  @@map("stock_reservations")
+}
+
+// Immutable audit log of intentional admin stock changes — append-only
+// by design (no update/delete path is ever exposed through the ordinary
+// admin API), mirroring `PaymentWebhookEvent`'s own "durable record,
+// never rewritten" treatment.
+model StockAdjustment {
+  id String @id @default(cuid())
+
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  // Signed — a restock is positive, a correction can be negative. Never
+  // zero: a no-op adjustment shouldn't be recorded at all. Also
+  // enforced by a database CHECK constraint (!= 0) in `migration.sql`
+  // — not expressible in Prisma's schema DSL.
+  quantityChange Int
+  reason         String
+
+  // No foreign key — Identity is a different module, same cross-module
+  // correlation convention as `StockReservation.orderId` above.
+  adminUserId String?
+
+  createdAt DateTime @default(now())
+
+  @@index([productId, createdAt])
+  @@map("stock_adjustments")
+}
+
+enum InventoryExceptionStatus {
+  OPEN
+  RESOLVED
+}
+
+// Records the rare case where a payment settles successfully after its
+// backing StockReservation has already left ACTIVE for some other
+// reason (expired and reclaimed by another order) — see this section's
+// own doc comment on why a reservation is never revived in that
+// situation. Deliberately a real foreign key to StockReservation (both
+// models are Catalog-owned, so there is no cross-module tension) and
+// deliberately NOT append-only like StockAdjustment: an admin resolving
+// an incident is a normal, expected lifecycle action for this model,
+// never for StockAdjustment.
+//
+// `reservationId` is `@unique` rather than a composite
+// (orderId, productId) key: since a reservation is permanent per pair
+// (see above), there can be at most one such incident per reservation,
+// ever — resolving one is therefore terminal; there is no legitimate
+// reason to reopen it.
+model InventoryException {
+  id String @id @default(cuid())
+
+  reservationId String           @unique
+  reservation   StockReservation @relation(fields: [reservationId], references: [id], onDelete: Restrict)
+
+  // Denormalized from the reservation for convenient admin-list queries
+  // — identity facts about an already-permanent reservation, not a
+  // value that can drift out of sync with anything mutable.
+  orderId   String
+  productId String
+  // The quantity of the reservation that could not be consumed. Also
+  // enforced by a database CHECK constraint (> 0) in `migration.sql` —
+  // not expressible in Prisma's schema DSL.
+  quantity  Int
+
+  // No foreign key — Payment is a different module.
+  paymentId String?
+
+  reason String
+
+  status     InventoryExceptionStatus @default(OPEN)
+  detectedAt DateTime                 @default(now())
+
+  resolvedAt            DateTime?
+  resolvedByAdminUserId String?
+  resolutionNote        String?
+
+  @@index([status])
+  @@map("inventory_exceptions")
 }

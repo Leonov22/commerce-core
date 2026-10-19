@@ -7,6 +7,7 @@
  */
 import "server-only";
 import { prismaProductRepository } from "@/modules/catalog/infrastructure/prisma-product-repository";
+import { prismaInventoryRepository } from "@/modules/catalog/infrastructure/prisma-inventory-repository";
 import * as catalogQueries from "@/modules/catalog/application/catalog-queries";
 import * as adminProductQueries from "@/modules/catalog/application/admin-product-queries";
 import * as adminProductCommands from "@/modules/catalog/application/admin-product-commands";
@@ -24,6 +25,7 @@ import type { RawAdminProductInput } from "@/modules/catalog/application/admin-p
 import type { RawAdminCategoryInput } from "@/modules/catalog/application/admin-category-commands";
 import type { ConfirmProductImageUploadInput } from "@/modules/catalog/application/admin-product-image-commands";
 import type { RawAdminDiscountInput } from "@/modules/catalog/application/admin-discount-commands";
+import type { ReserveStockInput } from "@/modules/catalog/repositories/inventory-repository";
 
 export type {
   Product,
@@ -76,6 +78,18 @@ export type {
   SetAdminDiscountActiveResult,
   RemoveAdminDiscountResult,
 } from "@/modules/catalog/application/admin-discount-commands";
+
+// IMP-048 Increment 3: only the two operations Order's checkout
+// integration needs (`reserveStock`, `releaseReservation`) are exposed
+// here. `consumeReservation`/`securePaymentWindow`/`adjustStock`/etc.
+// have no caller yet — they are exported from this barrel only once the
+// increment that actually calls them is approved, so an unused export
+// never implies a wiring that doesn't exist.
+export type {
+  ReserveStockInput,
+  ReserveStockResult,
+  ReleaseReservationResult,
+} from "@/modules/catalog/repositories/inventory-repository";
 
 export function getProductById(id: string, locale: string) {
   return catalogQueries.getProductById(prismaProductRepository, id, locale);
@@ -148,4 +162,14 @@ export function setAdminDiscountActive(id: string, isActive: boolean) {
 
 export function removeAdminDiscount(id: string) {
   return adminDiscountCommands.removeAdminDiscount(prismaProductRepository, id);
+}
+
+// IMP-048 Increment 3 — see this file's own export-type comment above for
+// why only these two inventory operations are exposed so far.
+export function reserveStock(input: ReserveStockInput) {
+  return prismaInventoryRepository.reserveStock(input);
+}
+
+export function releaseReservation(orderId: string, productId: string) {
+  return prismaInventoryRepository.releaseReservation(orderId, productId);
 }

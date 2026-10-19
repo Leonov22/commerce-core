@@ -1,6 +1,7 @@
 import "server-only";
-import { getProductsByIds } from "@/modules/catalog";
+import { getProductsByIds, reserveStock, releaseReservation } from "@/modules/catalog";
 import { computeCheckoutSubmissionFingerprint } from "@/modules/order/application/idempotency";
+import { changeOrderStatus } from "@/modules/order/application/order-status";
 import type { OrderRepository } from "@/modules/order/repositories/order-repository";
 import type { Order } from "@/modules/order/domain/order";
 
@@ -74,7 +75,20 @@ export type CreateOrderFromCheckoutResult =
    * else's key. The caller must reject this outright and must never fall
    * back to returning the mismatched existing Order.
    */
-  | { ok: false; error: "IDEMPOTENCY_KEY_CONFLICT" };
+  | { ok: false; error: "IDEMPOTENCY_KEY_CONFLICT" }
+  /**
+   * IMP-048 Increment 3: at least one *tracked* item could not be
+   * reserved (not enough on-hand stock, or the product vanished between
+   * Catalog resolution and reservation). The newly created Order has
+   * already been cancelled and every reservation this attempt created
+   * has already been released — never left dangling. `productIds` names
+   * the item(s) known to have failed; it can be empty when this is a
+   * replay of a submission that already failed this way on an earlier
+   * attempt (see `securePendingReservationsAndFinalize`'s own doc
+   * comment on why that case is inferred from the Order's own status
+   * rather than re-derived).
+   */
+  | { ok: false; error: "INSUFFICIENT_STOCK"; productIds: string[] };
 
 /**
  * A single OrderItem's quantity ceiling. 100 units of one product is
@@ -106,6 +120,121 @@ export const MAX_AMOUNT_MINOR = 2_147_483_647;
  */
 export function isWithinSafeAmountRange(amountMinor: number): boolean {
   return Number.isInteger(amountMinor) && amountMinor >= 0 && amountMinor <= MAX_AMOUNT_MINOR;
+}
+
+/**
+ * IMP-048 Increment 3: how long a checkout's stock reservation holds
+ * before it becomes eligible to be swept as expired by some other
+ * order's `reserveStock`/`adjustStock` call on the same product.
+ * Provisional — no payment flow exists yet to call Catalog's
+ * `securePaymentWindow` and extend it before this elapses; that wiring
+ * is a separately-approved, later increment. 15 minutes mirrors a
+ * typical checkout session window.
+ */
+const STOCK_RESERVATION_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * Attempts to reserve every item of an already-persisted, still-PENDING
+ * Order, one at a time, stopping at the first item that cannot be
+ * secured. Untracked products (the only kind that exist today — see
+ * `reserveStock`'s own "notTracked" outcome) are a complete no-op here,
+ * which is what keeps this step's introduction a zero-behavior-change
+ * for every product that hasn't opted into inventory tracking.
+ *
+ * Idempotent by construction: re-running this for an Order whose items
+ * were already reserved by an earlier, interrupted attempt simply sees
+ * `"alreadyReserved"` for each already-secured pair and continues — it
+ * never creates a duplicate row, and never re-attempts (or revives) a
+ * pair that already reached a terminal state.
+ */
+async function reserveStockForOrder(
+  order: Order,
+): Promise<{ ok: true } | { ok: false; failedProductIds: string[] }> {
+  const expiresAt = new Date(Date.now() + STOCK_RESERVATION_TTL_MS);
+  for (const item of order.items) {
+    const result = await reserveStock({
+      orderId: order.id,
+      productId: item.productId,
+      quantity: item.quantity,
+      expiresAt,
+    });
+    if (
+      result.outcome === "reserved" ||
+      result.outcome === "alreadyReserved" ||
+      result.outcome === "notTracked"
+    ) {
+      continue;
+    }
+    // "insufficientStock" | "productNotFound" | "alreadyFinal" — this
+    // item cannot be secured. Stop here rather than attempting the
+    // remaining items: whatever this call already reserved above gets
+    // released unconditionally by the caller regardless of how far this
+    // loop got.
+    return { ok: false, failedProductIds: [item.productId] };
+  }
+  return { ok: true };
+}
+
+/**
+ * Releases every item of an Order's reservations unconditionally — safe
+ * and idempotent to call for an item that was never reserved at all
+ * (untracked, or never reached by `reserveStockForOrder`'s early stop:
+ * `releaseReservation` simply reports `"notFound"`, a no-op) and for one
+ * already released by an earlier attempt (`"alreadyReleased"`, also a
+ * no-op). This is deliberately not told which items `reserveStockForOrder`
+ * actually created this call — looping over every item and letting each
+ * release be a safe no-op is simpler and more robust than tracking it.
+ */
+async function releaseAllReservationsForOrder(order: Order): Promise<void> {
+  for (const item of order.items) {
+    await releaseReservation(order.id, item.productId);
+  }
+}
+
+/**
+ * IMP-048 Increment 3: the one place a resolved Order (freshly created,
+ * or found via an idempotency replay) is secured against inventory
+ * before `createOrderFromCheckout` hands it back to its caller.
+ *
+ * - `PENDING`: the normal case — attempt to reserve every item. On
+ *   failure, release whatever this attempt reserved and cancel the
+ *   Order via the existing, atomic `changeOrderStatus` lifecycle
+ *   primitive (never an ad hoc status write) — which itself safely
+ *   no-ops if some other concurrent call already moved the Order away
+ *   from `PENDING` by the time this runs, satisfying "never cancel an
+ *   Order that already progressed to a non-pending state" without this
+ *   function needing its own extra guard for that race.
+ * - `CANCELLED`: only this function ever cancels a `PENDING` Order
+ *   today (no payment integration exists yet in this codebase), and
+ *   only for `INSUFFICIENT_STOCK` — so a replay that resolves to an
+ *   already-`CANCELLED` Order is consistently re-reporting that same
+ *   original failure, never fabricating a success. This inference would
+ *   need revisiting if a future increment introduces another path to
+ *   `CANCELLED`. `productIds` is empty here — this function doesn't
+ *   re-derive which item originally failed, only that this submission
+ *   did.
+ * - `PAID`: unreachable until payment integration lands (a separately
+ *   approved, later increment) — once it does, this Order's
+ *   reservations are already `CONSUMED`, so there is nothing left to
+ *   reserve, release, or re-decide; a replay here is a plain success.
+ */
+async function securePendingReservationsAndFinalize(
+  repository: OrderRepository,
+  order: Order,
+  created: boolean | undefined,
+): Promise<CreateOrderFromCheckoutResult> {
+  if (order.status === "CANCELLED") {
+    return { ok: false, error: "INSUFFICIENT_STOCK", productIds: [] };
+  }
+  if (order.status === "PENDING") {
+    const reservation = await reserveStockForOrder(order);
+    if (!reservation.ok) {
+      await releaseAllReservationsForOrder(order);
+      await changeOrderStatus(repository, order.id, "CANCELLED");
+      return { ok: false, error: "INSUFFICIENT_STOCK", productIds: reservation.failedProductIds };
+    }
+  }
+  return created === undefined ? { ok: true, order } : { ok: true, order, created };
 }
 
 /**
@@ -168,7 +297,12 @@ export async function createOrderFromCheckout(
     const existing = await repository.findIdempotencyRecord(request.idempotencyKey);
     if (existing) {
       if (existing.idempotencyRequestHash === idempotencyRequestHash) {
-        return { ok: true, order: existing.order, created: false };
+        // IMP-048 Increment 3: a replay must still resume/verify stock
+        // reservation — see `securePendingReservationsAndFinalize`'s own
+        // doc comment for why this is safe to run unconditionally, even
+        // though the common case (an attempt that already fully
+        // succeeded) does nothing new here.
+        return securePendingReservationsAndFinalize(repository, existing.order, false);
       }
       return { ok: false, error: "IDEMPOTENCY_KEY_CONFLICT" };
     }
@@ -259,7 +393,7 @@ async function createNewOrder(
 
   if (!request.idempotencyKey || !idempotencyRequestHash) {
     const order = await repository.create(newOrderInput);
-    return { ok: true, order };
+    return securePendingReservationsAndFinalize(repository, order, undefined);
   }
 
   const result = await repository.createIdempotent({
@@ -272,5 +406,9 @@ async function createNewOrder(
     return { ok: false, error: "IDEMPOTENCY_KEY_CONFLICT" };
   }
 
-  return { ok: true, order: result.order, created: result.outcome === "created" };
+  return securePendingReservationsAndFinalize(
+    repository,
+    result.order,
+    result.outcome === "created",
+  );
 }
