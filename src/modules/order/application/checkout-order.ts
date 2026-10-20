@@ -88,7 +88,22 @@ export type CreateOrderFromCheckoutResult =
    * comment on why that case is inferred from the Order's own status
    * rather than re-derived).
    */
-  | { ok: false; error: "INSUFFICIENT_STOCK"; productIds: string[] };
+  | { ok: false; error: "INSUFFICIENT_STOCK"; productIds: string[] }
+  /**
+   * CR-2 remediation (round 2): a reservation failed AND the attempt to
+   * clean up after that failure (cancel the Order, release whichever
+   * reservations this attempt made) could not be fully confirmed —
+   * e.g. one or more `releaseReservation` calls failed, or the Order's
+   * own status could not be conclusively determined afterward. Never
+   * returned for a cleanly resolved failure (that's `INSUFFICIENT_STOCK`
+   * above) — this exists specifically so the caller is never told "the
+   * order was cancelled and every reservation released" when that isn't
+   * known to be true. `productIds` names the item(s) whose release
+   * could not be confirmed; deliberately generic (no raw error detail)
+   * since this crosses into a customer-facing boundary — full detail is
+   * only in the server-side logs (`console.error`).
+   */
+  | { ok: false; error: "RESERVATION_CLEANUP_INCOMPLETE"; productIds: string[] };
 
 /**
  * A single OrderItem's quantity ceiling. 100 units of one product is
@@ -216,121 +231,182 @@ async function reserveStockForOrder(
 }
 
 /**
- * Releases every item of an Order's reservations unconditionally — safe
- * and idempotent to call for an item that was never reserved at all
- * (untracked, or never reached by `reserveStockForOrder`'s early stop:
- * `releaseReservation` simply reports `"notFound"`, a no-op) and for one
- * already released by an earlier attempt (`"alreadyReleased"`, also a
- * no-op). This is deliberately not told which items `reserveStockForOrder`
- * actually created this call — looping over every item and letting each
- * release be a safe no-op is simpler and more robust than tracking it.
+ * Attempts to release every item of an Order's reservations
+ * INDEPENDENTLY — CR-2 (round 2): a failure releasing one item must never
+ * prevent the remaining items from being attempted. Safe and idempotent
+ * to call for an item that was never reserved at all (untracked, or
+ * never reached by `reserveStockForOrder`'s early stop: `releaseReservation`
+ * simply reports `"notFound"`, a no-op) and for one already released by
+ * an earlier attempt (`"alreadyReleased"`, also a no-op).
+ *
+ * Returns the `productId`s whose release attempt itself threw — an empty
+ * array means every item was at least attempted without throwing (not
+ * necessarily that every one was actually `"released"`; outcomes like
+ * `"notReleasable"` are a different, already-logged-by-the-repository
+ * concern, not a failure of this function to attempt the call).
  */
-async function releaseAllReservationsForOrder(order: Order): Promise<void> {
+async function releaseEachReservationIndependently(order: Order): Promise<string[]> {
+  const failedProductIds: string[] = [];
   for (const item of order.items) {
-    await releaseReservation(order.id, item.productId);
+    try {
+      await releaseReservation(order.id, item.productId);
+    } catch (releaseError) {
+      console.error(
+        "[order/checkout-order] failed to release a reservation during cleanup — manual reconciliation required",
+        { orderId: order.id, productId: item.productId, releaseError },
+      );
+      failedProductIds.push(item.productId);
+    }
   }
+  return failedProductIds;
+}
+
+/** The outcome of an attempt to clean up after a reservation problem — see `cleanupReservationsAndReconcileOrder`'s own doc comment. */
+interface ReservationCleanupOutcome {
+  /** The best currently-known Order state. */
+  order: Order;
+  /**
+   * `"confirmed"`: the returned `order.status` is authoritative (either
+   * this attempt's own cancellation was confirmed to succeed and every
+   * reservation release it attempted completed without throwing, or the
+   * Order was found to have already, confirmably, moved to `PAID`/
+   * `CANCELLED` by something else). `"incomplete"`: some part of this
+   * could not be confirmed — never treat this the same as a cleanly
+   * resolved failure.
+   */
+  status: "confirmed" | "incomplete";
+  /** `productId`s whose release attempt itself threw, if any. */
+  releaseFailures: string[];
 }
 
 /**
- * CR-2 / CR-3: the one place reservation cleanup (release + cancel)
- * actually happens — used both when `reserveStockForOrder` cleanly
- * reports a business-outcome failure and when it THROWS (an unexpected
- * fault, e.g. a transient database error). Never throws itself: every
- * internal failure is logged loudly (`console.error`, matching this
- * codebase's existing convention — see `stripe-webhook.ts`/
- * `process-stripe-webhook-event.ts`) rather than silently swallowed, so
- * cleanup failures are observable instead of disappearing. The caller
- * always gets back the best currently-known Order state and decides what
- * to report from that, never from a stale assumption.
+ * CR-2 / CR-3 (round 2): the one place reservation cleanup actually
+ * happens — used both when `reserveStockForOrder` cleanly reports a
+ * business-outcome failure and when it THROWS (an unexpected fault).
+ * Never throws itself: every internal failure is logged loudly
+ * (`console.error`, matching this codebase's existing convention — see
+ * `stripe-webhook.ts`/`process-stripe-webhook-event.ts`) and folded into
+ * an explicit `"incomplete"` outcome rather than silently treated as
+ * resolved.
  *
- * CR-3: re-reads the Order's authoritative state FIRST and never
- * releases or cancels an Order that has already moved away from
- * `PENDING` (e.g. a concurrent payment success/failure elsewhere) — that
- * Order's reservations belong to whichever process moved it, not to this
- * cleanup. If `changeOrderStatus` itself reports the narrower race
- * (`ORDER_STATUS_CHANGED` — the Order moved on between this function's
- * own re-read and its cancel attempt), it resolves by reading once more
- * rather than looping indefinitely: the lifecycle only ever moves
- * forward once (CR-030), so a second read is sufficient in practice.
+ * CR-3 lifecycle coordination protocol — **cancel first, release only
+ * after that is confirmed**: earlier code re-read the Order, decided
+ * from that read alone that it was safe to release, and only attempted
+ * `changeOrderStatus` afterward. That is provably insufficient: the
+ * Order can move to `PAID` in the window between the read and the
+ * release, and no later re-read can undo a release that already
+ * happened. The fix does not add another read — it reorders the two
+ * side effects so the ONE thing in this system that is already atomic
+ * (`changeOrderStatus`'s `updateStatusIfCurrent`, a single
+ * `UPDATE ... WHERE id = ? AND status = ?`, established by CR-030) is
+ * the sole gate: `changeOrderStatus(..., "CANCELLED")` is attempted
+ * FIRST, with no prior read of our own. Reservations are released only
+ * once that call has been CONFIRMED to have succeeded — never before,
+ * and never based on a read that could already be stale by the time the
+ * release actually runs. This requires no new primitive, no cross-module
+ * transaction, and no ad hoc status write; it is the existing CR-030
+ * guarantee used as the single source of truth instead of a read this
+ * function performed itself.
  *
- * Deliberately does not introduce a cross-module transaction or any ad
- * hoc status write — reconciliation uses only the existing, atomic
- * `changeOrderStatus`/`OrderRepository.findById` primitives already
- * established by CR-030. If those primitives ever report something this
- * function doesn't recognize, it logs loudly and returns the
- * last-known Order rather than inventing a new mechanism.
+ * This closes the checkout side of the race. It depends on one
+ * documented, NOT-YET-IMPLEMENTED constraint on the future payment-
+ * success path (Increment 5, not approved/not written here): that code
+ * must likewise call `changeOrderStatus(orderId, "PAID")` as ITS OWN
+ * gate BEFORE calling `consumeReservation` for any item, never the
+ * reverse order and never unconditionally. Only then are "release" and
+ * "consume" guaranteed never to race each other for the same reservation
+ * row — because only one of `PENDING -> CANCELLED` / `PENDING -> PAID`
+ * can ever succeed (Postgres's own row lock on the Order row during that
+ * single `UPDATE` already guarantees this, with zero new infrastructure),
+ * and each side only acts on its own reservations after ITS OWN
+ * transition is confirmed. This is flagged here as a requirement for
+ * that future, separately-approved work — not implemented, since no
+ * payment-success code exists yet to apply it to.
  */
 async function cleanupReservationsAndReconcileOrder(
   repository: OrderRepository,
   order: Order,
-): Promise<Order> {
-  let current: Order | null = order;
-  try {
-    current = await repository.findById(order.id);
-  } catch (readError) {
-    console.error(
-      "[order/checkout-order] could not re-read order before reservation cleanup — proceeding with the last-known state",
-      { orderId: order.id, readError },
-    );
-  }
-  if (!current) {
-    console.error(
-      "[order/checkout-order] order not found during reservation cleanup — nothing to reconcile",
-      { orderId: order.id },
-    );
-    return order;
-  }
-  if (current.status !== "PENDING") {
-    // Already moved on (e.g. a concurrent payment success/failure) —
-    // never release or cancel; its reservations belong to whichever
-    // process moved it, not to this cleanup.
-    return current;
-  }
-
-  try {
-    await releaseAllReservationsForOrder(current);
-  } catch (releaseError) {
-    console.error(
-      "[order/checkout-order] failed to release one or more reservations during cleanup — manual reconciliation required",
-      { orderId: current.id, releaseError },
-    );
-  }
-
+): Promise<ReservationCleanupOutcome> {
   let cancelResult;
   try {
-    cancelResult = await changeOrderStatus(repository, current.id, "CANCELLED");
+    cancelResult = await changeOrderStatus(repository, order.id, "CANCELLED");
   } catch (cancelThrow) {
     console.error(
-      "[order/checkout-order] changeOrderStatus itself threw during reservation cleanup — manual reconciliation required",
-      { orderId: current.id, cancelThrow },
+      "[order/checkout-order] changeOrderStatus threw while attempting to cancel during reservation cleanup — compensation is incomplete, no reservation was released",
+      { orderId: order.id, cancelThrow },
     );
-    return current;
+    return { order, status: "incomplete", releaseFailures: [] };
   }
 
   if (cancelResult.ok) {
-    return cancelResult.order;
+    // CONFIRMED: this attempt's cancellation succeeded — the Order was
+    // still PENDING at the exact instant of that atomic write and is now
+    // CANCELLED. Only now is it safe to release.
+    const releaseFailures = await releaseEachReservationIndependently(cancelResult.order);
+    return {
+      order: cancelResult.order,
+      status: releaseFailures.length > 0 ? "incomplete" : "confirmed",
+      releaseFailures,
+    };
   }
 
-  if (cancelResult.error === "ORDER_STATUS_CHANGED") {
+  if (
+    cancelResult.error === "ORDER_STATUS_CHANGED" ||
+    cancelResult.error === "INVALID_STATUS_TRANSITION"
+  ) {
+    // The Order was not PENDING at the time of that atomic write (or of
+    // changeOrderStatus's own internal read) — find out what it actually
+    // is now, authoritatively, via a fresh read.
+    let latest: Order | null;
     try {
-      const latest = await repository.findById(current.id);
-      if (latest) {
-        return latest;
-      }
+      latest = await repository.findById(order.id);
     } catch (rereadError) {
       console.error(
-        "[order/checkout-order] could not re-read order after a status-change race during cleanup",
-        { orderId: current.id, rereadError },
+        "[order/checkout-order] could not re-read order after a failed cancellation attempt during cleanup — compensation is incomplete, no reservation was released",
+        { orderId: order.id, cancelError: cancelResult.error, rereadError },
       );
+      return { order, status: "incomplete", releaseFailures: [] };
     }
-    return current;
+    if (!latest) {
+      console.error(
+        "[order/checkout-order] order not found while reconciling a failed cancellation attempt during cleanup",
+        { orderId: order.id, cancelError: cancelResult.error },
+      );
+      return { order, status: "incomplete", releaseFailures: [] };
+    }
+    if (latest.status === "PAID") {
+      // Confirmed: something else (e.g. a future payment-success path)
+      // already won this Order — its reservations are that process's to
+      // manage, never released here.
+      return { order: latest, status: "confirmed", releaseFailures: [] };
+    }
+    if (latest.status === "CANCELLED") {
+      // Confirmed CANCELLED — but not necessarily by a call that also
+      // finished releasing every reservation (e.g. an earlier, crashed
+      // attempt). Resuming the release here is safe and idempotent,
+      // exactly like `reserveStockForOrder`'s own resume behavior.
+      const releaseFailures = await releaseEachReservationIndependently(latest);
+      return {
+        order: latest,
+        status: releaseFailures.length > 0 ? "incomplete" : "confirmed",
+        releaseFailures,
+      };
+    }
+    // Still PENDING (or any other value): unexpected given the lifecycle
+    // rules (CANCELLED/PAID are both terminal, so this shouldn't be
+    // reachable) — never guess, never release.
+    console.error(
+      "[order/checkout-order] order was neither PAID nor CANCELLED after a failed cancellation attempt during cleanup — compensation is incomplete",
+      { orderId: order.id, latestStatus: latest.status, cancelError: cancelResult.error },
+    );
+    return { order: latest, status: "incomplete", releaseFailures: [] };
   }
 
   console.error(
-    "[order/checkout-order] unexpected changeOrderStatus outcome during reservation cleanup",
-    { orderId: current.id, error: cancelResult.error },
+    "[order/checkout-order] unexpected changeOrderStatus outcome while attempting to cancel during reservation cleanup",
+    { orderId: order.id, error: cancelResult.error },
   );
-  return current;
+  return { order, status: "incomplete", releaseFailures: [] };
 }
 
 /**
@@ -352,7 +428,11 @@ async function cleanupReservationsAndReconcileOrder(
  *     actually already reached `PAID` (a concurrent process completed it
  *     before cleanup ran), this reports that real, successful outcome —
  *     never a fabricated `INSUFFICIENT_STOCK` for an Order that actually
- *     succeeded.
+ *     succeeded. If cleanup could not be CONFIRMED complete (a release
+ *     failed, or the Order's final state couldn't be determined), this
+ *     reports `RESERVATION_CLEANUP_INCOMPLETE` instead of
+ *     `INSUFFICIENT_STOCK` — never claiming a clean cancellation that
+ *     isn't known to be true.
  * - `CANCELLED`: only this function ever cancels a `PENDING` Order
  *   today (no payment integration exists yet in this codebase), and
  *   only for `INSUFFICIENT_STOCK` — so a replay that resolves to an
@@ -384,10 +464,20 @@ async function securePendingReservationsAndFinalize(
     reservation = await reserveStockForOrder(order);
   } catch (reservationError) {
     console.error(
-      "[order/checkout-order] reserveStockForOrder threw — attempting compensation before re-raising",
+      "[order/checkout-order] reserveStockForOrder threw — attempting compensation before re-raising the original error",
       { orderId: order.id, reservationError },
     );
-    await cleanupReservationsAndReconcileOrder(repository, order);
+    const cleanup = await cleanupReservationsAndReconcileOrder(repository, order);
+    if (cleanup.status === "incomplete") {
+      console.error(
+        "[order/checkout-order] compensation after a thrown reservation error was INCOMPLETE — manual reconciliation required",
+        { orderId: order.id, releaseFailures: cleanup.releaseFailures, reservationError },
+      );
+    }
+    // CR-2: the original fault must never be laundered into a softer
+    // result, regardless of whether compensation itself fully
+    // succeeded — a thrown error here is already the strongest, most
+    // honest signal this function can give.
     throw reservationError;
   }
 
@@ -395,9 +485,19 @@ async function securePendingReservationsAndFinalize(
     return created === undefined ? { ok: true, order } : { ok: true, order, created };
   }
 
-  const finalOrder = await cleanupReservationsAndReconcileOrder(repository, order);
-  if (finalOrder.status === "PAID") {
-    return { ok: true, order: finalOrder };
+  const cleanup = await cleanupReservationsAndReconcileOrder(repository, order);
+
+  if (cleanup.status === "incomplete") {
+    // CR-2: never claim the Order was successfully cancelled and every
+    // reservation released when that isn't known to be true.
+    return {
+      ok: false,
+      error: "RESERVATION_CLEANUP_INCOMPLETE",
+      productIds: cleanup.releaseFailures,
+    };
+  }
+  if (cleanup.order.status === "PAID") {
+    return { ok: true, order: cleanup.order };
   }
   return { ok: false, error: "INSUFFICIENT_STOCK", productIds: reservation.failedProductIds };
 }

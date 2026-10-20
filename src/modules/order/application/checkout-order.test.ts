@@ -1379,7 +1379,8 @@ describe("createOrderFromCheckout — stock reservation integration (IMP-048 Inc
     });
     createdOrderIds.push(order.id);
     // Compensation still ran despite the throw: the order was cancelled
-    // and the earlier successful reservation was released.
+    // (cancel-first, per the CR-3 protocol) and the earlier successful
+    // reservation was released afterward.
     expect(order.status).toBe("CANCELLED");
 
     const reservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
@@ -1388,7 +1389,50 @@ describe("createOrderFromCheckout — stock reservation integration (IMP-048 Inc
     expect(reservation.status).toBe("RELEASED");
   });
 
-  it("CR-2: a release operation that throws during compensation does not crash checkout — it still reports INSUFFICIENT_STOCK and still attempts to cancel the order", async () => {
+  it("CR-2 (1): a release failure for one reservation does not prevent the remaining reservations from being released", async () => {
+    const productA = await createTrackedTestProduct(5);
+    const productB = await createTrackedTestProduct(5);
+    const insufficientProduct = await createTrackedTestProduct(0);
+    releaseReservationThrowForProductIds.add(productA.id);
+    try {
+      const result = await createOrderFromCheckout(
+        prismaOrderRepository,
+        testOrderPayload([
+          { productId: productA.id, quantity: 1 },
+          { productId: productB.id, quantity: 1 },
+          { productId: insufficientProduct.id, quantity: 1 },
+        ]),
+      );
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.error).toBe("RESERVATION_CLEANUP_INCOMPLETE");
+    } finally {
+      releaseReservationThrowForProductIds.delete(productA.id);
+    }
+
+    const order = await prisma.order.findFirstOrThrow({
+      where: { items: { some: { productId: productB.id } } },
+      orderBy: { createdAt: "desc" },
+    });
+    createdOrderIds.push(order.id);
+    expect(order.status).toBe("CANCELLED");
+
+    // productA's release threw — left ACTIVE, observable/unresolved.
+    const reservationA = await catalogPrisma.stockReservation.findUniqueOrThrow({
+      where: { orderId_productId: { orderId: order.id, productId: productA.id } },
+    });
+    expect(reservationA.status).toBe("ACTIVE");
+
+    // productB's release must still have been ATTEMPTED despite A's
+    // throw — this is the independence CR-2 requires: a failure
+    // releasing one reservation must never stop the others.
+    const reservationB = await catalogPrisma.stockReservation.findUniqueOrThrow({
+      where: { orderId_productId: { orderId: order.id, productId: productB.id } },
+    });
+    expect(reservationB.status).toBe("RELEASED");
+  });
+
+  it("CR-2 (2): a release failure produces an explicit RESERVATION_CLEANUP_INCOMPLETE outcome, never a plain INSUFFICIENT_STOCK", async () => {
     const succeedsProduct = await createTrackedTestProduct(5);
     const insufficientProduct = await createTrackedTestProduct(0);
     releaseReservationThrowForProductIds.add(succeedsProduct.id);
@@ -1402,8 +1446,8 @@ describe("createOrderFromCheckout — stock reservation integration (IMP-048 Inc
       );
       expect(result).toEqual({
         ok: false,
-        error: "INSUFFICIENT_STOCK",
-        productIds: [insufficientProduct.id],
+        error: "RESERVATION_CLEANUP_INCOMPLETE",
+        productIds: [succeedsProduct.id],
       });
     } finally {
       releaseReservationThrowForProductIds.delete(succeedsProduct.id);
@@ -1414,21 +1458,131 @@ describe("createOrderFromCheckout — stock reservation integration (IMP-048 Inc
       orderBy: { createdAt: "desc" },
     });
     createdOrderIds.push(order.id);
-    // Best-effort cancellation still happens even though releasing the
-    // sibling reservation threw.
+    // Cancellation itself still happened (cancel-first: it runs BEFORE
+    // release and succeeded on its own) — only the release is unresolved.
     expect(order.status).toBe("CANCELLED");
 
-    // The reservation itself is left ACTIVE (release failed) — this is
-    // the "observable, not silently lost" unresolved state CR-2 calls
-    // for; it is surfaced via the logged error, never hidden behind a
-    // fabricated success.
+    // Never silently claimed as resolved: the reservation is still
+    // ACTIVE, observable via the logged error and this result, not
+    // hidden behind a fabricated success or a generic INSUFFICIENT_STOCK.
     const reservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
       where: { orderId_productId: { orderId: order.id, productId: succeedsProduct.id } },
     });
     expect(reservation.status).toBe("ACTIVE");
   });
 
-  it("CR-3: a concurrent transition to PAID while checkout is handling a reservation failure is reported as success, never a fabricated INSUFFICIENT_STOCK, and its reservation is not released", async () => {
+  it("CR-2 (3): the original reservation exception is preserved even when cleanup's own release also fails", async () => {
+    const succeedsProduct = await createTrackedTestProduct(5);
+    const throwsProduct = await createTrackedTestProduct(5);
+    reserveStockThrowForProductIds.add(throwsProduct.id);
+    releaseReservationThrowForProductIds.add(succeedsProduct.id);
+    try {
+      await expect(
+        createOrderFromCheckout(
+          prismaOrderRepository,
+          testOrderPayload([
+            { productId: succeedsProduct.id, quantity: 1 },
+            { productId: throwsProduct.id, quantity: 1 },
+          ]),
+        ),
+        // The ORIGINAL reservation fault propagates — never replaced or
+        // masked by the release failure that also happened during
+        // compensation.
+      ).rejects.toThrow(/QA-injected reserveStock failure/);
+    } finally {
+      reserveStockThrowForProductIds.delete(throwsProduct.id);
+      releaseReservationThrowForProductIds.delete(succeedsProduct.id);
+    }
+
+    const order = await prisma.order.findFirstOrThrow({
+      where: { items: { some: { productId: succeedsProduct.id } } },
+      orderBy: { createdAt: "desc" },
+    });
+    createdOrderIds.push(order.id);
+    expect(order.status).toBe("CANCELLED");
+    const reservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
+      where: { orderId_productId: { orderId: order.id, productId: succeedsProduct.id } },
+    });
+    expect(reservation.status).toBe("ACTIVE");
+  });
+
+  it("CR-2 (5) / CR-3 (3): an initial order read failure causes no reservation release at all", async () => {
+    const succeedsProduct = await createTrackedTestProduct(5);
+    const insufficientProduct = await createTrackedTestProduct(0);
+
+    const racingRepository: OrderRepository = {
+      ...prismaOrderRepository,
+      findById: async () => {
+        // Fails the very first read `changeOrderStatus` itself performs
+        // internally — nothing in cleanup has learned anything about the
+        // order's real state yet.
+        throw new Error("QA-injected findById failure on the very first cleanup read");
+      },
+    };
+
+    const result = await createOrderFromCheckout(
+      racingRepository,
+      testOrderPayload([
+        { productId: succeedsProduct.id, quantity: 1 },
+        { productId: insufficientProduct.id, quantity: 1 },
+      ]),
+    );
+    expect(result).toEqual({
+      ok: false,
+      error: "RESERVATION_CLEANUP_INCOMPLETE",
+      productIds: [],
+    });
+
+    // Never released — we never got far enough to safely know the
+    // order's real state, so no destructive compensation was attempted.
+    const reservation = await catalogPrisma.stockReservation.findFirstOrThrow({
+      where: { productId: succeedsProduct.id },
+      orderBy: { createdAt: "desc" },
+    });
+    expect(reservation.status).toBe("ACTIVE");
+    createdOrderIds.push(reservation.orderId);
+  });
+
+  it("CR-3 (1): a concurrent transition to PAID exactly between changeOrderStatus's own read and its atomic write is detected, never released", async () => {
+    const paidRaceProduct = await createTrackedTestProduct(5);
+    const insufficientProduct = await createTrackedTestProduct(0);
+
+    let flipped = false;
+    const racingRepository: OrderRepository = {
+      ...prismaOrderRepository,
+      updateStatusIfCurrent: async (orderId, expectedStatus, nextStatus) => {
+        if (!flipped) {
+          flipped = true;
+          // A concurrent process (e.g. a future payment flow) completes
+          // PAID exactly between changeOrderStatus's own internal read
+          // (which already saw PENDING) and this atomic write.
+          await prisma.order.update({ where: { id: orderId }, data: { status: "PAID" } });
+        }
+        return prismaOrderRepository.updateStatusIfCurrent(orderId, expectedStatus, nextStatus);
+      },
+    };
+
+    const result = await createOrderFromCheckout(
+      racingRepository,
+      testOrderPayload([
+        { productId: paidRaceProduct.id, quantity: 1 },
+        { productId: insufficientProduct.id, quantity: 1 },
+      ]),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    createdOrderIds.push(result.order.id);
+    expect(result.order.status).toBe("PAID");
+
+    // The cancel attempt's own atomic write lost the race (its
+    // conditional UPDATE no longer matched PENDING) — never released.
+    const reservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
+      where: { orderId_productId: { orderId: result.order.id, productId: paidRaceProduct.id } },
+    });
+    expect(reservation.status).toBe("ACTIVE");
+  });
+
+  it("CR-3 (2): a concurrent transition to PAID already visible by the time changeOrderStatus's own internal read runs is detected via INVALID_STATUS_TRANSITION, never released", async () => {
     const paidRaceProduct = await createTrackedTestProduct(5);
     const insufficientProduct = await createTrackedTestProduct(0);
 
@@ -1438,9 +1592,8 @@ describe("createOrderFromCheckout — stock reservation integration (IMP-048 Inc
       findById: async (orderId: string) => {
         if (!flipped) {
           flipped = true;
-          // Simulate a concurrent process (e.g. a future payment flow)
-          // completing this Order's payment exactly as cleanup's own
-          // re-read runs.
+          // The concurrent process has already completed PAID before
+          // changeOrderStatus ever reads the order at all.
           await prisma.order.update({ where: { id: orderId }, data: { status: "PAID" } });
         }
         return prismaOrderRepository.findById(orderId);
@@ -1459,11 +1612,65 @@ describe("createOrderFromCheckout — stock reservation integration (IMP-048 Inc
     createdOrderIds.push(result.order.id);
     expect(result.order.status).toBe("PAID");
 
-    // The already-successful reservation must NOT have been released —
-    // it belongs to whatever process moved the Order to PAID, not to
-    // this cleanup.
     const reservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
       where: { orderId_productId: { orderId: result.order.id, productId: paidRaceProduct.id } },
+    });
+    expect(reservation.status).toBe("ACTIVE");
+  });
+
+  it("CR-2 (4) / CR-3 (4): a concurrent PAID transition wins, and the subsequent reconciliation read also fails — reported as incomplete, never a fabricated success or INSUFFICIENT_STOCK", async () => {
+    const paidRaceProduct = await createTrackedTestProduct(5);
+    const insufficientProduct = await createTrackedTestProduct(0);
+
+    let flippedBeforeWrite = false;
+    let findByIdCallCount = 0;
+    const racingRepository: OrderRepository = {
+      ...prismaOrderRepository,
+      updateStatusIfCurrent: async (orderId, expectedStatus, nextStatus) => {
+        if (!flippedBeforeWrite) {
+          flippedBeforeWrite = true;
+          await prisma.order.update({ where: { id: orderId }, data: { status: "PAID" } });
+        }
+        return prismaOrderRepository.updateStatusIfCurrent(orderId, expectedStatus, nextStatus);
+      },
+      findById: async (orderId: string) => {
+        findByIdCallCount += 1;
+        // The FIRST findById call is changeOrderStatus's own internal
+        // read (must succeed, still PENDING — the write above is what
+        // loses the race). The SECOND is cleanup's own reconciliation
+        // re-read after that failed cancel attempt — make THAT one fail.
+        if (findByIdCallCount === 2) {
+          throw new Error("QA-injected findById failure during reconciliation");
+        }
+        return prismaOrderRepository.findById(orderId);
+      },
+    };
+
+    const result = await createOrderFromCheckout(
+      racingRepository,
+      testOrderPayload([
+        { productId: paidRaceProduct.id, quantity: 1 },
+        { productId: insufficientProduct.id, quantity: 1 },
+      ]),
+    );
+    expect(result).toEqual({
+      ok: false,
+      error: "RESERVATION_CLEANUP_INCOMPLETE",
+      productIds: [],
+    });
+
+    const order = await prisma.order.findFirstOrThrow({
+      where: { items: { some: { productId: paidRaceProduct.id } } },
+      orderBy: { createdAt: "desc" },
+    });
+    createdOrderIds.push(order.id);
+    // The order is ACTUALLY PAID (the concurrent transition really did
+    // win) — but because the reconciliation read failed, that could not
+    // be confirmed, so the result must not claim success, and the
+    // reservation must not have been released.
+    expect(order.status).toBe("PAID");
+    const reservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
+      where: { orderId_productId: { orderId: order.id, productId: paidRaceProduct.id } },
     });
     expect(reservation.status).toBe("ACTIVE");
   });

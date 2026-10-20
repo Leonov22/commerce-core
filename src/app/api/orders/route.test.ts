@@ -361,3 +361,42 @@ describe("POST /api/orders — idempotency result handling (IMP-031)", () => {
     expect(json.order).toBeUndefined();
   });
 });
+
+/**
+ * IMP-048 Increment 3 / CR-2 remediation (round 3): `INSUFFICIENT_STOCK`
+ * and `RESERVATION_CLEANUP_INCOMPLETE` previously fell through this
+ * route's generic `default:` switch arm (a safe, but semantically wrong,
+ * 500 `INTERNAL_ERROR` for the former — a legitimate business outcome the
+ * customer's own cart caused, not a server fault). Both now have their
+ * own explicit, intentional mapping.
+ */
+describe("POST /api/orders — inventory reservation result mapping (IMP-048 Increment 3)", () => {
+  it("returns 409 INSUFFICIENT_STOCK with the affected product ids — not a generic 500 — when checkout's stock reservation fails", async () => {
+    mockGetCurrentUser.mockResolvedValueOnce(AUTHENTICATED_USER);
+    mockCreateOrderFromCheckout.mockResolvedValueOnce({
+      ok: false,
+      error: "INSUFFICIENT_STOCK",
+      productIds: ["prod-1"],
+    });
+
+    const response = await POST(makeRequest(validBody()));
+    expect(response.status).toBe(409);
+    const json = (await response.json()) as { error: string; productIds?: string[] };
+    expect(json.error).toBe("INSUFFICIENT_STOCK");
+    expect(json.productIds).toEqual(["prod-1"]);
+  });
+
+  it("returns a generic 500 INTERNAL_ERROR, with no product ids or internal detail, when reservation cleanup could not be confirmed", async () => {
+    mockGetCurrentUser.mockResolvedValueOnce(AUTHENTICATED_USER);
+    mockCreateOrderFromCheckout.mockResolvedValueOnce({
+      ok: false,
+      error: "RESERVATION_CLEANUP_INCOMPLETE",
+      productIds: ["prod-1"],
+    });
+
+    const response = await POST(makeRequest(validBody()));
+    expect(response.status).toBe(500);
+    const json = (await response.json()) as Record<string, unknown>;
+    expect(json).toEqual({ error: "INTERNAL_ERROR" });
+  });
+});

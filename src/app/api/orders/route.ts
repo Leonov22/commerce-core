@@ -167,6 +167,24 @@ export async function POST(request: Request) {
           // Same key, different logical request (or a different resolved
           // user) — reject outright, never return the mismatched Order.
           return NextResponse.json({ error: "IDEMPOTENCY_KEY_CONFLICT" }, { status: 409 });
+        case "INSUFFICIENT_STOCK":
+          // IMP-048 Increment 3: a legitimate business outcome the
+          // customer caused (their cart's requested quantity exceeds
+          // available stock) — not a server fault, so it must not be
+          // reported as a generic 500. `productIds` is safe to return:
+          // it only names items already in the client's own submitted
+          // cart, nothing about internal reservation/database state.
+          return NextResponse.json(
+            { error: "INSUFFICIENT_STOCK", productIds: result.productIds },
+            { status: 409 },
+          );
+        case "RESERVATION_CLEANUP_INCOMPLETE":
+          // CR-2 remediation: an operational state, not something the
+          // customer's own input caused or can resolve — deliberately a
+          // generic, explicit 500 (never the specific product ids or any
+          // other internal detail; full context is already in the
+          // server-side log `createOrderFromCheckout` itself wrote).
+          return NextResponse.json({ error: "INTERNAL_ERROR" }, { status: 500 });
         default:
           return NextResponse.json({ error: "INTERNAL_ERROR" }, { status: 500 });
       }

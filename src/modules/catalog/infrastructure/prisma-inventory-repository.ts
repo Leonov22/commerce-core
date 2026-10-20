@@ -164,21 +164,31 @@ export const prismaInventoryRepository: InventoryRepository = {
           };
         }
         if (existing.status === "ACTIVE") {
-          // CR-4: still literally ACTIVE in the database, but its
-          // wall-clock `expiresAt` has already passed and nothing has
-          // swept it yet. We already hold this product's row lock here,
-          // so this is the correct place to perform that real, atomic
-          // ACTIVE -> EXPIRED transition for this one row — it must never
-          // be reported as a successful reservation, and the pair is now
-          // permanently terminal (never revived), exactly like the
-          // RELEASED/CONSUMED rows handled just below. Deliberately makes
-          // the outcome identical whether or not some other operation's
-          // sweep already flipped this exact row first.
-          const expired = await tx.stockReservation.update({
-            where: { id: existing.id },
+          // CR-4 (round 3): still literally ACTIVE in the database, but
+          // its wall-clock `expiresAt` has already passed and nothing has
+          // swept it yet. We hold this product's row lock here, but NOT
+          // a lock on this specific reservation row — `releaseReservation`/
+          // `consumeReservation` can still concurrently win a terminal
+          // transition on this exact row without needing the product
+          // lock (by design, per the established protocol). The sweep
+          // below is therefore a CONDITIONAL `UPDATE ... WHERE id = ? AND
+          // status = 'ACTIVE' AND "expiresAt" <= now()` — both conditions
+          // re-asserted at the exact moment of the write itself, not
+          // merely inferred from the read above — never an unconditional
+          // write: if release/consume already won in between our read
+          // and this statement, this matches zero rows and does NOT
+          // overwrite their result. Either way, the re-read immediately
+          // after reports whichever transition actually won —
+          // deterministic, and the pair is permanently terminal either
+          // way (never revived, never a second row).
+          await tx.stockReservation.updateMany({
+            where: { id: existing.id, status: "ACTIVE", expiresAt: { lte: new Date() } },
             data: { status: "EXPIRED" },
           });
-          return { outcome: "alreadyFinal" as const, reservation: toDomainReservation(expired) };
+          const resolved = await tx.stockReservation.findUniqueOrThrow({
+            where: { id: existing.id },
+          });
+          return { outcome: "alreadyFinal" as const, reservation: toDomainReservation(resolved) };
         }
         return { outcome: "alreadyFinal" as const, reservation: toDomainReservation(existing) };
       }

@@ -220,6 +220,66 @@ describe("prismaInventoryRepository", () => {
       });
       expect(count).toBe(1);
     });
+
+    it("CR-4 (round 2): a genuinely concurrent sweep (via reserveStock) and release racing on the same expired-but-not-yet-swept reservation never corrupts or reverts the other's result", async () => {
+      const product = await createTestProduct({ stockQuantity: 5 });
+      const orderId = testOrderId();
+      const stale = await prisma.stockReservation.create({
+        data: {
+          orderId,
+          productId: product.id,
+          quantity: 1,
+          status: "ACTIVE",
+          expiresAt: new Date(Date.now() - 60_000),
+        },
+      });
+
+      const [reserveResult, releaseResult] = await Promise.all([
+        prismaInventoryRepository.reserveStock({
+          orderId,
+          productId: product.id,
+          quantity: 1,
+          expiresAt: new Date(Date.now() + 60_000),
+        }),
+        prismaInventoryRepository.releaseReservation(orderId, product.id),
+      ]);
+
+      // reserveStock's own sweep must always report "alreadyFinal" here —
+      // never a successful reservation — regardless of which side won.
+      expect(reserveResult.outcome).toBe("alreadyFinal");
+      if (reserveResult.outcome !== "alreadyFinal") return;
+
+      // Whichever side won, both calls must agree on the SAME final
+      // status — neither call's conditional update may silently
+      // overwrite the other's already-applied terminal transition.
+      if (reserveResult.reservation.status === "EXPIRED") {
+        // The sweep won the race: release's own conditional update
+        // found the row already EXPIRED, not ACTIVE.
+        expect(releaseResult.outcome).toBe("notReleasable");
+        if (releaseResult.outcome === "notReleasable") {
+          expect(releaseResult.reservation.status).toBe("EXPIRED");
+        }
+      } else {
+        // Release won the race: the sweep's conditional update matched
+        // zero rows and correctly reported release's result instead of
+        // overwriting it back to EXPIRED.
+        expect(reserveResult.reservation.status).toBe("RELEASED");
+        expect(releaseResult.outcome).toBe("released");
+      }
+
+      // Exactly one row, in exactly one of the two valid terminal
+      // states — never reverted, never duplicated.
+      const persisted = await prisma.stockReservation.findUniqueOrThrow({
+        where: { id: stale.id },
+      });
+      expect(["EXPIRED", "RELEASED"]).toContain(persisted.status);
+      expect(persisted.status).toBe(reserveResult.reservation.status);
+
+      const count = await prisma.stockReservation.count({
+        where: { orderId, productId: product.id },
+      });
+      expect(count).toBe(1);
+    });
   });
 
   describe("reserveStock — untracked product compatibility", () => {
