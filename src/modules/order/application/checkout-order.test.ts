@@ -1736,18 +1736,26 @@ describe("createOrderFromCheckout — stock reservation integration (IMP-048 Inc
       key,
     );
 
+    let order: Awaited<ReturnType<typeof prisma.order.findFirstOrThrow>> | undefined;
     releaseReservationThrowForProductIds.add(succeedsProduct.id);
-    const first = await createOrderFromCheckout(prismaOrderRepository, payload);
-    expect(first).toEqual({
-      ok: false,
-      error: "RESERVATION_CLEANUP_INCOMPLETE",
-      productIds: [succeedsProduct.id],
-    });
-    releaseReservationThrowForProductIds.delete(succeedsProduct.id);
+    try {
+      const first = await createOrderFromCheckout(prismaOrderRepository, payload);
+      expect(first).toEqual({
+        ok: false,
+        error: "RESERVATION_CLEANUP_INCOMPLETE",
+        productIds: [succeedsProduct.id],
+      });
 
-    const order = await prisma.order.findFirstOrThrow({ where: { idempotencyKey: key } });
-    createdOrderIds.push(order.id);
-    expect(order.status).toBe("CANCELLED");
+      order = await prisma.order.findFirstOrThrow({ where: { idempotencyKey: key } });
+      expect(order.status).toBe("CANCELLED");
+    } finally {
+      // Removed before the replay below runs, regardless of whether the
+      // assertions above passed -- a thrown assertion here must never
+      // leave this product id permanently marked in the shared,
+      // module-level throw-injection set.
+      releaseReservationThrowForProductIds.delete(succeedsProduct.id);
+    }
+    createdOrderIds.push(order!.id);
 
     // Replay now that release can actually succeed — reconciliation
     // (using only the existing, idempotent releaseReservation
@@ -1756,9 +1764,40 @@ describe("createOrderFromCheckout — stock reservation integration (IMP-048 Inc
     expect(replay).toEqual({ ok: false, error: "INSUFFICIENT_STOCK", productIds: [] });
 
     const reservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
-      where: { orderId_productId: { orderId: order.id, productId: succeedsProduct.id } },
+      where: { orderId_productId: { orderId: order!.id, productId: succeedsProduct.id } },
     });
     expect(reservation.status).toBe("RELEASED");
+  });
+
+  it("CR-2 (round 4, Finding 2): the shared release-throw injection is always removed, even when the test's own assertion throws", async () => {
+    const succeedsProduct = await createTrackedTestProduct(5);
+    const insufficientProduct = await createTrackedTestProduct(0);
+    const payload = testOrderPayload([
+      { productId: succeedsProduct.id, quantity: 1 },
+      { productId: insufficientProduct.id, quantity: 1 },
+    ]);
+
+    releaseReservationThrowForProductIds.add(succeedsProduct.id);
+    try {
+      const result = await createOrderFromCheckout(prismaOrderRepository, payload);
+      // Deliberately wrong expectation to force a thrown AssertionError
+      // inside this try block -- proves the `finally` below still runs
+      // and removes the product id from the shared, module-level set
+      // regardless of what happens inside the try.
+      expect(result).toEqual({ ok: true, order: expect.anything() });
+    } catch {
+      // Expected: the deliberate mismatch above always throws.
+    } finally {
+      releaseReservationThrowForProductIds.delete(succeedsProduct.id);
+    }
+
+    expect(releaseReservationThrowForProductIds.has(succeedsProduct.id)).toBe(false);
+
+    const order = await prisma.order.findFirstOrThrow({
+      where: { items: { some: { productId: succeedsProduct.id } } },
+      orderBy: { createdAt: "desc" },
+    });
+    createdOrderIds.push(order.id);
   });
 
   it("CR-2 (round 4, Finding 1 test 3): a replay that finds a reservation CONSUMED while its order is CANCELLED reports incomplete cleanup, never silent success", async () => {

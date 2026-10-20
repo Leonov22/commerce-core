@@ -221,7 +221,7 @@ describe("prismaInventoryRepository", () => {
       expect(count).toBe(1);
     });
 
-    it("CR-4 (round 4): a real competing release committed strictly between the expiry sweep's own read and its conditional update is never overwritten — deterministic interleaving, not just Promise.all", async () => {
+    it("CR-4 (round 5): the real production reserveStock expiry sweep, paused at a deterministic seam, never overwrites a real competing release that commits in the gap", async () => {
       const product = await createTestProduct({ stockQuantity: 5 });
       const orderId = testOrderId();
       const stale = await prisma.stockReservation.create({
@@ -234,69 +234,45 @@ describe("prismaInventoryRepository", () => {
         },
       });
 
-      // `reserveStock` has no external seam to pause it mid-transaction
-      // between its own read and its conditional update, and adding one
-      // purely for this test would be production complexity this change
-      // doesn't need. Instead, this test drives the EXACT two statements
-      // the expiry sweep issues (the same `SELECT`, then the identical
-      // conditional `UPDATE ... WHERE id = ? AND status = 'ACTIVE' AND
-      // "expiresAt" <= now()`) inside a manually controlled transaction,
-      // with the REAL, unmodified `releaseReservation` production call
-      // committing in the gap between them. This is what actually proves
-      // the conditional UPDATE's WHERE clause — not just its presence in
-      // the source — is what prevents the overwrite: a bare `Promise.all`
-      // only hopes for this exact ordering, it cannot guarantee it.
-      // Definite-assignment assertion: TypeScript cannot trace that the
-      // closure below always runs (and assigns this) before the outer
-      // `await` resolves — it always does, since `prisma.$transaction`
-      // awaits its callback before returning.
-      let releaseResult!: Awaited<ReturnType<typeof prismaInventoryRepository.releaseReservation>>;
-      const sweep = await prisma.$transaction(async (tx) => {
-        const existing = await tx.stockReservation.findUniqueOrThrow({
-          where: { id: stale.id },
-        });
-        expect(existing.status).toBe("ACTIVE");
+      // Deterministic orchestration against the REAL, unmodified
+      // `reserveStock` — not a replica of its SQL. `reserveStock`'s
+      // third-argument hook (test-only; not part of the public
+      // `InventoryRepository` interface, so no real caller can reach it
+      // — see its own doc comment in prisma-inventory-repository.ts) is
+      // invoked by the PRODUCTION transaction itself at the exact moment
+      // between its own read of the expired `ACTIVE` reservation and its
+      // conditional expiry `UPDATE`. The hook runs the REAL
+      // `releaseReservation` to full completion (commit) before
+      // returning, so the production `UPDATE` that follows is
+      // guaranteed — not merely hoped via `Promise.all` — to execute
+      // strictly after that competing commit.
+      let releaseResult:
+        Awaited<ReturnType<typeof prismaInventoryRepository.releaseReservation>> | undefined;
+      const reserveResult = await prismaInventoryRepository.reserveStock(
+        {
+          orderId,
+          productId: product.id,
+          quantity: 1,
+          expiresAt: new Date(Date.now() + 60_000),
+        },
+        async () => {
+          releaseResult = await prismaInventoryRepository.releaseReservation(orderId, product.id);
+        },
+      );
 
-        // The REAL competing release runs and fully COMMITS here —
-        // strictly between the read above and the conditional update
-        // below. Under Postgres's default READ COMMITTED isolation, the
-        // next statement in THIS transaction sees that committed write.
-        releaseResult = await prismaInventoryRepository.releaseReservation(orderId, product.id);
-
-        const updated = await tx.stockReservation.updateMany({
-          where: { id: stale.id, status: "ACTIVE", expiresAt: { lte: new Date() } },
-          data: { status: "EXPIRED" },
-        });
-        const resolved = await tx.stockReservation.findUniqueOrThrow({ where: { id: stale.id } });
-        return { matchedCount: updated.count, resolved };
-      });
-
-      // The competing release committed first: the sweep's conditional
-      // update, issued strictly afterward, matched zero rows and could
-      // not overwrite it.
-      expect(sweep.matchedCount).toBe(0);
-      expect(releaseResult.outcome).toBe("released");
-      expect(sweep.resolved.status).toBe("RELEASED");
+      // The competing release committed first (inside the seam): the
+      // real production expiry update, issued strictly afterward inside
+      // the same transaction, could not overwrite it.
+      expect(releaseResult?.outcome).toBe("released");
+      expect(reserveResult.outcome).toBe("alreadyFinal");
+      if (reserveResult.outcome === "alreadyFinal") {
+        expect(reserveResult.reservation.status).toBe("RELEASED");
+      }
 
       const persisted = await prisma.stockReservation.findUniqueOrThrow({
         where: { id: stale.id },
       });
       expect(persisted.status).toBe("RELEASED");
-
-      // The real, full `reserveStock` function — not just the replicated
-      // statements above — must independently agree with this persisted,
-      // already-terminal state: never a successful reservation, and
-      // reporting exactly the state release actually won.
-      const reserveResult = await prismaInventoryRepository.reserveStock({
-        orderId,
-        productId: product.id,
-        quantity: 1,
-        expiresAt: new Date(Date.now() + 60_000),
-      });
-      expect(reserveResult.outcome).toBe("alreadyFinal");
-      if (reserveResult.outcome === "alreadyFinal") {
-        expect(reserveResult.reservation.status).toBe("RELEASED");
-      }
 
       const count = await prisma.stockReservation.count({
         where: { orderId, productId: product.id },

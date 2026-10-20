@@ -142,8 +142,30 @@ class SecurePaymentWindowAbort extends Error {
   }
 }
 
-export const prismaInventoryRepository: InventoryRepository = {
-  async reserveStock(input: ReserveStockInput): Promise<ReserveStockResult> {
+export const prismaInventoryRepository = {
+  /**
+   * `testOnlyBeforeExpirySweep` (round 5): a narrow, test-only
+   * synchronization seam — NOT part of the public `InventoryRepository`
+   * interface this object implements, so no real caller can reach it,
+   * see it in its type, or be affected by it; every real call site goes
+   * through that interface and therefore always invokes this with
+   * exactly one argument, leaving this parameter `undefined`. Exercised
+   * only by this repository's own integration test
+   * (`prisma-inventory-repository.test.ts`) to deterministically prove
+   * the conditional expiry update below cannot overwrite a competing
+   * terminal transition — called at the exact moment between this
+   * transaction's own read of `existing` and its conditional `UPDATE`,
+   * letting the test run a REAL, unmodified `releaseReservation` call to
+   * completion in that gap without resorting to `Promise.all`'s
+   * non-deterministic scheduling or copying this statement's SQL into
+   * the test. A no-op by construction for every real caller — never a
+   * production behavior change, and introduces no module-level mutable
+   * state (it is an ordinary per-call parameter, passed and forgotten).
+   */
+  async reserveStock(
+    input: ReserveStockInput,
+    testOnlyBeforeExpirySweep?: () => Promise<void>,
+  ): Promise<ReserveStockResult> {
     return prisma.$transaction(async (tx) => {
       const locked = await tx.$queryRaw<
         { id: string; trackInventory: boolean; stockQuantity: number }[]
@@ -181,6 +203,9 @@ export const prismaInventoryRepository: InventoryRepository = {
           // after reports whichever transition actually won —
           // deterministic, and the pair is permanently terminal either
           // way (never revived, never a second row).
+          if (testOnlyBeforeExpirySweep) {
+            await testOnlyBeforeExpirySweep();
+          }
           await tx.stockReservation.updateMany({
             where: { id: existing.id, status: "ACTIVE", expiresAt: { lte: new Date() } },
             data: { status: "EXPIRED" },
@@ -511,4 +536,4 @@ export const prismaInventoryRepository: InventoryRepository = {
       .filter((availability) => availability.available <= threshold)
       .sort((a, b) => a.available - b.available);
   },
-};
+} satisfies InventoryRepository;
