@@ -4,6 +4,7 @@ import { computeCheckoutSubmissionFingerprint } from "@/modules/order/applicatio
 import { changeOrderStatus } from "@/modules/order/application/order-status";
 import type { OrderRepository } from "@/modules/order/repositories/order-repository";
 import type { Order } from "@/modules/order/domain/order";
+import type { ReleaseReservationResult } from "@/modules/catalog";
 
 export interface CheckoutOrderCustomer {
   firstName: string;
@@ -231,34 +232,81 @@ async function reserveStockForOrder(
 }
 
 /**
+ * CR-2 (round 4): classifies an actual `ReleaseReservationResult` — not
+ * just "did the call throw" — against the real repository contract (see
+ * `@/modules/catalog`'s `ReleaseReservationResult`):
+ *
+ * - `"released"`, `"alreadyReleased"`: the pair is terminal and no stock
+ *   was ever consumed for it — confirmed safe, whether this call or an
+ *   earlier one is what actually released it.
+ * - `"notFound"`: nothing was ever reserved for this pair (untracked
+ *   product, or never reached) — confirmed safe, nothing to reconcile.
+ * - `"notReleasable"` covers two DIFFERENT terminal reasons the
+ *   repository folds into one outcome (see its own doc comment) — this
+ *   function tells them apart by inspecting `reservation.status`:
+ *     - `EXPIRED`: no stock was ever consumed, just a timed-out hold —
+ *       confirmed safe, consistent with the Order being cancelled.
+ *     - `CONSUMED`: stock WAS actually taken for this pair. An Order
+ *       being cancelled must never silently treat that as resolved
+ *       cleanup — this is an inconsistency worth surfacing, not success.
+ *
+ * Exported for direct unit testing — every outcome the real repository
+ * contract can produce is cheap to construct as a plain object, so this
+ * pure classification is tested directly rather than only indirectly
+ * through a full database-backed checkout scenario per outcome.
+ */
+export function classifyReleaseOutcome(
+  result: ReleaseReservationResult,
+): "confirmedSafe" | "unresolved" {
+  switch (result.outcome) {
+    case "released":
+    case "alreadyReleased":
+    case "notFound":
+      return "confirmedSafe";
+    case "notReleasable":
+      return result.reservation.status === "EXPIRED" ? "confirmedSafe" : "unresolved";
+  }
+}
+
+/**
  * Attempts to release every item of an Order's reservations
  * INDEPENDENTLY — CR-2 (round 2): a failure releasing one item must never
  * prevent the remaining items from being attempted. Safe and idempotent
- * to call for an item that was never reserved at all (untracked, or
- * never reached by `reserveStockForOrder`'s early stop: `releaseReservation`
- * simply reports `"notFound"`, a no-op) and for one already released by
- * an earlier attempt (`"alreadyReleased"`, also a no-op).
+ * to call for an item that was never reserved at all and for one already
+ * released by an earlier attempt.
  *
- * Returns the `productId`s whose release attempt itself threw — an empty
- * array means every item was at least attempted without throwing (not
- * necessarily that every one was actually `"released"`; outcomes like
- * `"notReleasable"` are a different, already-logged-by-the-repository
- * concern, not a failure of this function to attempt the call).
+ * CR-2 (round 4): a thrown release call is one way this can be
+ * unresolved, but not the only one — each call's actual, non-throwing
+ * RESULT is also classified via `classifyReleaseOutcome` (see its own
+ * doc comment), since a `notReleasable` outcome caused by a `CONSUMED`
+ * reservation must not silently count as safe cleanup just because the
+ * call itself didn't throw.
+ *
+ * Returns the `productId`s whose outcome could not be classified as
+ * confirmed-safe (thrown, or a non-safe result) — an empty array means
+ * every item's reservation is now in a confirmed-safe terminal state.
  */
 async function releaseEachReservationIndependently(order: Order): Promise<string[]> {
-  const failedProductIds: string[] = [];
+  const unresolvedProductIds: string[] = [];
   for (const item of order.items) {
     try {
-      await releaseReservation(order.id, item.productId);
+      const result = await releaseReservation(order.id, item.productId);
+      if (classifyReleaseOutcome(result) === "unresolved") {
+        console.error(
+          "[order/checkout-order] a reservation release outcome could not be classified as safe cleanup — manual reconciliation required",
+          { orderId: order.id, productId: item.productId, result },
+        );
+        unresolvedProductIds.push(item.productId);
+      }
     } catch (releaseError) {
       console.error(
         "[order/checkout-order] failed to release a reservation during cleanup — manual reconciliation required",
         { orderId: order.id, productId: item.productId, releaseError },
       );
-      failedProductIds.push(item.productId);
+      unresolvedProductIds.push(item.productId);
     }
   }
-  return failedProductIds;
+  return unresolvedProductIds;
 }
 
 /** The outcome of an attempt to clean up after a reservation problem — see `cleanupReservationsAndReconcileOrder`'s own doc comment. */
@@ -276,7 +324,7 @@ interface ReservationCleanupOutcome {
    */
   status: "confirmed" | "incomplete";
   /** `productId`s whose release attempt itself threw, if any. */
-  releaseFailures: string[];
+  unresolvedProductIds: string[];
 }
 
 /**
@@ -335,18 +383,18 @@ async function cleanupReservationsAndReconcileOrder(
       "[order/checkout-order] changeOrderStatus threw while attempting to cancel during reservation cleanup — compensation is incomplete, no reservation was released",
       { orderId: order.id, cancelThrow },
     );
-    return { order, status: "incomplete", releaseFailures: [] };
+    return { order, status: "incomplete", unresolvedProductIds: [] };
   }
 
   if (cancelResult.ok) {
     // CONFIRMED: this attempt's cancellation succeeded — the Order was
     // still PENDING at the exact instant of that atomic write and is now
     // CANCELLED. Only now is it safe to release.
-    const releaseFailures = await releaseEachReservationIndependently(cancelResult.order);
+    const unresolvedProductIds = await releaseEachReservationIndependently(cancelResult.order);
     return {
       order: cancelResult.order,
-      status: releaseFailures.length > 0 ? "incomplete" : "confirmed",
-      releaseFailures,
+      status: unresolvedProductIds.length > 0 ? "incomplete" : "confirmed",
+      unresolvedProductIds,
     };
   }
 
@@ -365,31 +413,31 @@ async function cleanupReservationsAndReconcileOrder(
         "[order/checkout-order] could not re-read order after a failed cancellation attempt during cleanup — compensation is incomplete, no reservation was released",
         { orderId: order.id, cancelError: cancelResult.error, rereadError },
       );
-      return { order, status: "incomplete", releaseFailures: [] };
+      return { order, status: "incomplete", unresolvedProductIds: [] };
     }
     if (!latest) {
       console.error(
         "[order/checkout-order] order not found while reconciling a failed cancellation attempt during cleanup",
         { orderId: order.id, cancelError: cancelResult.error },
       );
-      return { order, status: "incomplete", releaseFailures: [] };
+      return { order, status: "incomplete", unresolvedProductIds: [] };
     }
     if (latest.status === "PAID") {
       // Confirmed: something else (e.g. a future payment-success path)
       // already won this Order — its reservations are that process's to
       // manage, never released here.
-      return { order: latest, status: "confirmed", releaseFailures: [] };
+      return { order: latest, status: "confirmed", unresolvedProductIds: [] };
     }
     if (latest.status === "CANCELLED") {
       // Confirmed CANCELLED — but not necessarily by a call that also
       // finished releasing every reservation (e.g. an earlier, crashed
       // attempt). Resuming the release here is safe and idempotent,
       // exactly like `reserveStockForOrder`'s own resume behavior.
-      const releaseFailures = await releaseEachReservationIndependently(latest);
+      const unresolvedProductIds = await releaseEachReservationIndependently(latest);
       return {
         order: latest,
-        status: releaseFailures.length > 0 ? "incomplete" : "confirmed",
-        releaseFailures,
+        status: unresolvedProductIds.length > 0 ? "incomplete" : "confirmed",
+        unresolvedProductIds,
       };
     }
     // Still PENDING (or any other value): unexpected given the lifecycle
@@ -399,14 +447,14 @@ async function cleanupReservationsAndReconcileOrder(
       "[order/checkout-order] order was neither PAID nor CANCELLED after a failed cancellation attempt during cleanup — compensation is incomplete",
       { orderId: order.id, latestStatus: latest.status, cancelError: cancelResult.error },
     );
-    return { order: latest, status: "incomplete", releaseFailures: [] };
+    return { order: latest, status: "incomplete", unresolvedProductIds: [] };
   }
 
   console.error(
     "[order/checkout-order] unexpected changeOrderStatus outcome while attempting to cancel during reservation cleanup",
     { orderId: order.id, error: cancelResult.error },
   );
-  return { order, status: "incomplete", releaseFailures: [] };
+  return { order, status: "incomplete", unresolvedProductIds: [] };
 }
 
 /**
@@ -433,15 +481,22 @@ async function cleanupReservationsAndReconcileOrder(
  *     reports `RESERVATION_CLEANUP_INCOMPLETE` instead of
  *     `INSUFFICIENT_STOCK` — never claiming a clean cancellation that
  *     isn't known to be true.
- * - `CANCELLED`: only this function ever cancels a `PENDING` Order
- *   today (no payment integration exists yet in this codebase), and
- *   only for `INSUFFICIENT_STOCK` — so a replay that resolves to an
- *   already-`CANCELLED` Order is consistently re-reporting that same
- *   original failure, never fabricating a success. This inference would
- *   need revisiting if a future increment introduces another path to
- *   `CANCELLED`. `productIds` is empty here — this function doesn't
- *   re-derive which item originally failed, only that this submission
- *   did.
+ * - `CANCELLED`: only this function ever cancels a `PENDING` Order today
+ *   (no payment integration exists yet in this codebase), and only for
+ *   `INSUFFICIENT_STOCK` — but CR-2 (round 4): a `CANCELLED` status
+ *   alone does NOT prove every reservation was actually released —
+ *   an earlier attempt could have reached `RESERVATION_CLEANUP_INCOMPLETE`
+ *   (e.g. a `releaseReservation` call threw) after the Order was already
+ *   confirmed cancelled, leaving a reservation dangling. A replay that
+ *   finds the Order already `CANCELLED` therefore re-attempts release
+ *   for every item (safe and idempotent — see
+ *   `releaseEachReservationIndependently`'s own doc comment) and
+ *   classifies the actual result before deciding what to report: only
+ *   once every item is confirmed-safe does this report
+ *   `INSUFFICIENT_STOCK`; otherwise it reports
+ *   `RESERVATION_CLEANUP_INCOMPLETE`, exactly like the `PENDING` path
+ *   below. This uses only the existing `releaseReservation` repository
+ *   capability — no new persistence, schema, or infrastructure.
  * - `PAID`: unreachable until payment integration lands (a separately
  *   approved, later increment) — once it does, this Order's
  *   reservations are already `CONSUMED`, so there is nothing left to
@@ -453,6 +508,14 @@ async function securePendingReservationsAndFinalize(
   created: boolean | undefined,
 ): Promise<CreateOrderFromCheckoutResult> {
   if (order.status === "CANCELLED") {
+    const unresolvedProductIds = await releaseEachReservationIndependently(order);
+    if (unresolvedProductIds.length > 0) {
+      return {
+        ok: false,
+        error: "RESERVATION_CLEANUP_INCOMPLETE",
+        productIds: unresolvedProductIds,
+      };
+    }
     return { ok: false, error: "INSUFFICIENT_STOCK", productIds: [] };
   }
   if (order.status !== "PENDING") {
@@ -471,7 +534,7 @@ async function securePendingReservationsAndFinalize(
     if (cleanup.status === "incomplete") {
       console.error(
         "[order/checkout-order] compensation after a thrown reservation error was INCOMPLETE — manual reconciliation required",
-        { orderId: order.id, releaseFailures: cleanup.releaseFailures, reservationError },
+        { orderId: order.id, unresolvedProductIds: cleanup.unresolvedProductIds, reservationError },
       );
     }
     // CR-2: the original fault must never be laundered into a softer
@@ -493,7 +556,7 @@ async function securePendingReservationsAndFinalize(
     return {
       ok: false,
       error: "RESERVATION_CLEANUP_INCOMPLETE",
-      productIds: cleanup.releaseFailures,
+      productIds: cleanup.unresolvedProductIds,
     };
   }
   if (cleanup.order.status === "PAID") {

@@ -5,6 +5,7 @@ import {
   MAX_QUANTITY_PER_ITEM,
   MAX_AMOUNT_MINOR,
   isWithinSafeAmountRange,
+  classifyReleaseOutcome,
 } from "@/modules/order/application/checkout-order";
 import type {
   CheckoutOrderCustomer,
@@ -1674,6 +1675,182 @@ describe("createOrderFromCheckout — stock reservation integration (IMP-048 Inc
     });
     expect(reservation.status).toBe("ACTIVE");
   });
+
+  it("CR-2 (round 4, Finding 1 test 1): a replay while a reservation is still unresolved does not silently report ordinary INSUFFICIENT_STOCK", async () => {
+    const succeedsProduct = await createTrackedTestProduct(5);
+    const insufficientProduct = await createTrackedTestProduct(0);
+    const key = `idem-cr2-f1-1-${Date.now()}`;
+    const payload = testOrderPayload(
+      [
+        { productId: succeedsProduct.id, quantity: 1 },
+        { productId: insufficientProduct.id, quantity: 1 },
+      ],
+      key,
+    );
+
+    releaseReservationThrowForProductIds.add(succeedsProduct.id);
+    try {
+      const first = await createOrderFromCheckout(prismaOrderRepository, payload);
+      expect(first).toEqual({
+        ok: false,
+        error: "RESERVATION_CLEANUP_INCOMPLETE",
+        productIds: [succeedsProduct.id],
+      });
+
+      const order = await prisma.order.findFirstOrThrow({ where: { idempotencyKey: key } });
+      createdOrderIds.push(order.id);
+      expect(order.status).toBe("CANCELLED");
+      const reservationBefore = await catalogPrisma.stockReservation.findUniqueOrThrow({
+        where: { orderId_productId: { orderId: order.id, productId: succeedsProduct.id } },
+      });
+      expect(reservationBefore.status).toBe("ACTIVE");
+
+      // Replay with the SAME unresolved condition still active must NOT
+      // silently flip to a plain INSUFFICIENT_STOCK — compensation is
+      // still not known to be complete, so the cancelled status alone
+      // must not be trusted.
+      const replay = await createOrderFromCheckout(prismaOrderRepository, payload);
+      expect(replay).toEqual({
+        ok: false,
+        error: "RESERVATION_CLEANUP_INCOMPLETE",
+        productIds: [succeedsProduct.id],
+      });
+      const reservationAfter = await catalogPrisma.stockReservation.findUniqueOrThrow({
+        where: { orderId_productId: { orderId: order.id, productId: succeedsProduct.id } },
+      });
+      expect(reservationAfter.status).toBe("ACTIVE");
+    } finally {
+      releaseReservationThrowForProductIds.delete(succeedsProduct.id);
+    }
+  });
+
+  it("CR-2 (round 4, Finding 1 test 2): a replay successfully reconciles a reservation left dangling by an earlier incomplete attempt", async () => {
+    const succeedsProduct = await createTrackedTestProduct(5);
+    const insufficientProduct = await createTrackedTestProduct(0);
+    const key = `idem-cr2-f1-2-${Date.now()}`;
+    const payload = testOrderPayload(
+      [
+        { productId: succeedsProduct.id, quantity: 1 },
+        { productId: insufficientProduct.id, quantity: 1 },
+      ],
+      key,
+    );
+
+    releaseReservationThrowForProductIds.add(succeedsProduct.id);
+    const first = await createOrderFromCheckout(prismaOrderRepository, payload);
+    expect(first).toEqual({
+      ok: false,
+      error: "RESERVATION_CLEANUP_INCOMPLETE",
+      productIds: [succeedsProduct.id],
+    });
+    releaseReservationThrowForProductIds.delete(succeedsProduct.id);
+
+    const order = await prisma.order.findFirstOrThrow({ where: { idempotencyKey: key } });
+    createdOrderIds.push(order.id);
+    expect(order.status).toBe("CANCELLED");
+
+    // Replay now that release can actually succeed — reconciliation
+    // (using only the existing, idempotent releaseReservation
+    // capability) must confirm cleanup and report the accurate outcome.
+    const replay = await createOrderFromCheckout(prismaOrderRepository, payload);
+    expect(replay).toEqual({ ok: false, error: "INSUFFICIENT_STOCK", productIds: [] });
+
+    const reservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
+      where: { orderId_productId: { orderId: order.id, productId: succeedsProduct.id } },
+    });
+    expect(reservation.status).toBe("RELEASED");
+  });
+
+  it("CR-2 (round 4, Finding 1 test 3): a replay that finds a reservation CONSUMED while its order is CANCELLED reports incomplete cleanup, never silent success", async () => {
+    const product = await createTrackedTestProduct(5);
+    const insufficientProduct = await createTrackedTestProduct(0);
+    const key = `idem-cr2-f1-3-${Date.now()}`;
+    const payload = testOrderPayload(
+      [
+        { productId: product.id, quantity: 1 },
+        { productId: insufficientProduct.id, quantity: 1 },
+      ],
+      key,
+    );
+
+    const first = await createOrderFromCheckout(prismaOrderRepository, payload);
+    // The first (PENDING-path) attempt reports the item that actually
+    // failed to reserve.
+    expect(first).toEqual({
+      ok: false,
+      error: "INSUFFICIENT_STOCK",
+      productIds: [insufficientProduct.id],
+    });
+
+    const order = await prisma.order.findFirstOrThrow({ where: { idempotencyKey: key } });
+    createdOrderIds.push(order.id);
+    expect(order.status).toBe("CANCELLED");
+
+    // Simulate an inconsistent state directly in the database: the
+    // reservation somehow became CONSUMED after its order was already
+    // cancelled (e.g. a hypothetical future payment-side defect) — not
+    // produced by any approved code path, purely to prove reconciliation
+    // never silently treats this as resolved cleanup.
+    await catalogPrisma.stockReservation.update({
+      where: { orderId_productId: { orderId: order.id, productId: product.id } },
+      data: { status: "CONSUMED" },
+    });
+
+    const replay = await createOrderFromCheckout(prismaOrderRepository, payload);
+    expect(replay).toEqual({
+      ok: false,
+      error: "RESERVATION_CLEANUP_INCOMPLETE",
+      productIds: [product.id],
+    });
+
+    // Never silently "fixed" — the CONSUMED state is left exactly as
+    // found, not reverted or reinterpreted.
+    const reservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
+      where: { orderId_productId: { orderId: order.id, productId: product.id } },
+    });
+    expect(reservation.status).toBe("CONSUMED");
+  });
+
+  it("CR-2 (round 4, Finding 1 test 4): repeated replays of a confirmed-complete cancellation remain idempotent", async () => {
+    const product = await createTrackedTestProduct(5);
+    const insufficientProduct = await createTrackedTestProduct(0);
+    const key = `idem-cr2-f1-4-${Date.now()}`;
+    const payload = testOrderPayload(
+      [
+        { productId: product.id, quantity: 1 },
+        { productId: insufficientProduct.id, quantity: 1 },
+      ],
+      key,
+    );
+
+    const first = await createOrderFromCheckout(prismaOrderRepository, payload);
+    // The first (PENDING-path) attempt reports the item that actually
+    // failed to reserve; replays (CANCELLED-path) report an empty list
+    // since they don't re-derive which item originally failed.
+    expect(first).toEqual({
+      ok: false,
+      error: "INSUFFICIENT_STOCK",
+      productIds: [insufficientProduct.id],
+    });
+    const order = await prisma.order.findFirstOrThrow({ where: { idempotencyKey: key } });
+    createdOrderIds.push(order.id);
+
+    const second = await createOrderFromCheckout(prismaOrderRepository, payload);
+    const third = await createOrderFromCheckout(prismaOrderRepository, payload);
+    expect(second).toEqual({ ok: false, error: "INSUFFICIENT_STOCK", productIds: [] });
+    expect(third).toEqual({ ok: false, error: "INSUFFICIENT_STOCK", productIds: [] });
+
+    // No duplicate rows, no reverted state — a single reservation row,
+    // still RELEASED.
+    const count = await catalogPrisma.stockReservation.count({
+      where: { orderId: order.id, productId: product.id },
+    });
+    expect(count).toBe(1);
+    const reservation = await catalogPrisma.stockReservation.findUniqueOrThrow({
+      where: { orderId_productId: { orderId: order.id, productId: product.id } },
+    });
+    expect(reservation.status).toBe("RELEASED");
+  });
 });
 
 /**
@@ -1709,5 +1886,65 @@ describe("isWithinSafeAmountRange", () => {
 
   it("rejects a non-integer amount", () => {
     expect(isWithinSafeAmountRange(100.5)).toBe(false);
+  });
+});
+
+/**
+ * CR-2 (round 4, Finding 2): every outcome the real `ReleaseReservationResult`
+ * contract (`@/modules/catalog`) can produce, classified directly —
+ * cheap to construct as plain objects, so tested as a pure function
+ * rather than only indirectly through a full database-backed scenario
+ * per outcome. `makeReservation` fills in the fields the classifier
+ * itself never reads, since only `status` is relevant to it.
+ */
+describe("classifyReleaseOutcome", () => {
+  function makeReservation(status: "ACTIVE" | "EXPIRED" | "RELEASED" | "CONSUMED") {
+    return {
+      id: "res-1",
+      productId: "prod-1",
+      orderId: "order-1",
+      quantity: 1,
+      status,
+      expiresAt: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+  }
+
+  it("classifies a successful release as confirmed safe", () => {
+    expect(
+      classifyReleaseOutcome({ outcome: "released", reservation: makeReservation("RELEASED") }),
+    ).toBe("confirmedSafe");
+  });
+
+  it("classifies an already-released reservation as confirmed safe", () => {
+    expect(
+      classifyReleaseOutcome({
+        outcome: "alreadyReleased",
+        reservation: makeReservation("RELEASED"),
+      }),
+    ).toBe("confirmedSafe");
+  });
+
+  it("classifies notFound (nothing was ever reserved) as confirmed safe", () => {
+    expect(classifyReleaseOutcome({ outcome: "notFound" })).toBe("confirmedSafe");
+  });
+
+  it("classifies notReleasable due to EXPIRED as confirmed safe — no stock was ever consumed", () => {
+    expect(
+      classifyReleaseOutcome({
+        outcome: "notReleasable",
+        reservation: makeReservation("EXPIRED"),
+      }),
+    ).toBe("confirmedSafe");
+  });
+
+  it("classifies notReleasable due to CONSUMED as unresolved — stock was actually taken, never silently treated as safe cleanup", () => {
+    expect(
+      classifyReleaseOutcome({
+        outcome: "notReleasable",
+        reservation: makeReservation("CONSUMED"),
+      }),
+    ).toBe("unresolved");
   });
 });
