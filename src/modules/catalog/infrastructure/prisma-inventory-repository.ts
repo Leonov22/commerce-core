@@ -142,398 +142,427 @@ class SecurePaymentWindowAbort extends Error {
   }
 }
 
-export const prismaInventoryRepository = {
+/**
+ * Round 6: test-only hooks accepted ONLY by `createPrismaInventoryRepository`
+ * itself, at construction time — never by a method call on the resulting
+ * object. This is what keeps `prismaInventoryRepository.reserveStock`'s
+ * own callable signature identical to the public `InventoryRepository`
+ * interface's single-argument contract: no caller holding a reference to
+ * the shared production object (however it got that reference — through
+ * the interface type, a direct import, or runtime introspection) can
+ * pass a second argument and run arbitrary code while a production
+ * transaction and product-row lock are held, because the method simply
+ * never accepts one. The hook lives only in the closure of whichever
+ * object instance was built with it — not in any module-level mutable
+ * variable — so a test that needs it builds its OWN, separate instance
+ * via this factory; the shared production singleton below is always
+ * built with no hooks at all.
+ */
+export interface PrismaInventoryRepositoryTestHooks {
   /**
-   * `testOnlyBeforeExpirySweep` (round 5): a narrow, test-only
-   * synchronization seam — NOT part of the public `InventoryRepository`
-   * interface this object implements, so no real caller can reach it,
-   * see it in its type, or be affected by it; every real call site goes
-   * through that interface and therefore always invokes this with
-   * exactly one argument, leaving this parameter `undefined`. Exercised
-   * only by this repository's own integration test
-   * (`prisma-inventory-repository.test.ts`) to deterministically prove
-   * the conditional expiry update below cannot overwrite a competing
-   * terminal transition — called at the exact moment between this
-   * transaction's own read of `existing` and its conditional `UPDATE`,
-   * letting the test run a REAL, unmodified `releaseReservation` call to
-   * completion in that gap without resorting to `Promise.all`'s
-   * non-deterministic scheduling or copying this statement's SQL into
-   * the test. A no-op by construction for every real caller — never a
-   * production behavior change, and introduces no module-level mutable
-   * state (it is an ordinary per-call parameter, passed and forgotten).
+   * Invoked at the exact moment between `reserveStock`'s own read of an
+   * `ACTIVE`-but-expired reservation and its conditional expiry
+   * `UPDATE` — lets a test run a REAL, unmodified `releaseReservation`
+   * call to full completion (commit) in that gap, deterministically,
+   * without resorting to `Promise.all`'s non-deterministic scheduling or
+   * copying this statement's SQL into the test. Exercised only by this
+   * repository's own integration test, against a repository instance
+   * this factory built specifically for that one test.
    */
-  async reserveStock(
-    input: ReserveStockInput,
-    testOnlyBeforeExpirySweep?: () => Promise<void>,
-  ): Promise<ReserveStockResult> {
-    return prisma.$transaction(async (tx) => {
-      const locked = await tx.$queryRaw<
-        { id: string; trackInventory: boolean; stockQuantity: number }[]
-      >`SELECT "id", "trackInventory", "stockQuantity" FROM "products" WHERE "id" = ${input.productId} FOR UPDATE`;
-      if (locked.length === 0) {
-        return { outcome: "productNotFound" as const };
-      }
-      const product = locked[0]!;
+  beforeExpirySweep?: () => Promise<void>;
+}
 
-      const existing = await tx.stockReservation.findUnique({
-        where: { orderId_productId: { orderId: input.orderId, productId: input.productId } },
-      });
-      if (existing) {
-        if (existing.status === "ACTIVE" && existing.expiresAt > new Date()) {
-          return {
-            outcome: "alreadyReserved" as const,
-            reservation: toDomainReservation(existing),
-          };
+export function createPrismaInventoryRepository(
+  testHooks: PrismaInventoryRepositoryTestHooks = {},
+): InventoryRepository {
+  return {
+    async reserveStock(input: ReserveStockInput): Promise<ReserveStockResult> {
+      return prisma.$transaction(async (tx) => {
+        const locked = await tx.$queryRaw<
+          { id: string; trackInventory: boolean; stockQuantity: number }[]
+        >`SELECT "id", "trackInventory", "stockQuantity" FROM "products" WHERE "id" = ${input.productId} FOR UPDATE`;
+        if (locked.length === 0) {
+          return { outcome: "productNotFound" as const };
         }
-        if (existing.status === "ACTIVE") {
-          // CR-4 (round 3): still literally ACTIVE in the database, but
-          // its wall-clock `expiresAt` has already passed and nothing has
-          // swept it yet. We hold this product's row lock here, but NOT
-          // a lock on this specific reservation row — `releaseReservation`/
-          // `consumeReservation` can still concurrently win a terminal
-          // transition on this exact row without needing the product
-          // lock (by design, per the established protocol). The sweep
-          // below is therefore a CONDITIONAL `UPDATE ... WHERE id = ? AND
-          // status = 'ACTIVE' AND "expiresAt" <= now()` — both conditions
-          // re-asserted at the exact moment of the write itself, not
-          // merely inferred from the read above — never an unconditional
-          // write: if release/consume already won in between our read
-          // and this statement, this matches zero rows and does NOT
-          // overwrite their result. Either way, the re-read immediately
-          // after reports whichever transition actually won —
-          // deterministic, and the pair is permanently terminal either
-          // way (never revived, never a second row).
-          if (testOnlyBeforeExpirySweep) {
-            await testOnlyBeforeExpirySweep();
-          }
-          await tx.stockReservation.updateMany({
-            where: { id: existing.id, status: "ACTIVE", expiresAt: { lte: new Date() } },
-            data: { status: "EXPIRED" },
-          });
-          const resolved = await tx.stockReservation.findUniqueOrThrow({
-            where: { id: existing.id },
-          });
-          return { outcome: "alreadyFinal" as const, reservation: toDomainReservation(resolved) };
-        }
-        return { outcome: "alreadyFinal" as const, reservation: toDomainReservation(existing) };
-      }
+        const product = locked[0]!;
 
-      if (!product.trackInventory) {
-        return { outcome: "notTracked" as const };
-      }
-
-      const now = new Date();
-      await tx.stockReservation.updateMany({
-        where: { productId: input.productId, status: "ACTIVE", expiresAt: { lt: now } },
-        data: { status: "EXPIRED" },
-      });
-
-      const aggregate = await tx.stockReservation.aggregate({
-        where: { productId: input.productId, status: "ACTIVE" },
-        _sum: { quantity: true },
-      });
-      const reserved = aggregate._sum.quantity ?? 0;
-      const available = product.stockQuantity - reserved;
-      if (available < input.quantity) {
-        return { outcome: "insufficientStock" as const, available };
-      }
-
-      const created = await tx.stockReservation.create({
-        data: {
-          orderId: input.orderId,
-          productId: input.productId,
-          quantity: input.quantity,
-          status: "ACTIVE",
-          expiresAt: input.expiresAt,
-        },
-      });
-      return { outcome: "reserved" as const, reservation: toDomainReservation(created) };
-    });
-  },
-
-  async consumeReservation(orderId: string, productId: string): Promise<ConsumeReservationResult> {
-    return prisma.$transaction(async (tx) => {
-      const existing = await tx.stockReservation.findUnique({
-        where: { orderId_productId: { orderId, productId } },
-      });
-      if (!existing) {
-        return { outcome: "notFound" as const };
-      }
-
-      const now = new Date();
-      const updated = await tx.stockReservation.updateMany({
-        where: { orderId, productId, status: "ACTIVE", expiresAt: { gt: now } },
-        data: { status: "CONSUMED" },
-      });
-
-      if (updated.count === 0) {
-        const latest = await tx.stockReservation.findUniqueOrThrow({
-          where: { orderId_productId: { orderId, productId } },
+        const existing = await tx.stockReservation.findUnique({
+          where: { orderId_productId: { orderId: input.orderId, productId: input.productId } },
         });
-        if (latest.status === "CONSUMED") {
-          return { outcome: "alreadyConsumed" as const, reservation: toDomainReservation(latest) };
+        if (existing) {
+          if (existing.status === "ACTIVE" && existing.expiresAt > new Date()) {
+            return {
+              outcome: "alreadyReserved" as const,
+              reservation: toDomainReservation(existing),
+            };
+          }
+          if (existing.status === "ACTIVE") {
+            // CR-4 (round 3): still literally ACTIVE in the database, but
+            // its wall-clock `expiresAt` has already passed and nothing has
+            // swept it yet. We hold this product's row lock here, but NOT
+            // a lock on this specific reservation row — `releaseReservation`/
+            // `consumeReservation` can still concurrently win a terminal
+            // transition on this exact row without needing the product
+            // lock (by design, per the established protocol). The sweep
+            // below is therefore a CONDITIONAL `UPDATE ... WHERE id = ? AND
+            // status = 'ACTIVE' AND "expiresAt" <= now()` — both conditions
+            // re-asserted at the exact moment of the write itself, not
+            // merely inferred from the read above — never an unconditional
+            // write: if release/consume already won in between our read
+            // and this statement, this matches zero rows and does NOT
+            // overwrite their result. Either way, the re-read immediately
+            // after reports whichever transition actually won —
+            // deterministic, and the pair is permanently terminal either
+            // way (never revived, never a second row).
+            if (testHooks.beforeExpirySweep) {
+              await testHooks.beforeExpirySweep();
+            }
+            await tx.stockReservation.updateMany({
+              where: { id: existing.id, status: "ACTIVE", expiresAt: { lte: new Date() } },
+              data: { status: "EXPIRED" },
+            });
+            const resolved = await tx.stockReservation.findUniqueOrThrow({
+              where: { id: existing.id },
+            });
+            return { outcome: "alreadyFinal" as const, reservation: toDomainReservation(resolved) };
+          }
+          return { outcome: "alreadyFinal" as const, reservation: toDomainReservation(existing) };
         }
-        return { outcome: "notConsumable" as const, reservation: toDomainReservation(latest) };
-      }
 
-      // `quantity` is set once at creation and never mutated by any
-      // operation in this module, so the pre-update snapshot read above
-      // is still an accurate amount to decrement by.
-      await tx.product.update({
-        where: { id: productId },
-        data: { stockQuantity: { decrement: existing.quantity } },
+        if (!product.trackInventory) {
+          return { outcome: "notTracked" as const };
+        }
+
+        const now = new Date();
+        await tx.stockReservation.updateMany({
+          where: { productId: input.productId, status: "ACTIVE", expiresAt: { lt: now } },
+          data: { status: "EXPIRED" },
+        });
+
+        const aggregate = await tx.stockReservation.aggregate({
+          where: { productId: input.productId, status: "ACTIVE" },
+          _sum: { quantity: true },
+        });
+        const reserved = aggregate._sum.quantity ?? 0;
+        const available = product.stockQuantity - reserved;
+        if (available < input.quantity) {
+          return { outcome: "insufficientStock" as const, available };
+        }
+
+        const created = await tx.stockReservation.create({
+          data: {
+            orderId: input.orderId,
+            productId: input.productId,
+            quantity: input.quantity,
+            status: "ACTIVE",
+            expiresAt: input.expiresAt,
+          },
+        });
+        return { outcome: "reserved" as const, reservation: toDomainReservation(created) };
       });
+    },
 
-      const consumed = await tx.stockReservation.findUniqueOrThrow({
-        where: { orderId_productId: { orderId, productId } },
-      });
-      return { outcome: "consumed" as const, reservation: toDomainReservation(consumed) };
-    });
-  },
-
-  async releaseReservation(orderId: string, productId: string): Promise<ReleaseReservationResult> {
-    return prisma.$transaction(async (tx) => {
-      const updated = await tx.stockReservation.updateMany({
-        where: { orderId, productId, status: "ACTIVE" },
-        data: { status: "RELEASED" },
-      });
-
-      if (updated.count === 0) {
+    async consumeReservation(
+      orderId: string,
+      productId: string,
+    ): Promise<ConsumeReservationResult> {
+      return prisma.$transaction(async (tx) => {
         const existing = await tx.stockReservation.findUnique({
           where: { orderId_productId: { orderId, productId } },
         });
         if (!existing) {
           return { outcome: "notFound" as const };
         }
-        if (existing.status === "RELEASED") {
-          return {
-            outcome: "alreadyReleased" as const,
-            reservation: toDomainReservation(existing),
-          };
-        }
-        return { outcome: "notReleasable" as const, reservation: toDomainReservation(existing) };
-      }
 
-      const released = await tx.stockReservation.findUniqueOrThrow({
-        where: { orderId_productId: { orderId, productId } },
-      });
-      return { outcome: "released" as const, reservation: toDomainReservation(released) };
-    });
-  },
+        const now = new Date();
+        const updated = await tx.stockReservation.updateMany({
+          where: { orderId, productId, status: "ACTIVE", expiresAt: { gt: now } },
+          data: { status: "CONSUMED" },
+        });
 
-  async securePaymentWindow(
-    orderId: string,
-    requiredItems: RequiredPaymentItem[],
-    newExpiresAt: Date,
-  ): Promise<SecurePaymentWindowResult> {
-    try {
-      await prisma.$transaction(async (tx) => {
-        const failures: SecurePaymentWindowFailure[] = [];
-        const trackedProductIds: string[] = [];
-
-        for (const item of requiredItems) {
-          const product = await tx.product.findUnique({
-            where: { id: item.productId },
-            select: { trackInventory: true },
+        if (updated.count === 0) {
+          const latest = await tx.stockReservation.findUniqueOrThrow({
+            where: { orderId_productId: { orderId, productId } },
           });
-          if (!product) {
-            failures.push({ productId: item.productId, reason: "productNotFound" });
-            continue;
+          if (latest.status === "CONSUMED") {
+            return {
+              outcome: "alreadyConsumed" as const,
+              reservation: toDomainReservation(latest),
+            };
           }
-          if (product.trackInventory) {
-            trackedProductIds.push(item.productId);
-          }
+          return { outcome: "notConsumable" as const, reservation: toDomainReservation(latest) };
         }
-        if (failures.length > 0) {
-          throw new SecurePaymentWindowAbort(failures);
+
+        // `quantity` is set once at creation and never mutated by any
+        // operation in this module, so the pre-update snapshot read above
+        // is still an accurate amount to decrement by.
+        await tx.product.update({
+          where: { id: productId },
+          data: { stockQuantity: { decrement: existing.quantity } },
+        });
+
+        const consumed = await tx.stockReservation.findUniqueOrThrow({
+          where: { orderId_productId: { orderId, productId } },
+        });
+        return { outcome: "consumed" as const, reservation: toDomainReservation(consumed) };
+      });
+    },
+
+    async releaseReservation(
+      orderId: string,
+      productId: string,
+    ): Promise<ReleaseReservationResult> {
+      return prisma.$transaction(async (tx) => {
+        const updated = await tx.stockReservation.updateMany({
+          where: { orderId, productId, status: "ACTIVE" },
+          data: { status: "RELEASED" },
+        });
+
+        if (updated.count === 0) {
+          const existing = await tx.stockReservation.findUnique({
+            where: { orderId_productId: { orderId, productId } },
+          });
+          if (!existing) {
+            return { outcome: "notFound" as const };
+          }
+          if (existing.status === "RELEASED") {
+            return {
+              outcome: "alreadyReleased" as const,
+              reservation: toDomainReservation(existing),
+            };
+          }
+          return { outcome: "notReleasable" as const, reservation: toDomainReservation(existing) };
+        }
+
+        const released = await tx.stockReservation.findUniqueOrThrow({
+          where: { orderId_productId: { orderId, productId } },
+        });
+        return { outcome: "released" as const, reservation: toDomainReservation(released) };
+      });
+    },
+
+    async securePaymentWindow(
+      orderId: string,
+      requiredItems: RequiredPaymentItem[],
+      newExpiresAt: Date,
+    ): Promise<SecurePaymentWindowResult> {
+      try {
+        await prisma.$transaction(async (tx) => {
+          const failures: SecurePaymentWindowFailure[] = [];
+          const trackedProductIds: string[] = [];
+
+          for (const item of requiredItems) {
+            const product = await tx.product.findUnique({
+              where: { id: item.productId },
+              select: { trackInventory: true },
+            });
+            if (!product) {
+              failures.push({ productId: item.productId, reason: "productNotFound" });
+              continue;
+            }
+            if (product.trackInventory) {
+              trackedProductIds.push(item.productId);
+            }
+          }
+          if (failures.length > 0) {
+            throw new SecurePaymentWindowAbort(failures);
+          }
+
+          const now = new Date();
+          for (const productId of trackedProductIds) {
+            const touched = await tx.stockReservation.updateMany({
+              where: { orderId, productId, status: "ACTIVE", expiresAt: { gt: now } },
+              data: { expiresAt: newExpiresAt },
+            });
+            if (touched.count !== 1) {
+              const existing = await tx.stockReservation.findUnique({
+                where: { orderId_productId: { orderId, productId } },
+              });
+              failures.push({
+                productId,
+                reason: existing ? "reservationNotActive" : "reservationMissing",
+              });
+            }
+          }
+          if (failures.length > 0) {
+            // Rolls back every extension already applied above in this
+            // same transaction — this is all-or-nothing by construction,
+            // not by a second compensating pass.
+            throw new SecurePaymentWindowAbort(failures);
+          }
+        });
+        return { ok: true };
+      } catch (error) {
+        if (error instanceof SecurePaymentWindowAbort) {
+          return { ok: false, failures: error.failures };
+        }
+        throw error;
+      }
+    },
+
+    async adjustStock(input: AdjustStockInput): Promise<AdjustStockResult> {
+      if (input.quantityChange === 0) {
+        return { outcome: "noOp" as const };
+      }
+      return prisma.$transaction(async (tx) => {
+        const locked = await tx.$queryRaw<
+          { id: string; stockQuantity: number }[]
+        >`SELECT "id", "stockQuantity" FROM "products" WHERE "id" = ${input.productId} FOR UPDATE`;
+        if (locked.length === 0) {
+          return { outcome: "productNotFound" as const };
+        }
+        const currentStockQuantity = locked[0]!.stockQuantity;
+        const newStockQuantity = currentStockQuantity + input.quantityChange;
+        if (newStockQuantity < 0) {
+          return { outcome: "wouldGoNegative" as const, currentStockQuantity };
         }
 
         const now = new Date();
-        for (const productId of trackedProductIds) {
-          const touched = await tx.stockReservation.updateMany({
-            where: { orderId, productId, status: "ACTIVE", expiresAt: { gt: now } },
-            data: { expiresAt: newExpiresAt },
-          });
-          if (touched.count !== 1) {
-            const existing = await tx.stockReservation.findUnique({
-              where: { orderId_productId: { orderId, productId } },
-            });
-            failures.push({
-              productId,
-              reason: existing ? "reservationNotActive" : "reservationMissing",
-            });
-          }
-        }
-        if (failures.length > 0) {
-          // Rolls back every extension already applied above in this
-          // same transaction — this is all-or-nothing by construction,
-          // not by a second compensating pass.
-          throw new SecurePaymentWindowAbort(failures);
-        }
-      });
-      return { ok: true };
-    } catch (error) {
-      if (error instanceof SecurePaymentWindowAbort) {
-        return { ok: false, failures: error.failures };
-      }
-      throw error;
-    }
-  },
+        await tx.stockReservation.updateMany({
+          where: { productId: input.productId, status: "ACTIVE", expiresAt: { lt: now } },
+          data: { status: "EXPIRED" },
+        });
 
-  async adjustStock(input: AdjustStockInput): Promise<AdjustStockResult> {
-    if (input.quantityChange === 0) {
-      return { outcome: "noOp" as const };
-    }
-    return prisma.$transaction(async (tx) => {
-      const locked = await tx.$queryRaw<
-        { id: string; stockQuantity: number }[]
-      >`SELECT "id", "stockQuantity" FROM "products" WHERE "id" = ${input.productId} FOR UPDATE`;
-      if (locked.length === 0) {
-        return { outcome: "productNotFound" as const };
+        const aggregate = await tx.stockReservation.aggregate({
+          where: { productId: input.productId, status: "ACTIVE" },
+          _sum: { quantity: true },
+        });
+        const activeReserved = aggregate._sum.quantity ?? 0;
+        if (newStockQuantity < activeReserved) {
+          return {
+            outcome: "belowActiveReservations" as const,
+            currentStockQuantity,
+            activeReserved,
+          };
+        }
+
+        await tx.product.update({
+          where: { id: input.productId },
+          data: { stockQuantity: newStockQuantity },
+        });
+        const adjustment = await tx.stockAdjustment.create({
+          data: {
+            productId: input.productId,
+            quantityChange: input.quantityChange,
+            reason: input.reason,
+            adminUserId: input.adminUserId,
+          },
+        });
+        return {
+          outcome: "applied" as const,
+          adjustment: toDomainAdjustment(adjustment),
+          stockQuantity: newStockQuantity,
+        };
+      });
+    },
+
+    async recordInventoryException(
+      input: RecordInventoryExceptionInput,
+    ): Promise<RecordInventoryExceptionResult> {
+      try {
+        const created = await prisma.inventoryException.create({
+          data: {
+            reservationId: input.reservationId,
+            orderId: input.orderId,
+            productId: input.productId,
+            quantity: input.quantity,
+            paymentId: input.paymentId,
+            reason: input.reason,
+            status: "OPEN",
+          },
+        });
+        return { outcome: "created" as const, exception: toDomainException(created) };
+      } catch (error) {
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+          const existing = await prisma.inventoryException.findUniqueOrThrow({
+            where: { reservationId: input.reservationId },
+          });
+          return { outcome: "alreadyExists" as const, exception: toDomainException(existing) };
+        }
+        throw error;
       }
-      const currentStockQuantity = locked[0]!.stockQuantity;
-      const newStockQuantity = currentStockQuantity + input.quantityChange;
-      if (newStockQuantity < 0) {
-        return { outcome: "wouldGoNegative" as const, currentStockQuantity };
+    },
+
+    async getProductAvailability(productId: string): Promise<ProductAvailability | null> {
+      const product = await prisma.product.findUnique({
+        where: { id: productId },
+        select: { id: true, trackInventory: true, stockQuantity: true },
+      });
+      if (!product) {
+        return null;
+      }
+      if (!product.trackInventory) {
+        return {
+          productId: product.id,
+          trackInventory: false,
+          stockQuantity: product.stockQuantity,
+          reserved: 0,
+          available: null,
+        };
+      }
+
+      // Read-time filtered (`expiresAt > now()`), for display only — this
+      // is a pure read, never a capacity *decision*, so the write-path race
+      // this module's own doc comment describes does not apply here.
+      const now = new Date();
+      const aggregate = await prisma.stockReservation.aggregate({
+        where: { productId, status: "ACTIVE", expiresAt: { gt: now } },
+        _sum: { quantity: true },
+      });
+      const reserved = aggregate._sum.quantity ?? 0;
+      return {
+        productId: product.id,
+        trackInventory: true,
+        stockQuantity: product.stockQuantity,
+        reserved,
+        available: product.stockQuantity - reserved,
+      };
+    },
+
+    async listLowStockProducts(threshold: number): Promise<ProductAvailability[]> {
+      const trackedProducts = await prisma.product.findMany({
+        where: { trackInventory: true },
+        select: { id: true, stockQuantity: true },
+      });
+      if (trackedProducts.length === 0) {
+        return [];
       }
 
       const now = new Date();
-      await tx.stockReservation.updateMany({
-        where: { productId: input.productId, status: "ACTIVE", expiresAt: { lt: now } },
-        data: { status: "EXPIRED" },
-      });
-
-      const aggregate = await tx.stockReservation.aggregate({
-        where: { productId: input.productId, status: "ACTIVE" },
+      const grouped = await prisma.stockReservation.groupBy({
+        by: ["productId"],
+        where: {
+          productId: { in: trackedProducts.map((product) => product.id) },
+          status: "ACTIVE",
+          expiresAt: { gt: now },
+        },
         _sum: { quantity: true },
       });
-      const activeReserved = aggregate._sum.quantity ?? 0;
-      if (newStockQuantity < activeReserved) {
-        return {
-          outcome: "belowActiveReservations" as const,
-          currentStockQuantity,
-          activeReserved,
-        };
-      }
+      const reservedByProduct = new Map(
+        grouped.map((row) => [row.productId, row._sum.quantity ?? 0]),
+      );
 
-      await tx.product.update({
-        where: { id: input.productId },
-        data: { stockQuantity: newStockQuantity },
-      });
-      const adjustment = await tx.stockAdjustment.create({
-        data: {
-          productId: input.productId,
-          quantityChange: input.quantityChange,
-          reason: input.reason,
-          adminUserId: input.adminUserId,
-        },
-      });
-      return {
-        outcome: "applied" as const,
-        adjustment: toDomainAdjustment(adjustment),
-        stockQuantity: newStockQuantity,
-      };
-    });
-  },
+      return trackedProducts
+        .map((product) => {
+          const reserved = reservedByProduct.get(product.id) ?? 0;
+          return {
+            productId: product.id,
+            trackInventory: true as const,
+            stockQuantity: product.stockQuantity,
+            reserved,
+            available: product.stockQuantity - reserved,
+          };
+        })
+        .filter((availability) => availability.available <= threshold)
+        .sort((a, b) => a.available - b.available);
+    },
+  };
+}
 
-  async recordInventoryException(
-    input: RecordInventoryExceptionInput,
-  ): Promise<RecordInventoryExceptionResult> {
-    try {
-      const created = await prisma.inventoryException.create({
-        data: {
-          reservationId: input.reservationId,
-          orderId: input.orderId,
-          productId: input.productId,
-          quantity: input.quantity,
-          paymentId: input.paymentId,
-          reason: input.reason,
-          status: "OPEN",
-        },
-      });
-      return { outcome: "created" as const, exception: toDomainException(created) };
-    } catch (error) {
-      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-        const existing = await prisma.inventoryException.findUniqueOrThrow({
-          where: { reservationId: input.reservationId },
-        });
-        return { outcome: "alreadyExists" as const, exception: toDomainException(existing) };
-      }
-      throw error;
-    }
-  },
-
-  async getProductAvailability(productId: string): Promise<ProductAvailability | null> {
-    const product = await prisma.product.findUnique({
-      where: { id: productId },
-      select: { id: true, trackInventory: true, stockQuantity: true },
-    });
-    if (!product) {
-      return null;
-    }
-    if (!product.trackInventory) {
-      return {
-        productId: product.id,
-        trackInventory: false,
-        stockQuantity: product.stockQuantity,
-        reserved: 0,
-        available: null,
-      };
-    }
-
-    // Read-time filtered (`expiresAt > now()`), for display only — this
-    // is a pure read, never a capacity *decision*, so the write-path race
-    // this module's own doc comment describes does not apply here.
-    const now = new Date();
-    const aggregate = await prisma.stockReservation.aggregate({
-      where: { productId, status: "ACTIVE", expiresAt: { gt: now } },
-      _sum: { quantity: true },
-    });
-    const reserved = aggregate._sum.quantity ?? 0;
-    return {
-      productId: product.id,
-      trackInventory: true,
-      stockQuantity: product.stockQuantity,
-      reserved,
-      available: product.stockQuantity - reserved,
-    };
-  },
-
-  async listLowStockProducts(threshold: number): Promise<ProductAvailability[]> {
-    const trackedProducts = await prisma.product.findMany({
-      where: { trackInventory: true },
-      select: { id: true, stockQuantity: true },
-    });
-    if (trackedProducts.length === 0) {
-      return [];
-    }
-
-    const now = new Date();
-    const grouped = await prisma.stockReservation.groupBy({
-      by: ["productId"],
-      where: {
-        productId: { in: trackedProducts.map((product) => product.id) },
-        status: "ACTIVE",
-        expiresAt: { gt: now },
-      },
-      _sum: { quantity: true },
-    });
-    const reservedByProduct = new Map(
-      grouped.map((row) => [row.productId, row._sum.quantity ?? 0]),
-    );
-
-    return trackedProducts
-      .map((product) => {
-        const reserved = reservedByProduct.get(product.id) ?? 0;
-        return {
-          productId: product.id,
-          trackInventory: true as const,
-          stockQuantity: product.stockQuantity,
-          reserved,
-          available: product.stockQuantity - reserved,
-        };
-      })
-      .filter((availability) => availability.available <= threshold)
-      .sort((a, b) => a.available - b.available);
-  },
-} satisfies InventoryRepository;
+/**
+ * The shared production singleton — built with no test hooks, so its
+ * `reserveStock` is indistinguishable, at both the type level and the
+ * runtime level, from a plain `InventoryRepository` implementation that
+ * never had a synchronization seam at all.
+ */
+export const prismaInventoryRepository: InventoryRepository = createPrismaInventoryRepository();

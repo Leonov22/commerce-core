@@ -1,6 +1,9 @@
 import "dotenv/config";
 import { afterAll, describe, expect, it } from "vitest";
-import { prismaInventoryRepository } from "@/modules/catalog/infrastructure/prisma-inventory-repository";
+import {
+  prismaInventoryRepository,
+  createPrismaInventoryRepository,
+} from "@/modules/catalog/infrastructure/prisma-inventory-repository";
 import { prisma } from "@/modules/catalog/infrastructure/prisma-client";
 
 /**
@@ -235,30 +238,35 @@ describe("prismaInventoryRepository", () => {
       });
 
       // Deterministic orchestration against the REAL, unmodified
-      // `reserveStock` — not a replica of its SQL. `reserveStock`'s
-      // third-argument hook (test-only; not part of the public
-      // `InventoryRepository` interface, so no real caller can reach it
-      // — see its own doc comment in prisma-inventory-repository.ts) is
-      // invoked by the PRODUCTION transaction itself at the exact moment
-      // between its own read of the expired `ACTIVE` reservation and its
-      // conditional expiry `UPDATE`. The hook runs the REAL
-      // `releaseReservation` to full completion (commit) before
-      // returning, so the production `UPDATE` that follows is
+      // `reserveStock` logic — not a replica of its SQL. `reserveStock`
+      // itself takes no callback at all (see
+      // `prisma-inventory-repository.ts`'s own doc comment on
+      // `PrismaInventoryRepositoryTestHooks`): a SEPARATE repository
+      // instance is built here, via the same factory that builds the
+      // shared production singleton, with a hook supplied only to THIS
+      // instance's closure — the production singleton (`prismaInventoryRepository`,
+      // used below for the competing `releaseReservation` call) is
+      // never touched or reconfigured. The hook is invoked by the real
+      // production transaction body at the exact moment between its own
+      // read of the expired `ACTIVE` reservation and its conditional
+      // expiry `UPDATE`. The hook runs the REAL `releaseReservation` (on
+      // the ordinary production singleton) to full completion (commit)
+      // before returning, so the production `UPDATE` that follows is
       // guaranteed — not merely hoped via `Promise.all` — to execute
       // strictly after that competing commit.
       let releaseResult:
         Awaited<ReturnType<typeof prismaInventoryRepository.releaseReservation>> | undefined;
-      const reserveResult = await prismaInventoryRepository.reserveStock(
-        {
-          orderId,
-          productId: product.id,
-          quantity: 1,
-          expiresAt: new Date(Date.now() + 60_000),
-        },
-        async () => {
+      const testRepository = createPrismaInventoryRepository({
+        beforeExpirySweep: async () => {
           releaseResult = await prismaInventoryRepository.releaseReservation(orderId, product.id);
         },
-      );
+      });
+      const reserveResult = await testRepository.reserveStock({
+        orderId,
+        productId: product.id,
+        quantity: 1,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
 
       // The competing release committed first (inside the seam): the
       // real production expiry update, issued strictly afterward inside
