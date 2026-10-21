@@ -16,3 +16,5 @@ export {
 export { AdminProductForm } from "@/modules/admin/components/admin-product-form";
 export { AdminCategoryCreateForm } from "@/modules/admin/components/admin-category-create-form";
 export { AdminDiscountForm } from "@/modules/admin/components/admin-discount-form";
+export { AdminInventoryTrackingForm } from "@/modules/admin/components/admin-inventory-tracking-form";
+export { AdminInventoryAdjustForm } from "@/modules/admin/components/admin-inventory-adjust-form";

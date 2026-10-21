@@ -15,6 +15,8 @@ import * as adminCategoryCommands from "@/modules/catalog/application/admin-cate
 import * as adminProductImageCommands from "@/modules/catalog/application/admin-product-image-commands";
 import * as adminDiscountCommands from "@/modules/catalog/application/admin-discount-commands";
 import * as adminDiscountQueries from "@/modules/catalog/application/admin-discount-queries";
+import * as adminInventoryQueries from "@/modules/catalog/application/admin-inventory-queries";
+import * as adminInventoryCommands from "@/modules/catalog/application/admin-inventory-commands";
 import { deleteProductImageBlob as deleteProductImageBlobImpl } from "@/modules/catalog/infrastructure/product-image-blob-storage";
 import type {
   ProductListFilter,
@@ -26,6 +28,12 @@ import type { RawAdminCategoryInput } from "@/modules/catalog/application/admin-
 import type { ConfirmProductImageUploadInput } from "@/modules/catalog/application/admin-product-image-commands";
 import type { RawAdminDiscountInput } from "@/modules/catalog/application/admin-discount-commands";
 import type { ReserveStockInput } from "@/modules/catalog/repositories/inventory-repository";
+import type { AdminInventoryListOptions } from "@/modules/catalog/application/admin-inventory-queries";
+import type {
+  RawSetTrackInventoryInput,
+  RawAdjustStockInput,
+} from "@/modules/catalog/application/admin-inventory-commands";
+import type { StockAdjustmentListOptions } from "@/modules/catalog/repositories/inventory-repository";
 
 export type {
   Product,
@@ -81,15 +89,39 @@ export type {
 
 // IMP-048 Increment 3: only the two operations Order's checkout
 // integration needs (`reserveStock`, `releaseReservation`) are exposed
-// here. `consumeReservation`/`securePaymentWindow`/`adjustStock`/etc.
-// have no caller yet — they are exported from this barrel only once the
-// increment that actually calls them is approved, so an unused export
-// never implies a wiring that doesn't exist.
+// here. `consumeReservation`/`securePaymentWindow`/etc. still have no
+// caller and remain unexported. `adjustStock`/`getProductAvailability`/
+// `listStockAdjustments`/`setTrackInventory` now have one: the Admin
+// Panel inventory feature below (IMP-048 Increment 4) — exposed only
+// through its own `AdminInventory*`/`AdjustProductStock*`/
+// `SetTrackInventory*` wrapper functions and types, never by exporting
+// `InventoryRepository`/`prismaInventoryRepository` themselves.
 export type {
   ReserveStockInput,
   ReserveStockResult,
   ReleaseReservationResult,
 } from "@/modules/catalog/repositories/inventory-repository";
+
+// Admin Panel inventory management (IMP-048 Increment 4).
+export type { StockAdjustment } from "@/modules/catalog/domain/inventory";
+export type {
+  AdminInventoryListItem,
+  AdminInventoryListOptions,
+  AdminInventoryListPage,
+  AdminInventoryProductDetail,
+} from "@/modules/catalog/application/admin-inventory-queries";
+export type {
+  StockAdjustmentListOptions,
+  StockAdjustmentListItem,
+  StockAdjustmentListPage,
+} from "@/modules/catalog/repositories/inventory-repository";
+export type {
+  RawSetTrackInventoryInput,
+  SetTrackInventoryResult,
+  RawAdjustStockInput,
+  AdjustProductStockResult,
+} from "@/modules/catalog/application/admin-inventory-commands";
+export type { AdjustStockResult } from "@/modules/catalog/repositories/inventory-repository";
 
 export function getProductById(id: string, locale: string) {
   return catalogQueries.getProductById(prismaProductRepository, id, locale);
@@ -172,4 +204,45 @@ export function reserveStock(input: ReserveStockInput) {
 
 export function releaseReservation(orderId: string, productId: string) {
   return prismaInventoryRepository.releaseReservation(orderId, productId);
+}
+
+// Admin Panel inventory management (IMP-048 Increment 4). Every function
+// below is the ONLY sanctioned way for route/UI code to reach the
+// inventory domain — none of them hands back `InventoryRepository` or
+// `prismaInventoryRepository` itself.
+export function listAdminInventory(options: AdminInventoryListOptions) {
+  return adminInventoryQueries.listAdminInventory(
+    prismaProductRepository,
+    prismaInventoryRepository,
+    options,
+  );
+}
+
+export function getAdminInventoryProduct(productId: string) {
+  return adminInventoryQueries.getAdminInventoryProduct(
+    prismaProductRepository,
+    prismaInventoryRepository,
+    productId,
+  );
+}
+
+export function listAdminStockHistory(options: StockAdjustmentListOptions) {
+  return adminInventoryQueries.listAdminStockHistory(prismaInventoryRepository, options);
+}
+
+export function setProductTrackInventory(
+  productId: string,
+  input: RawSetTrackInventoryInput,
+  adminUserId: string | null,
+) {
+  return adminInventoryCommands.setProductTrackInventory(
+    prismaInventoryRepository,
+    productId,
+    input,
+    adminUserId,
+  );
+}
+
+export function adjustProductStock(input: RawAdjustStockInput, adminUserId: string | null) {
+  return adminInventoryCommands.adjustProductStock(prismaInventoryRepository, input, adminUserId);
 }

@@ -17,7 +17,7 @@ const NAV_ITEMS: AdminNavItem[] = [
   { key: "categories", label: "Categories", href: "/admin/categories", available: true },
   { key: "discounts", label: "Discounts", href: "/admin/discounts", available: true },
   { key: "orders", label: "Orders", href: "/admin/orders", available: false },
-  { key: "inventory", label: "Inventory", href: "/admin/inventory", available: false },
+  { key: "inventory", label: "Inventory", href: "/admin/inventory", available: true },
   { key: "customers", label: "Customers", href: "/admin/customers", available: false },
   { key: "analytics", label: "Analytics", href: "/admin/analytics", available: false },
   { key: "settings", label: "Settings", href: "/admin/settings", available: false },
@@ -25,7 +25,8 @@ const NAV_ITEMS: AdminNavItem[] = [
 
 /**
  * Sidebar navigation for the Admin Panel. Dashboard, Products, Categories
- * (IMP-043), and Discounts (IMP-047) are functional — every other section
+ * (IMP-043), Discounts (IMP-047), and Inventory (IMP-048) are functional
+ * — every other section
  * is rendered as a visibly disabled item (not a working link, not
  * omitted entirely) so the planned structure is legible without ever
  * routing to a page that doesn't exist. Adding a real page for one of

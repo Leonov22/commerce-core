@@ -70,6 +70,53 @@ export type AdjustStockResult =
   | { outcome: "productNotFound" }
   | { outcome: "noOp" };
 
+export interface SetTrackInventoryInput {
+  productId: string;
+  trackInventory: boolean;
+  /**
+   * Only meaningful when enabling (`trackInventory: true`); ignored when
+   * disabling. An absolute target for `stockQuantity`, not a signed delta
+   * — the signed delta from the row's current, lock-protected
+   * `stockQuantity` is computed internally, inside the same transaction
+   * and under the same row lock as the flag flip itself (see
+   * `SetTrackInventoryResult`'s own doc comment for why this one-call
+   * shape, rather than a separate `adjustStock` call afterward, is what
+   * actually closes the race between enabling and a concurrent
+   * `reserveStock`).
+   */
+  initialQuantity?: number;
+  /** Required only if `initialQuantity` is given and actually differs from the current `stockQuantity` — a zero delta is a no-op, exactly like `adjustStock`'s own rule, and creates no audit row. */
+  reason?: string;
+  adminUserId?: string | null;
+}
+
+/**
+ * `updated["adjustment"]` is non-null only when enabling with an
+ * `initialQuantity` that actually changed `stockQuantity` — the same
+ * `StockAdjustment` row `adjustStock` would have created, created here
+ * instead, in the SAME transaction as the flag flip. `wouldGoNegative`/
+ * `belowActiveReservations` mirror `AdjustStockResult`'s own outcomes of
+ * the same name and are only possible on that same enabling path.
+ */
+export type SetTrackInventoryResult =
+  | {
+      outcome: "updated";
+      trackInventory: boolean;
+      stockQuantity: number;
+      adjustment: StockAdjustment | null;
+    }
+  | { outcome: "productNotFound" }
+  /**
+   * Only ever returned when turning tracking OFF: refuses to stop tracking
+   * a product that still has `ACTIVE`, unexpired reservations against it —
+   * those reservations still correspond to a real promise made to a real
+   * order, and silently abandoning that promise (or the stock backing it)
+   * is never an acceptable side effect of an admin toggling a display flag.
+   */
+  | { outcome: "activeReservationsExist"; reserved: number }
+  | { outcome: "wouldGoNegative"; currentStockQuantity: number }
+  | { outcome: "belowActiveReservations"; currentStockQuantity: number; activeReserved: number };
+
 export interface RecordInventoryExceptionInput {
   reservationId: string;
   orderId: string;
@@ -83,6 +130,29 @@ export type RecordInventoryExceptionResult =
   | { outcome: "created"; exception: InventoryException }
   /** Idempotent: an exception for this `reservationId` already existed — the existing row is returned, never duplicated. */
   | { outcome: "alreadyExists"; exception: InventoryException };
+
+export interface StockAdjustmentListFilter {
+  productId?: string;
+}
+
+export interface StockAdjustmentListOptions {
+  filter?: StockAdjustmentListFilter;
+  /** 1-based. */
+  page: number;
+  pageSize: number;
+}
+
+/** `StockAdjustment` joined with the product's display name, for the Admin Panel's read-only stock history view. */
+export interface StockAdjustmentListItem extends StockAdjustment {
+  productName: string;
+}
+
+export interface StockAdjustmentListPage {
+  items: StockAdjustmentListItem[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
 
 /**
  * Read-only abstraction for IMP-048's reservation-based inventory
@@ -136,6 +206,20 @@ export interface InventoryRepository {
    */
   adjustStock(input: AdjustStockInput): Promise<AdjustStockResult>;
 
+  /**
+   * Admin Panel opt-in/opt-out of inventory tracking (IMP-048 Increment
+   * 4). Disabling never touches `stockQuantity`. Enabling with an
+   * `initialQuantity` applies the resulting signed delta and creates its
+   * `StockAdjustment` audit row atomically, in the SAME transaction and
+   * under the SAME row lock as the flag flip — a caller must never
+   * observe `trackInventory: true` paired with a `stockQuantity` that
+   * predates the initialization (that was an earlier, two-transaction
+   * design's race; see the Prisma implementation's own doc comment). See
+   * `SetTrackInventoryResult`'s own doc comment for why disabling can
+   * refuse.
+   */
+  setTrackInventory(input: SetTrackInventoryInput): Promise<SetTrackInventoryResult>;
+
   /** Idempotent on `reservationId` — see `RecordInventoryExceptionResult`'s own doc comment. */
   recordInventoryException(
     input: RecordInventoryExceptionInput,
@@ -146,4 +230,13 @@ export interface InventoryRepository {
 
   /** Every *tracked* product whose computed `available` is at or below `threshold`, ascending by `available`. */
   listLowStockProducts(threshold: number): Promise<ProductAvailability[]>;
+
+  /**
+   * Admin Panel read-only stock history (IMP-048 Increment 4). Every
+   * `StockAdjustment` row, newest first, optionally scoped to one
+   * product. Never filters or modifies the underlying rows — this is a
+   * pure read over the same append-only, never-rewritten audit log
+   * `adjustStock` creates.
+   */
+  listStockAdjustments(options: StockAdjustmentListOptions): Promise<StockAdjustmentListPage>;
 }

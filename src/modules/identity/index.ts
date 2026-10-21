@@ -18,6 +18,7 @@ import { prismaUserRepository } from "@/modules/identity/infrastructure/prisma-u
 import * as registerUserCommand from "@/modules/identity/application/register-user";
 import * as verifyCredentialsCommand from "@/modules/identity/application/verify-credentials";
 import * as currentUserCommand from "@/modules/identity/application/current-user";
+import * as userLookupCommand from "@/modules/identity/application/user-lookup";
 import type { RegisterUserInput } from "@/modules/identity/application/register-user";
 import type { VerifyCredentialsInput } from "@/modules/identity/application/verify-credentials";
 
@@ -66,4 +67,9 @@ export function getCurrentUser() {
 
 export function requireAuthenticatedUser() {
   return currentUserCommand.requireAuthenticatedUser(prismaUserRepository);
+}
+
+/** IMP-048 Increment 4: resolves a `StockAdjustment.adminUserId` to a displayable user, for the Admin Panel's stock-history view. `null` if no such user exists (e.g. the account was later removed). */
+export function getUserById(id: string) {
+  return userLookupCommand.getUserById(prismaUserRepository, id);
 }

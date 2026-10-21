@@ -5,6 +5,7 @@ import {
   createPrismaInventoryRepository,
 } from "@/modules/catalog/infrastructure/prisma-inventory-repository";
 import { prisma } from "@/modules/catalog/infrastructure/prisma-client";
+import type { ReserveStockResult } from "@/modules/catalog/repositories/inventory-repository";
 
 /**
  * Integration tests against the real Postgres database — concurrency
@@ -820,6 +821,428 @@ describe("prismaInventoryRepository", () => {
       expect(ids).toContain(low.id);
       expect(ids).not.toContain(high.id);
       expect(ids).not.toContain(untracked.id);
+    });
+  });
+
+  // IMP-048 Increment 4 — Admin Panel inventory management.
+  describe("setTrackInventory", () => {
+    it("enables tracking for a product that was not tracked, leaving stockQuantity untouched, with no audit row", async () => {
+      const product = await createTestProduct({ trackInventory: false, stockQuantity: 7 });
+
+      const result = await prismaInventoryRepository.setTrackInventory({
+        productId: product.id,
+        trackInventory: true,
+      });
+      expect(result).toEqual({
+        outcome: "updated",
+        trackInventory: true,
+        stockQuantity: 7,
+        adjustment: null,
+      });
+
+      const availability = await prismaInventoryRepository.getProductAvailability(product.id);
+      expect(availability?.trackInventory).toBe(true);
+      expect(availability?.stockQuantity).toBe(7);
+
+      const history = await prismaInventoryRepository.listStockAdjustments({
+        filter: { productId: product.id },
+        page: 1,
+        pageSize: 10,
+      });
+      expect(history.total).toBe(0);
+    });
+
+    it("disables tracking for a tracked product with no active reservations", async () => {
+      const product = await createTestProduct({ trackInventory: true, stockQuantity: 3 });
+
+      const result = await prismaInventoryRepository.setTrackInventory({
+        productId: product.id,
+        trackInventory: false,
+      });
+      expect(result).toEqual({
+        outcome: "updated",
+        trackInventory: false,
+        stockQuantity: 3,
+        adjustment: null,
+      });
+    });
+
+    it("refuses to disable tracking while an active reservation exists, and does not flip the flag", async () => {
+      const product = await createTestProduct({ trackInventory: true, stockQuantity: 5 });
+      await prismaInventoryRepository.reserveStock({
+        orderId: testOrderId(),
+        productId: product.id,
+        quantity: 2,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+
+      const result = await prismaInventoryRepository.setTrackInventory({
+        productId: product.id,
+        trackInventory: false,
+      });
+      expect(result).toEqual({ outcome: "activeReservationsExist", reserved: 2 });
+
+      const availability = await prismaInventoryRepository.getProductAvailability(product.id);
+      expect(availability?.trackInventory).toBe(true);
+    });
+
+    it("disabling succeeds once the only reservation has expired (never blocked by a merely-stale ACTIVE row)", async () => {
+      const product = await createTestProduct({ trackInventory: true, stockQuantity: 5 });
+      await prismaInventoryRepository.reserveStock({
+        orderId: testOrderId(),
+        productId: product.id,
+        quantity: 2,
+        expiresAt: new Date(Date.now() - 1), // already expired
+      });
+
+      const result = await prismaInventoryRepository.setTrackInventory({
+        productId: product.id,
+        trackInventory: false,
+      });
+      expect(result).toEqual({
+        outcome: "updated",
+        trackInventory: false,
+        stockQuantity: 5,
+        adjustment: null,
+      });
+    });
+
+    it("returns productNotFound for a nonexistent product", async () => {
+      const result = await prismaInventoryRepository.setTrackInventory({
+        productId: "does-not-exist",
+        trackInventory: true,
+      });
+      expect(result).toEqual({ outcome: "productNotFound" });
+    });
+
+    describe("enabling with an initial quantity (race fix)", () => {
+      it("applies the flag flip, the stock write, and the audit row atomically, in one call", async () => {
+        const product = await createTestProduct({ trackInventory: false, stockQuantity: 0 });
+
+        const result = await prismaInventoryRepository.setTrackInventory({
+          productId: product.id,
+          trackInventory: true,
+          initialQuantity: 20,
+          reason: "Initial stock count",
+          adminUserId: "admin-1",
+        });
+
+        expect(result.outcome).toBe("updated");
+        if (result.outcome !== "updated") throw new Error("unreachable");
+        expect(result.trackInventory).toBe(true);
+        expect(result.stockQuantity).toBe(20);
+        expect(result.adjustment).not.toBeNull();
+        expect(result.adjustment?.quantityChange).toBe(20);
+        expect(result.adjustment?.reason).toBe("Initial stock count");
+        expect(result.adjustment?.adminUserId).toBe("admin-1");
+
+        const availability = await prismaInventoryRepository.getProductAvailability(product.id);
+        expect(availability).toEqual({
+          productId: product.id,
+          trackInventory: true,
+          stockQuantity: 20,
+          reserved: 0,
+          available: 20,
+        });
+
+        const history = await prismaInventoryRepository.listStockAdjustments({
+          filter: { productId: product.id },
+          page: 1,
+          pageSize: 10,
+        });
+        expect(history.total).toBe(1);
+        expect(history.items[0]!.quantityChange).toBe(20);
+      });
+
+      it("creates no audit row and still flips the flag when the initial quantity equals the current stock (zero delta)", async () => {
+        const product = await createTestProduct({ trackInventory: false, stockQuantity: 5 });
+
+        const result = await prismaInventoryRepository.setTrackInventory({
+          productId: product.id,
+          trackInventory: true,
+          initialQuantity: 5,
+        });
+
+        expect(result).toEqual({
+          outcome: "updated",
+          trackInventory: true,
+          stockQuantity: 5,
+          adjustment: null,
+        });
+
+        const history = await prismaInventoryRepository.listStockAdjustments({
+          filter: { productId: product.id },
+          page: 1,
+          pageSize: 10,
+        });
+        expect(history.total).toBe(0);
+      });
+
+      it("refuses a negative resulting stock quantity, writing neither the flag nor the stock", async () => {
+        // Structurally this outcome can't arise through the sanctioned
+        // admin flow (initialQuantity is always validated >= 0 before
+        // this is called, so currentStockQuantity + delta === initialQuantity
+        // can never be negative) — this test exercises the repository's
+        // own defensive floor directly, the same way `adjustStock`'s own
+        // tests exercise its identical floor in isolation.
+        const product = await createTestProduct({ trackInventory: false, stockQuantity: 10 });
+        // Force a negative target by calling with initialQuantity below
+        // zero via a cast — the repository itself does not re-validate
+        // non-negativity of `initialQuantity`, only that the computed
+        // result isn't negative (mirroring `adjustStock`, which also
+        // trusts its caller's `quantityChange` sign and only checks the
+        // resulting total).
+        const result = await prismaInventoryRepository.setTrackInventory({
+          productId: product.id,
+          trackInventory: true,
+          initialQuantity: -5,
+        });
+        expect(result).toEqual({ outcome: "wouldGoNegative", currentStockQuantity: 10 });
+
+        const availability = await prismaInventoryRepository.getProductAvailability(product.id);
+        expect(availability?.trackInventory).toBe(false);
+        expect(availability?.stockQuantity).toBe(10);
+      });
+
+      it("refuses an initial quantity below already-active reservations, writing neither the flag nor the stock", async () => {
+        // Also structurally unreachable through the sanctioned admin
+        // flow today (a product can only have ACTIVE reservations once
+        // it has already been tracked at some point, and the enable
+        // path is only reachable while untracked) — exercised directly
+        // against the repository, as above, to prove the floor itself
+        // is correct in isolation, the same way `adjustStock`'s own
+        // `belowActiveReservations` test does.
+        const product = await createTestProduct({ trackInventory: true, stockQuantity: 10 });
+        await prismaInventoryRepository.reserveStock({
+          orderId: testOrderId(),
+          productId: product.id,
+          quantity: 8,
+          expiresAt: new Date(Date.now() + 60_000),
+        });
+        // Disable first so the product is back in the one state the
+        // enable branch actually runs from, while the reservation (an
+        // already-committed, independent row) stays ACTIVE — this is
+        // the only way to construct the precondition at all, and it
+        // requires disabling to succeed despite the active reservation,
+        // which it would not through the normal `activeReservationsExist`
+        // floor; so this test writes the product directly to simulate
+        // a product that is untracked yet still has a lingering ACTIVE
+        // reservation row, a state the sanctioned admin flow can never
+        // itself produce.
+        await prisma.product.update({ where: { id: product.id }, data: { trackInventory: false } });
+
+        const result = await prismaInventoryRepository.setTrackInventory({
+          productId: product.id,
+          trackInventory: true,
+          initialQuantity: 3,
+        });
+        expect(result).toEqual({
+          outcome: "belowActiveReservations",
+          currentStockQuantity: 10,
+          activeReserved: 8,
+        });
+
+        const availability = await prismaInventoryRepository.getProductAvailability(product.id);
+        expect(availability?.trackInventory).toBe(false);
+        expect(availability?.stockQuantity).toBe(10);
+      });
+
+      it("sweeps a merely-stale ACTIVE reservation before computing the floor, consistent with adjustStock", async () => {
+        const product = await createTestProduct({ trackInventory: true, stockQuantity: 10 });
+        await prismaInventoryRepository.reserveStock({
+          orderId: testOrderId(),
+          productId: product.id,
+          quantity: 8,
+          expiresAt: new Date(Date.now() - 1), // already expired, not yet swept
+        });
+        await prisma.product.update({ where: { id: product.id }, data: { trackInventory: false } });
+
+        const result = await prismaInventoryRepository.setTrackInventory({
+          productId: product.id,
+          trackInventory: true,
+          initialQuantity: 3,
+        });
+        expect(result.outcome).toBe("updated");
+        if (result.outcome !== "updated") throw new Error("unreachable");
+        expect(result.stockQuantity).toBe(3);
+      });
+
+      it("rolls back the flag flip and the stock write together when a later step in the same transaction fails", async () => {
+        const product = await createTestProduct({ trackInventory: false, stockQuantity: 0 });
+        const testRepository = createPrismaInventoryRepository({
+          beforeInitialStockAdjustmentInsert: async () => {
+            throw new Error("injected failure after the product write, before the audit row");
+          },
+        });
+
+        await expect(
+          testRepository.setTrackInventory({
+            productId: product.id,
+            trackInventory: true,
+            initialQuantity: 20,
+            reason: "should never persist",
+          }),
+        ).rejects.toThrow("injected failure");
+
+        // The whole transaction — including the `trackInventory`/
+        // `stockQuantity` write that ran BEFORE the injected failure —
+        // must have rolled back together. Read via a separate,
+        // unrelated repository instance, after the failed call's own
+        // transaction has definitely ended.
+        const availability = await prismaInventoryRepository.getProductAvailability(product.id);
+        expect(availability?.trackInventory).toBe(false);
+        expect(availability?.stockQuantity).toBe(0);
+
+        const history = await prismaInventoryRepository.listStockAdjustments({
+          filter: { productId: product.id },
+          page: 1,
+          pageSize: 10,
+        });
+        expect(history.total).toBe(0);
+      });
+
+      it("a concurrent reserveStock call can never observe trackInventory=true paired with the pre-initialization stock — it is blocked by the same row lock until the enabling transaction commits", async () => {
+        const product = await createTestProduct({ trackInventory: false, stockQuantity: 0 });
+        const orderId = testOrderId();
+
+        const box: { reserveStockPromise: Promise<ReserveStockResult> | null } = {
+          reserveStockPromise: null,
+        };
+
+        const testRepository = createPrismaInventoryRepository({
+          beforeInitialStockAdjustmentInsert: async () => {
+            // At this exact point, inside the still-open enabling
+            // transaction, the product row's `trackInventory`/
+            // `stockQuantity` have already been written but NOT yet
+            // committed — and the row is still locked (`FOR UPDATE`) by
+            // this same transaction. Firing a real, unmodified
+            // `reserveStock` call here — on the shared production
+            // repository, a separate connection — and NOT awaiting it
+            // yet proves it cannot proceed past its own `FOR UPDATE`
+            // read until this transaction ends.
+            box.reserveStockPromise = prismaInventoryRepository.reserveStock({
+              orderId,
+              productId: product.id,
+              quantity: 20,
+              expiresAt: new Date(Date.now() + 60_000),
+            });
+            // Give the now-blocked call a moment to actually reach and
+            // block on the lock, so this transaction's own commit
+            // (immediately after this hook returns) is genuinely what
+            // unblocks it, not a lucky ordering.
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          },
+        });
+
+        const enableResult = await testRepository.setTrackInventory({
+          productId: product.id,
+          trackInventory: true,
+          initialQuantity: 20,
+          reason: "Initial stock count",
+        });
+        expect(enableResult.outcome).toBe("updated");
+
+        if (!box.reserveStockPromise) {
+          throw new Error("the hook never fired — test is not exercising the intended window");
+        }
+        const reserveResult = await box.reserveStockPromise;
+
+        // The decisive assertion: by the time `reserveStock` actually
+        // ran its own availability check, it was reading the FULLY
+        // committed post-initialization row (trackInventory=true AND
+        // stockQuantity=20 together) — never the old, two-transaction
+        // design's partial state (trackInventory=true, stockQuantity=0)
+        // that would have wrongly reported `insufficientStock` here.
+        expect(reserveResult.outcome).toBe("reserved");
+
+        // `reserveStock` never decrements `stockQuantity` itself (only
+        // `consumeReservation` does) — it only creates the reservation
+        // row, so the on-hand count is still 20 and the full 20 units
+        // are now reflected as reserved, leaving nothing available.
+        const availability = await prismaInventoryRepository.getProductAvailability(product.id);
+        expect(availability).toEqual({
+          productId: product.id,
+          trackInventory: true,
+          stockQuantity: 20,
+          reserved: 20,
+          available: 0,
+        });
+      });
+    });
+  });
+
+  describe("listStockAdjustments", () => {
+    it("returns adjustments for one product, newest first, joined with the product's name", async () => {
+      const product = await createTestProduct({ trackInventory: true, stockQuantity: 0 });
+      await prismaInventoryRepository.adjustStock({
+        productId: product.id,
+        quantityChange: 10,
+        reason: "Initial stock",
+        adminUserId: "admin-1",
+      });
+      await prismaInventoryRepository.adjustStock({
+        productId: product.id,
+        quantityChange: -3,
+        reason: "Damaged units",
+        adminUserId: "admin-1",
+      });
+
+      const page = await prismaInventoryRepository.listStockAdjustments({
+        filter: { productId: product.id },
+        page: 1,
+        pageSize: 20,
+      });
+
+      expect(page.total).toBe(2);
+      expect(page.items).toHaveLength(2);
+      expect(page.items[0]!.reason).toBe("Damaged units");
+      expect(page.items[0]!.quantityChange).toBe(-3);
+      expect(page.items[1]!.reason).toBe("Initial stock");
+      expect(page.items.every((item) => item.productName === "Inventory Test Product")).toBe(true);
+    });
+
+    it("paginates and never returns another product's rows when filtered by productId", async () => {
+      const productA = await createTestProduct({ trackInventory: true, stockQuantity: 0 });
+      const productB = await createTestProduct({ trackInventory: true, stockQuantity: 0 });
+      await prismaInventoryRepository.adjustStock({
+        productId: productA.id,
+        quantityChange: 5,
+        reason: "A's stock",
+        adminUserId: null,
+      });
+      await prismaInventoryRepository.adjustStock({
+        productId: productB.id,
+        quantityChange: 5,
+        reason: "B's stock",
+        adminUserId: null,
+      });
+
+      const page = await prismaInventoryRepository.listStockAdjustments({
+        filter: { productId: productA.id },
+        page: 1,
+        pageSize: 20,
+      });
+
+      expect(page.items).toHaveLength(1);
+      expect(page.items[0]!.productId).toBe(productA.id);
+      expect(page.items[0]!.reason).toBe("A's stock");
+    });
+
+    it("records a null adminUserId as-is, never inventing an actor", async () => {
+      const product = await createTestProduct({ trackInventory: true, stockQuantity: 0 });
+      await prismaInventoryRepository.adjustStock({
+        productId: product.id,
+        quantityChange: 1,
+        reason: "No admin id on this one",
+        adminUserId: null,
+      });
+
+      const page = await prismaInventoryRepository.listStockAdjustments({
+        filter: { productId: product.id },
+        page: 1,
+        pageSize: 20,
+      });
+      expect(page.items[0]!.adminUserId).toBeNull();
     });
   });
 });

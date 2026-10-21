@@ -12,8 +12,13 @@ import type {
   SecurePaymentWindowFailure,
   AdjustStockInput,
   AdjustStockResult,
+  SetTrackInventoryInput,
+  SetTrackInventoryResult,
   RecordInventoryExceptionInput,
   RecordInventoryExceptionResult,
+  StockAdjustmentListOptions,
+  StockAdjustmentListPage,
+  StockAdjustmentListItem,
 } from "@/modules/catalog/repositories/inventory-repository";
 import type {
   StockReservation,
@@ -135,6 +140,9 @@ function toDomainException(row: {
   };
 }
 
+/** Mirrors `prisma-product-repository.ts`'s own `ADMIN_LOCALE` — this project has exactly one locale (`en`) today. */
+const STOCK_HISTORY_LOCALE = "en";
+
 /** Thrown inside `securePaymentWindow`'s transaction purely to force a rollback of any already-applied per-item extensions once a later item fails — caught immediately outside, never leaks. */
 class SecurePaymentWindowAbort extends Error {
   constructor(public readonly failures: SecurePaymentWindowFailure[]) {
@@ -170,6 +178,16 @@ export interface PrismaInventoryRepositoryTestHooks {
    * this factory built specifically for that one test.
    */
   beforeExpirySweep?: () => Promise<void>;
+
+  /**
+   * Round 7 (race fix): invoked inside `setTrackInventory`'s enabling
+   * transaction, after the combined `trackInventory`+`stockQuantity`
+   * write but before the `StockAdjustment` audit row is created — see
+   * that method's own doc comment for exactly what this proves.
+   * Exercised only by this repository's own integration test, against a
+   * repository instance this factory built specifically for that test.
+   */
+  beforeInitialStockAdjustmentInsert?: () => Promise<void>;
 }
 
 export function createPrismaInventoryRepository(
@@ -456,6 +474,143 @@ export function createPrismaInventoryRepository(
       });
     },
 
+    async setTrackInventory(input: SetTrackInventoryInput): Promise<SetTrackInventoryResult> {
+      const { productId, trackInventory, initialQuantity, reason, adminUserId } = input;
+      return prisma.$transaction(async (tx) => {
+        const locked = await tx.$queryRaw<
+          { id: string; stockQuantity: number }[]
+        >`SELECT "id", "stockQuantity" FROM "products" WHERE "id" = ${productId} FOR UPDATE`;
+        if (locked.length === 0) {
+          return { outcome: "productNotFound" as const };
+        }
+        const currentStockQuantity = locked[0]!.stockQuantity;
+
+        if (!trackInventory) {
+          // Same sweep-then-aggregate sequence `adjustStock` uses, under
+          // the same product-row lock, so a reservation that is only
+          // nominally `ACTIVE` because nothing has swept it yet can never
+          // cause a false "still has active reservations" refusal.
+          const now = new Date();
+          await tx.stockReservation.updateMany({
+            where: { productId, status: "ACTIVE", expiresAt: { lt: now } },
+            data: { status: "EXPIRED" },
+          });
+          const aggregate = await tx.stockReservation.aggregate({
+            where: { productId, status: "ACTIVE" },
+            _sum: { quantity: true },
+          });
+          const reserved = aggregate._sum.quantity ?? 0;
+          if (reserved > 0) {
+            return { outcome: "activeReservationsExist" as const, reserved };
+          }
+
+          await tx.product.update({ where: { id: productId }, data: { trackInventory: false } });
+          return {
+            outcome: "updated" as const,
+            trackInventory: false,
+            stockQuantity: currentStockQuantity,
+            adjustment: null,
+          };
+        }
+
+        // Enabling. `initialQuantity` is an absolute target, not a
+        // signed delta — the delta is computed here, against the
+        // row-locked `currentStockQuantity`, never against a value read
+        // by an earlier, separate call. This is what makes the flag
+        // flip and the stock write a single atomic operation: there is
+        // no gap, visible to any other transaction, in which
+        // `trackInventory` is already `true` but `stockQuantity` is
+        // still stale (the race an earlier two-transaction version of
+        // this method had — `reserveStock` takes the same `FOR UPDATE`
+        // lock on this row, so it can only ever observe this row either
+        // fully before or fully after this entire transaction commits).
+        if (initialQuantity === undefined) {
+          await tx.product.update({ where: { id: productId }, data: { trackInventory: true } });
+          return {
+            outcome: "updated" as const,
+            trackInventory: true,
+            stockQuantity: currentStockQuantity,
+            adjustment: null,
+          };
+        }
+
+        const quantityChange = initialQuantity - currentStockQuantity;
+        if (quantityChange === 0) {
+          await tx.product.update({ where: { id: productId }, data: { trackInventory: true } });
+          return {
+            outcome: "updated" as const,
+            trackInventory: true,
+            stockQuantity: currentStockQuantity,
+            adjustment: null,
+          };
+        }
+
+        const newStockQuantity = currentStockQuantity + quantityChange;
+        if (newStockQuantity < 0) {
+          return { outcome: "wouldGoNegative" as const, currentStockQuantity };
+        }
+
+        // Same sweep-then-aggregate-then-floor sequence `adjustStock`
+        // itself uses — duplicated here, not called via a nested
+        // `prisma.$transaction`, since Prisma cannot compose an
+        // interactive transaction inside another on the same
+        // connection; calling `adjustStock` here would silently start a
+        // SECOND, independent transaction and reintroduce exactly the
+        // two-transaction race this method exists to close.
+        const now = new Date();
+        await tx.stockReservation.updateMany({
+          where: { productId, status: "ACTIVE", expiresAt: { lt: now } },
+          data: { status: "EXPIRED" },
+        });
+        const aggregate = await tx.stockReservation.aggregate({
+          where: { productId, status: "ACTIVE" },
+          _sum: { quantity: true },
+        });
+        const activeReserved = aggregate._sum.quantity ?? 0;
+        if (newStockQuantity < activeReserved) {
+          return {
+            outcome: "belowActiveReservations" as const,
+            currentStockQuantity,
+            activeReserved,
+          };
+        }
+
+        await tx.product.update({
+          where: { id: productId },
+          data: { trackInventory: true, stockQuantity: newStockQuantity },
+        });
+
+        // Round 7: test-only hook, invoked after the combined
+        // flag-and-stock write but before the audit row is created —
+        // lets a test (a) run a REAL, unmodified `reserveStock` call
+        // concurrently from here, deterministically proving it blocks
+        // on this same row's lock until this transaction commits, and
+        // (b) throw, deterministically proving the whole transaction
+        // (including the `tx.product.update` just above) rolls back
+        // rather than partially applying. See `beforeExpirySweep`'s own
+        // doc comment for why this is a hook rather than `Promise.all`
+        // or hand-replicated SQL.
+        if (testHooks.beforeInitialStockAdjustmentInsert) {
+          await testHooks.beforeInitialStockAdjustmentInsert();
+        }
+
+        const adjustment = await tx.stockAdjustment.create({
+          data: {
+            productId,
+            quantityChange,
+            reason: reason ?? "",
+            adminUserId: adminUserId ?? null,
+          },
+        });
+        return {
+          outcome: "updated" as const,
+          trackInventory: true,
+          stockQuantity: newStockQuantity,
+          adjustment: toDomainAdjustment(adjustment),
+        };
+      });
+    },
+
     async recordInventoryException(
       input: RecordInventoryExceptionInput,
     ): Promise<RecordInventoryExceptionResult> {
@@ -555,6 +710,33 @@ export function createPrismaInventoryRepository(
         })
         .filter((availability) => availability.available <= threshold)
         .sort((a, b) => a.available - b.available);
+    },
+
+    async listStockAdjustments(
+      options: StockAdjustmentListOptions,
+    ): Promise<StockAdjustmentListPage> {
+      const { filter, page, pageSize } = options;
+      const where = filter?.productId ? { productId: filter.productId } : {};
+
+      const [rows, total] = await Promise.all([
+        prisma.stockAdjustment.findMany({
+          where,
+          include: {
+            product: { include: { translations: { where: { locale: STOCK_HISTORY_LOCALE } } } },
+          },
+          orderBy: { createdAt: "desc" },
+          skip: (page - 1) * pageSize,
+          take: pageSize,
+        }),
+        prisma.stockAdjustment.count({ where }),
+      ]);
+
+      const items: StockAdjustmentListItem[] = rows.map((row) => ({
+        ...toDomainAdjustment(row),
+        productName: row.product.translations[0]?.name ?? "",
+      }));
+
+      return { items, total, page, pageSize };
     },
   };
 }
