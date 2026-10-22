@@ -160,6 +160,16 @@ function makeFakeInventoryRepository(
     async getProductAvailability(productId: string) {
       return availabilityByProductId[productId] ?? null;
     },
+    async getProductsAvailability(productIds: string[]) {
+      const result = new Map<string, ProductAvailability>();
+      for (const productId of productIds) {
+        const availability = availabilityByProductId[productId];
+        if (availability) {
+          result.set(productId, availability);
+        }
+      }
+      return result;
+    },
     async listLowStockProducts() {
       throw new Error("not used by these tests");
     },
@@ -230,6 +240,62 @@ describe("listAdminInventory", () => {
       available: null,
       lowStock: false,
     });
+  });
+
+  it("Chat 3 Finding 3 (MEDIUM): fetches availability for the whole page in one batched call, never one call per product", async () => {
+    const productRepository = makeFakeProductRepository({
+      listPage: {
+        items: [makeListItem({ id: "product-1" }), makeListItem({ id: "product-2" })],
+        total: 2,
+        page: 1,
+        pageSize: 20,
+      },
+    });
+    let getProductAvailabilityCalls = 0;
+    const getProductsAvailabilityCalls: string[][] = [];
+    const inventoryRepository: InventoryRepository = {
+      ...makeFakeInventoryRepository({}),
+      async getProductAvailability() {
+        getProductAvailabilityCalls += 1;
+        return null;
+      },
+      async getProductsAvailability(productIds: string[]) {
+        getProductsAvailabilityCalls.push(productIds);
+        return new Map([
+          [
+            "product-1",
+            {
+              productId: "product-1",
+              trackInventory: true,
+              stockQuantity: 10,
+              reserved: 2,
+              available: 8,
+            },
+          ],
+          [
+            "product-2",
+            {
+              productId: "product-2",
+              trackInventory: false,
+              stockQuantity: 0,
+              reserved: 0,
+              available: null,
+            },
+          ],
+        ]);
+      },
+    };
+
+    const page = await listAdminInventory(productRepository, inventoryRepository, {
+      page: 1,
+      pageSize: 20,
+    });
+
+    expect(getProductAvailabilityCalls).toBe(0);
+    expect(getProductsAvailabilityCalls).toEqual([["product-1", "product-2"]]);
+    expect(page.items).toHaveLength(2);
+    expect(page.items[0]).toMatchObject({ productId: "product-1", available: 8 });
+    expect(page.items[1]).toMatchObject({ productId: "product-2", available: null });
   });
 
   it("passes search through to the product repository's filter", async () => {

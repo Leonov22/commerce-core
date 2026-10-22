@@ -115,7 +115,16 @@ export type SetTrackInventoryResult =
    */
   | { outcome: "activeReservationsExist"; reserved: number }
   | { outcome: "wouldGoNegative"; currentStockQuantity: number }
-  | { outcome: "belowActiveReservations"; currentStockQuantity: number; activeReserved: number };
+  | { outcome: "belowActiveReservations"; currentStockQuantity: number; activeReserved: number }
+  /**
+   * Chat 3 Finding 1 (HIGH): only possible on the enable-with-
+   * `initialQuantity` path. The ACTUAL delta, computed from the
+   * row-locked `stockQuantity` (never a caller's own, possibly stale,
+   * pre-check), is nonzero, but no non-empty `reason` was supplied.
+   * Nothing is written when this is returned — `trackInventory` is not
+   * flipped, `stockQuantity` is not changed, no audit row is created.
+   */
+  | { outcome: "reasonRequired" };
 
 export interface RecordInventoryExceptionInput {
   reservationId: string;
@@ -227,6 +236,19 @@ export interface InventoryRepository {
 
   /** `null` if no product exists with this id. */
   getProductAvailability(productId: string): Promise<ProductAvailability | null>;
+
+  /**
+   * Chat 3 Finding 3 (MEDIUM): the same calculation `getProductAvailability`
+   * performs per product, batched into (at most) two queries total for
+   * the whole given set — one bounded `IN (...)` read of the products
+   * themselves, one bounded `groupBy` aggregate of their reservations —
+   * instead of one `getProductAvailability` call (itself up to two
+   * queries) per product. Mirrors `listLowStockProducts`'s own existing
+   * `groupBy` batching; introduces no new calculation, only batches the
+   * existing one. A product id with no matching row is simply absent
+   * from the returned map — never a null/placeholder entry.
+   */
+  getProductsAvailability(productIds: string[]): Promise<Map<string, ProductAvailability>>;
 
   /** Every *tracked* product whose computed `available` is at or below `threshold`, ascending by `available`. */
   listLowStockProducts(threshold: number): Promise<ProductAvailability[]>;

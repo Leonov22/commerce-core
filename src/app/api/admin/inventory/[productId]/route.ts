@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { Prisma } from "@/generated/prisma/client";
 import { getCurrentUser, isAdminUser } from "@/modules/identity";
 import { getAdminInventoryProduct, setProductTrackInventory } from "@/modules/catalog";
 
@@ -100,6 +101,12 @@ export async function PATCH(request: Request, { params }: RouteParams) {
         return result satisfies never;
     }
   } catch (error) {
+    // Finding 6 backstop — see the `/adjust` route's own identical catch
+    // for why this exists alongside (not instead of) the application
+    // layer's own best-effort bound check.
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2020") {
+      return NextResponse.json({ error: "INITIAL_QUANTITY_OUT_OF_RANGE" }, { status: 400 });
+    }
     console.error("[api/admin/inventory/[productId]] failed to update tracking", error);
     return NextResponse.json({ error: "INTERNAL_ERROR" }, { status: 500 });
   }

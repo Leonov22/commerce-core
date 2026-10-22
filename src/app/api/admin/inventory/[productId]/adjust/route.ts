@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { Prisma } from "@/generated/prisma/client";
 import { getCurrentUser, isAdminUser } from "@/modules/identity";
 import { adjustProductStock } from "@/modules/catalog";
 
@@ -79,6 +80,16 @@ export async function POST(request: Request, { params }: RouteParams) {
         return result satisfies never;
     }
   } catch (error) {
+    // Finding 6 backstop: the application layer already validates both
+    // the requested delta and (when the product's current count is
+    // readable) the resulting total against Postgres's `integer` range
+    // before ever calling the repository — this only catches whatever
+    // that best-effort, necessarily non-atomic check could not, so a
+    // genuine database-level range violation still reports a clean 400
+    // rather than leaking as a generic 500.
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2020") {
+      return NextResponse.json({ error: "RESULTING_STOCK_QUANTITY_OUT_OF_RANGE" }, { status: 400 });
+    }
     console.error("[api/admin/inventory/[productId]/adjust] failed to adjust stock", error);
     return NextResponse.json({ error: "INTERNAL_ERROR" }, { status: 500 });
   }

@@ -1,11 +1,20 @@
 import "dotenv/config";
 import { afterAll, describe, expect, it } from "vitest";
+import { Prisma } from "@/generated/prisma/client";
 import {
   prismaInventoryRepository,
   createPrismaInventoryRepository,
 } from "@/modules/catalog/infrastructure/prisma-inventory-repository";
 import { prisma } from "@/modules/catalog/infrastructure/prisma-client";
 import type { ReserveStockResult } from "@/modules/catalog/repositories/inventory-repository";
+
+/** Matches the exact shape Prisma 7 actually throws for a Postgres deadlock, captured by direct reproduction while developing Finding 2's fix — see this file's own "lock order" section for the full analysis. */
+function makeDeadlockError(): Prisma.PrismaClientKnownRequestError {
+  return new Prisma.PrismaClientKnownRequestError(
+    "Database error. Code: `40P01`. Message: `deadlock detected`",
+    { code: "P2039", clientVersion: "test" },
+  );
+}
 
 /**
  * Integration tests against the real Postgres database — concurrency
@@ -15,6 +24,45 @@ import type { ReserveStockResult } from "@/modules/catalog/repositories/inventor
  * rows. See `prisma-inventory-repository.ts`'s own doc comment for the
  * locking protocol these tests are proving.
  */
+
+/**
+ * Chat 3 Finding 4 (MEDIUM): polls Postgres's own `pg_locks` system view
+ * — never a fixed sleep — for a real, currently-waiting
+ * `transactionid` lock request. That specific lock type is exactly
+ * what a second transaction's blocked `SELECT ... FOR UPDATE` shows up
+ * as while it waits for the row-locking transaction's XID to finish
+ * (Postgres implements row-level lock waits this way internally). A
+ * test using this resolves only once Postgres itself confirms another
+ * backend has actually reached and is genuinely blocked at its
+ * intended lock-wait point — never merely "probably enough time has
+ * passed." Throws (failing the test with a clear message, not a false
+ * pass) if nothing is observed waiting within `timeoutMs`.
+ */
+async function waitUntilAnotherTransactionIsBlockedOnARowLock(
+  options: { timeoutMs?: number; pollIntervalMs?: number } = {},
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? 5000;
+  const pollIntervalMs = options.pollIntervalMs ?? 20;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const rows = await prisma.$queryRaw<{ count: bigint }[]>`
+      SELECT count(*)::bigint AS count
+      FROM pg_locks
+      WHERE locktype = 'transactionid' AND granted = false
+    `;
+    if (Number(rows[0]?.count ?? 0) > 0) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+
+  throw new Error(
+    "waitUntilAnotherTransactionIsBlockedOnARowLock: no backend was observed waiting on a " +
+      "transactionid lock within the timeout — the test is not exercising the intended " +
+      "lock-wait window, and the assertions that follow would not be deterministic.",
+  );
+}
 describe("prismaInventoryRepository", () => {
   const createdProductIds: string[] = [];
 
@@ -416,6 +464,96 @@ describe("prismaInventoryRepository", () => {
       const result = await prismaInventoryRepository.consumeReservation(testOrderId(), product.id);
       expect(result).toEqual({ outcome: "notFound" });
     });
+
+    // Chat 3 Finding 2 (MEDIUM) — root-cause fix. `consumeReservation`
+    // used to lock a `stockReservation` row BEFORE the `products` row —
+    // the reverse of `setTrackInventory`'s own order (product row,
+    // then `stockReservation` rows) — which was directly reproduced as
+    // a real Postgres `40P01` deadlock whenever a reservation sat right
+    // at its expiry boundary (see this file's git history / this
+    // round's own report for the captured error text). Reproducing that
+    // exact boundary deterministically is what made the original
+    // regression test flaky: it depended on a genuine race between two
+    // transactions' independent wall-clock reads, which no amount of
+    // `pg_locks` polling on ITS OWN can pin to a single instant. The fix
+    // itself removes that dependency entirely — `consumeReservation` now
+    // takes the SAME `products` row lock FIRST, unconditionally, so
+    // whichever of the two operations asks for it first simply makes
+    // the other wait (ordinary blocking, not a cycle), regardless of
+    // any reservation's expiry timing. This test proves exactly that
+    // mechanism, deterministically: it forces a real, uncommitted
+    // `setTrackInventory` transaction to hold the product lock, proves
+    // via Postgres's own `pg_locks` that a concurrent, completely
+    // unmodified, production `consumeReservation` call is genuinely
+    // blocked waiting for it (never a sleep), then releases the holder
+    // and confirms the waiter proceeds to completion with no deadlock
+    // and the correct final state. No hook was added to
+    // `consumeReservation` itself to build this — the existing,
+    // already-reviewed `beforeInitialStockAdjustmentInsert` hook on the
+    // LOCK-HOLDING side was sufficient.
+    it("Chat 3 Finding 2 (MEDIUM): a concurrent consumeReservation call waits cleanly for setTrackInventory's product-row lock instead of risking a reverse-order deadlock", async () => {
+      const product = await createTestProduct({ trackInventory: false, stockQuantity: 0 });
+      const orderId = testOrderId();
+      await prisma.stockReservation.create({
+        data: {
+          orderId,
+          productId: product.id,
+          quantity: 5,
+          status: "ACTIVE",
+          expiresAt: new Date(Date.now() + 60_000),
+        },
+      });
+
+      const box: {
+        consumeReservationPromise: Promise<
+          Awaited<ReturnType<typeof prismaInventoryRepository.consumeReservation>>
+        > | null;
+      } = { consumeReservationPromise: null };
+
+      const testRepository = createPrismaInventoryRepository({
+        beforeInitialStockAdjustmentInsert: async () => {
+          // At this point `setTrackInventory`'s transaction already
+          // holds the product row's `FOR UPDATE` lock, uncommitted.
+          // Firing the real, unmodified `consumeReservation` here (on
+          // the shared production repository, a separate connection)
+          // and not awaiting it yet is what lets the assertion below
+          // prove it is genuinely blocked on that SAME lock, not on the
+          // `stockReservation` row it will eventually also touch.
+          box.consumeReservationPromise = prismaInventoryRepository.consumeReservation(
+            orderId,
+            product.id,
+          );
+          await waitUntilAnotherTransactionIsBlockedOnARowLock();
+        },
+      });
+
+      const enableResult = await testRepository.setTrackInventory({
+        productId: product.id,
+        trackInventory: true,
+        initialQuantity: 10,
+        reason: "Initial stock count",
+      });
+      expect(enableResult.outcome).toBe("updated");
+      if (enableResult.outcome !== "updated") throw new Error("unreachable");
+      expect(enableResult.stockQuantity).toBe(10);
+
+      if (!box.consumeReservationPromise) {
+        throw new Error("the hook never fired — test is not exercising the intended window");
+      }
+      // The decisive assertion: this resolves at all (no deadlock error
+      // was thrown by either side) and reports the reservation as
+      // consumed against the now-fully-initialized stock.
+      const consumeResult = await box.consumeReservationPromise;
+      expect(consumeResult.outcome).toBe("consumed");
+
+      const finalProduct = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
+      expect(finalProduct.stockQuantity).toBe(5); // 10 initialized - 5 consumed
+
+      const reservation = await prisma.stockReservation.findUniqueOrThrow({
+        where: { orderId_productId: { orderId, productId: product.id } },
+      });
+      expect(reservation.status).toBe("CONSUMED");
+    });
   });
 
   describe("expiration versus consumption race", () => {
@@ -810,6 +948,101 @@ describe("prismaInventoryRepository", () => {
     });
   });
 
+  // Chat 3 Finding 3 (MEDIUM): batched availability, proven to match
+  // `getProductAvailability`'s own per-product calculation exactly.
+  describe("getProductsAvailability", () => {
+    it("matches getProductAvailability's own result for a tracked product with an active reservation", async () => {
+      const product = await createTestProduct({ trackInventory: true, stockQuantity: 10 });
+      await prismaInventoryRepository.reserveStock({
+        orderId: testOrderId(),
+        productId: product.id,
+        quantity: 4,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+
+      const single = await prismaInventoryRepository.getProductAvailability(product.id);
+      const batched = await prismaInventoryRepository.getProductsAvailability([product.id]);
+
+      expect(batched.get(product.id)).toEqual(single);
+      expect(batched.get(product.id)).toEqual({
+        productId: product.id,
+        trackInventory: true,
+        stockQuantity: 10,
+        reserved: 4,
+        available: 6,
+      });
+    });
+
+    it("matches getProductAvailability's own result for a tracked product whose only reservation has expired (reserved: 0)", async () => {
+      const product = await createTestProduct({ trackInventory: true, stockQuantity: 10 });
+      await prismaInventoryRepository.reserveStock({
+        orderId: testOrderId(),
+        productId: product.id,
+        quantity: 4,
+        expiresAt: new Date(Date.now() - 1), // already expired
+      });
+
+      const single = await prismaInventoryRepository.getProductAvailability(product.id);
+      const batched = await prismaInventoryRepository.getProductsAvailability([product.id]);
+
+      expect(batched.get(product.id)).toEqual(single);
+      expect(batched.get(product.id)).toEqual({
+        productId: product.id,
+        trackInventory: true,
+        stockQuantity: 10,
+        reserved: 0,
+        available: 10,
+      });
+    });
+
+    it("matches getProductAvailability's own result for an untracked product (available: null)", async () => {
+      const product = await createTestProduct({ trackInventory: false, stockQuantity: 7 });
+
+      const single = await prismaInventoryRepository.getProductAvailability(product.id);
+      const batched = await prismaInventoryRepository.getProductsAvailability([product.id]);
+
+      expect(batched.get(product.id)).toEqual(single);
+      expect(batched.get(product.id)).toEqual({
+        productId: product.id,
+        trackInventory: false,
+        stockQuantity: 7,
+        reserved: 0,
+        available: null,
+      });
+    });
+
+    it("batches multiple products in one call, each matching its own getProductAvailability result, and omits nonexistent ids entirely", async () => {
+      const tracked = await createTestProduct({ trackInventory: true, stockQuantity: 20 });
+      await prismaInventoryRepository.reserveStock({
+        orderId: testOrderId(),
+        productId: tracked.id,
+        quantity: 5,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      const untracked = await createTestProduct({ trackInventory: false, stockQuantity: 3 });
+
+      const batched = await prismaInventoryRepository.getProductsAvailability([
+        tracked.id,
+        untracked.id,
+        "does-not-exist",
+      ]);
+
+      expect(batched.size).toBe(2);
+      expect(batched.get(tracked.id)).toEqual(
+        await prismaInventoryRepository.getProductAvailability(tracked.id),
+      );
+      expect(batched.get(untracked.id)).toEqual(
+        await prismaInventoryRepository.getProductAvailability(untracked.id),
+      );
+      expect(batched.has("does-not-exist")).toBe(false);
+    });
+
+    it("returns an empty map for an empty input, without querying", async () => {
+      const batched = await prismaInventoryRepository.getProductsAvailability([]);
+      expect(batched.size).toBe(0);
+    });
+  });
+
   describe("listLowStockProducts", () => {
     it("returns only tracked products at or below the threshold, ascending by available", async () => {
       const low = await createTestProduct({ stockQuantity: 2 });
@@ -978,6 +1211,40 @@ describe("prismaInventoryRepository", () => {
         expect(history.total).toBe(0);
       });
 
+      it("Chat 3 Finding 1 (HIGH): requires a reason computed from the REAL, row-locked stock — not whatever a stale pre-check assumed — and writes nothing when it's missing", async () => {
+        // Simulates the exact scenario Chat 3 flagged: a caller's own
+        // pre-check reads `stockQuantity: 10`, sees `initialQuantity: 10`
+        // matches it, and concludes no reason is needed — but a
+        // DIFFERENT, concurrent write (any direct `adjustStock` call;
+        // nothing requires `trackInventory` to be true for that) changes
+        // the real on-hand count to 15 before this call ever acquires
+        // its row lock. The ACTUAL delta is therefore -5, not 0.
+        const product = await createTestProduct({ trackInventory: false, stockQuantity: 10 });
+        await prisma.product.update({ where: { id: product.id }, data: { stockQuantity: 15 } });
+
+        const result = await prismaInventoryRepository.setTrackInventory({
+          productId: product.id,
+          trackInventory: true,
+          initialQuantity: 10, // matches the STALE read of 10, not the real 15
+          // no reason supplied — exactly what a caller relying on the
+          // stale pre-check would have omitted
+        });
+
+        expect(result).toEqual({ outcome: "reasonRequired" });
+
+        // Nothing was written: not the flag, not the stock, no audit row.
+        const availability = await prismaInventoryRepository.getProductAvailability(product.id);
+        expect(availability?.trackInventory).toBe(false);
+        expect(availability?.stockQuantity).toBe(15);
+
+        const history = await prismaInventoryRepository.listStockAdjustments({
+          filter: { productId: product.id },
+          page: 1,
+          pageSize: 10,
+        });
+        expect(history.total).toBe(0);
+      });
+
       it("refuses a negative resulting stock quantity, writing neither the flag nor the stock", async () => {
         // Structurally this outcome can't arise through the sanctioned
         // admin flow (initialQuantity is always validated >= 0 before
@@ -996,6 +1263,7 @@ describe("prismaInventoryRepository", () => {
           productId: product.id,
           trackInventory: true,
           initialQuantity: -5,
+          reason: "test",
         });
         expect(result).toEqual({ outcome: "wouldGoNegative", currentStockQuantity: 10 });
 
@@ -1035,6 +1303,7 @@ describe("prismaInventoryRepository", () => {
           productId: product.id,
           trackInventory: true,
           initialQuantity: 3,
+          reason: "test",
         });
         expect(result).toEqual({
           outcome: "belowActiveReservations",
@@ -1061,6 +1330,7 @@ describe("prismaInventoryRepository", () => {
           productId: product.id,
           trackInventory: true,
           initialQuantity: 3,
+          reason: "test",
         });
         expect(result.outcome).toBe("updated");
         if (result.outcome !== "updated") throw new Error("unreachable");
@@ -1101,6 +1371,98 @@ describe("prismaInventoryRepository", () => {
         expect(history.total).toBe(0);
       });
 
+      // Chat 3 Finding 2 (MEDIUM) mitigation: `setTrackInventory`'s
+      // bounded retry on recognized, retryable Postgres errors.
+      // `beforeInitialStockAdjustmentInsert` is reused here purely as an
+      // injection point for a *simulated* error of the exact shape
+      // directly observed by reproducing the real deadlock (see this
+      // file's own "lock order" analysis above and this round's report)
+      // — it is not re-proving the deadlock itself, only this method's
+      // own reaction to that specific, recognized failure mode.
+      describe("bounded retry on a recognized deadlock/serialization error", () => {
+        it("retries up to the bound and succeeds once the error stops recurring, committing exactly once", async () => {
+          const product = await createTestProduct({ trackInventory: false, stockQuantity: 0 });
+          let attempts = 0;
+          const testRepository = createPrismaInventoryRepository({
+            beforeInitialStockAdjustmentInsert: async () => {
+              attempts += 1;
+              if (attempts < 3) {
+                throw makeDeadlockError();
+              }
+            },
+          });
+
+          const result = await testRepository.setTrackInventory({
+            productId: product.id,
+            trackInventory: true,
+            initialQuantity: 10,
+            reason: "test",
+          });
+
+          expect(result.outcome).toBe("updated");
+          expect(attempts).toBe(3);
+
+          // Each retried attempt re-runs the whole transaction from
+          // scratch; the two that threw rolled back entirely (no
+          // partial writes to accumulate), so only the attempt that
+          // actually committed leaves exactly one audit row behind.
+          const history = await prismaInventoryRepository.listStockAdjustments({
+            filter: { productId: product.id },
+            page: 1,
+            pageSize: 10,
+          });
+          expect(history.total).toBe(1);
+        });
+
+        it("never retries an error that is not one of the two recognized, retryable codes", async () => {
+          const product = await createTestProduct({ trackInventory: false, stockQuantity: 0 });
+          let attempts = 0;
+          const testRepository = createPrismaInventoryRepository({
+            beforeInitialStockAdjustmentInsert: async () => {
+              attempts += 1;
+              throw new Prisma.PrismaClientKnownRequestError("Unique constraint failed", {
+                code: "P2002",
+                clientVersion: "test",
+              });
+            },
+          });
+
+          await expect(
+            testRepository.setTrackInventory({
+              productId: product.id,
+              trackInventory: true,
+              initialQuantity: 10,
+              reason: "test",
+            }),
+          ).rejects.toThrow("Unique constraint failed");
+          expect(attempts).toBe(1);
+        });
+
+        it("gives up and propagates the error once the retry bound is exhausted", async () => {
+          const product = await createTestProduct({ trackInventory: false, stockQuantity: 0 });
+          let attempts = 0;
+          const testRepository = createPrismaInventoryRepository({
+            beforeInitialStockAdjustmentInsert: async () => {
+              attempts += 1;
+              throw makeDeadlockError();
+            },
+          });
+
+          await expect(
+            testRepository.setTrackInventory({
+              productId: product.id,
+              trackInventory: true,
+              initialQuantity: 10,
+              reason: "test",
+            }),
+          ).rejects.toThrow(/40P01/);
+          expect(attempts).toBe(3);
+
+          const availability = await prismaInventoryRepository.getProductAvailability(product.id);
+          expect(availability?.trackInventory).toBe(false);
+        });
+      });
+
       it("a concurrent reserveStock call can never observe trackInventory=true paired with the pre-initialization stock — it is blocked by the same row lock until the enabling transaction commits", async () => {
         const product = await createTestProduct({ trackInventory: false, stockQuantity: 0 });
         const orderId = testOrderId();
@@ -1126,11 +1488,13 @@ describe("prismaInventoryRepository", () => {
               quantity: 20,
               expiresAt: new Date(Date.now() + 60_000),
             });
-            // Give the now-blocked call a moment to actually reach and
-            // block on the lock, so this transaction's own commit
-            // (immediately after this hook returns) is genuinely what
-            // unblocks it, not a lucky ordering.
-            await new Promise((resolve) => setTimeout(resolve, 50));
+            // Chat 3 Finding 4: proves, via Postgres's own `pg_locks`,
+            // that the call above has actually reached and is genuinely
+            // blocked at its own `FOR UPDATE` statement — not a fixed
+            // sleep standing in for that proof. This transaction's own
+            // commit (immediately after this hook returns) is therefore
+            // provably what unblocks it, not a lucky timing guess.
+            await waitUntilAnotherTransactionIsBlockedOnARowLock();
           },
         });
 

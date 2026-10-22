@@ -59,22 +59,29 @@ export async function listAdminInventory(
     pageSize,
   });
 
-  const items = await Promise.all(
-    products.map(async (product) => {
-      const availability = await inventoryRepository.getProductAvailability(product.id);
-      const available = availability?.available ?? null;
-      return {
-        productId: product.id,
-        name: product.name,
-        slug: product.slug,
-        trackInventory: availability?.trackInventory ?? false,
-        stockQuantity: availability?.stockQuantity ?? 0,
-        reserved: availability?.reserved ?? 0,
-        available,
-        lowStock: available !== null && available <= LOW_STOCK_THRESHOLD,
-      };
-    }),
+  // Chat 3 Finding 3 (MEDIUM): one batched call for this page's
+  // products — bounded by `pageSize`, never the full catalog — instead
+  // of one `getProductAvailability` call per listed product. Same
+  // calculation, same semantics; see `getProductsAvailability`'s own
+  // doc comment.
+  const availabilityByProductId = await inventoryRepository.getProductsAvailability(
+    products.map((product) => product.id),
   );
+
+  const items = products.map((product) => {
+    const availability = availabilityByProductId.get(product.id);
+    const available = availability?.available ?? null;
+    return {
+      productId: product.id,
+      name: product.name,
+      slug: product.slug,
+      trackInventory: availability?.trackInventory ?? false,
+      stockQuantity: availability?.stockQuantity ?? 0,
+      reserved: availability?.reserved ?? 0,
+      available,
+      lowStock: available !== null && available <= LOW_STOCK_THRESHOLD,
+    };
+  });
 
   return { items, total, page, pageSize };
 }

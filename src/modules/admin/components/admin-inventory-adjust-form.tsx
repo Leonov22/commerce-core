@@ -22,6 +22,21 @@ type Direction = "increase" | "decrease";
  * change is required before the request is sent, and the submit button
  * is disabled for the duration of the request to prevent a double
  * submission from one click (or from pressing Enter twice).
+ *
+ * Chat 3 Finding 5 (MEDIUM): there is no durable, server-side
+ * deduplication of a submission (no client-generated request id is
+ * persisted anywhere — `StockAdjustment` has no column for one today,
+ * and adding one is a schema change out of scope for this round; see
+ * this round's own report for the proposed addition). What this form
+ * CAN do without one is make the one genuinely ambiguous case — a
+ * `fetch` that throws, meaning the request may or may not have reached
+ * and been applied by the server — impossible to casually retry past:
+ * `hasUnknownOutcome` gates a second, explicit confirmation naming that
+ * ambiguity before a resubmission with the same inputs is allowed, and
+ * the page is refreshed even on this failure path so the stock history
+ * below reflects whatever the server actually did, for the admin to
+ * check before deciding. This is honest, UI-level risk disclosure, not
+ * a substitute for real idempotency.
  */
 export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustFormProps) {
   const router = useRouter();
@@ -30,6 +45,7 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
   const [reason, setReason] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorCode, setErrorCode] = useState<string | null>(null);
+  const [hasUnknownOutcome, setHasUnknownOutcome] = useState(false);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -48,6 +64,17 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
     }
 
     const quantityChange = direction === "increase" ? parsedQuantity : -parsedQuantity;
+
+    if (hasUnknownOutcome) {
+      const acknowledgedRisk = window.confirm(
+        "The previous attempt's outcome is unknown — it may already have been applied. " +
+          "Check the stock history below before continuing. Submit this adjustment anyway?",
+      );
+      if (!acknowledgedRisk) {
+        return;
+      }
+    }
+
     const confirmed = window.confirm(
       `${direction === "increase" ? "Increase" : "Decrease"} stock by ${parsedQuantity} unit(s)? This will be recorded in the stock history.`,
     );
@@ -65,13 +92,24 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
       if (!response.ok) {
         const data: { error?: string } = await response.json().catch(() => ({}));
         setErrorCode(data.error ?? "UNKNOWN_ERROR");
+        // The server responded (even if with an error), so this
+        // outcome is known — a prior "unknown" state is now resolved.
+        setHasUnknownOutcome(false);
         return;
       }
       setQuantity("");
       setReason("");
+      setHasUnknownOutcome(false);
       router.refresh();
     } catch {
       setErrorCode("NETWORK_ERROR");
+      // Genuinely ambiguous: the request may have reached the server
+      // and been applied despite this client never seeing a response.
+      setHasUnknownOutcome(true);
+      // Refresh anyway — if the adjustment actually went through, the
+      // stock/history below will already show it, which is the admin's
+      // best evidence for deciding whether to resubmit.
+      router.refresh();
     } finally {
       setIsSubmitting(false);
     }
@@ -83,6 +121,15 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
       className="flex flex-col gap-3 rounded-md border border-border p-4"
     >
       <h3 className="text-sm font-medium">Adjust stock</h3>
+      {hasUnknownOutcome ? (
+        <div
+          role="alert"
+          className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-sm text-amber-700 dark:text-amber-400"
+        >
+          The last attempt&rsquo;s outcome is unknown — the request may already have been applied.
+          Check the stock history below before submitting again.
+        </div>
+      ) : null}
       {errorCode ? (
         <div
           role="alert"

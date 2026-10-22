@@ -130,6 +130,14 @@ function makeFakeRepository(
         };
       }
 
+      // Finding 1: checked against the REAL `quantityChange` computed
+      // just above from this fake's own current state — not whatever
+      // the caller assumed — mirroring the real repository's own
+      // row-locked re-check.
+      if (!reason || reason.trim().length === 0) {
+        return { outcome: "reasonRequired" };
+      }
+
       const newStockQuantity = state.stockQuantity + quantityChange;
       if (newStockQuantity < 0) {
         return { outcome: "wouldGoNegative", currentStockQuantity: state.stockQuantity };
@@ -173,6 +181,9 @@ function makeFakeRepository(
         reserved: state.reserved,
         available: state.trackInventory ? state.stockQuantity - state.reserved : null,
       };
+    },
+    async getProductsAvailability() {
+      throw new Error("not used by these tests");
     },
     async listLowStockProducts() {
       throw new Error("not used by these tests");
@@ -301,6 +312,32 @@ describe("setProductTrackInventory", () => {
     expect(result).toEqual({ outcome: "invalidInput", error: "INVALID_INITIAL_QUANTITY" });
   });
 
+  it("Chat 3 Finding 6 (LOW): rejects an initial quantity outside the Postgres integer range", async () => {
+    const { repository } = makeFakeRepository({
+      product: { id: "product-1", trackInventory: false, stockQuantity: 0, reserved: 0 },
+    });
+    const result = await setProductTrackInventory(
+      repository,
+      "product-1",
+      { trackInventory: true, initialQuantity: 2147483648 }, // one past int4 max
+      "admin-1",
+    );
+    expect(result).toEqual({ outcome: "invalidInput", error: "INITIAL_QUANTITY_OUT_OF_RANGE" });
+  });
+
+  it("Chat 3 Finding 6 (LOW): rejects an initial quantity that is not a safe integer", async () => {
+    const { repository } = makeFakeRepository({
+      product: { id: "product-1", trackInventory: false, stockQuantity: 0, reserved: 0 },
+    });
+    const result = await setProductTrackInventory(
+      repository,
+      "product-1",
+      { trackInventory: true, initialQuantity: Number.MAX_SAFE_INTEGER + 10 },
+      "admin-1",
+    );
+    expect(result).toEqual({ outcome: "invalidInput", error: "INITIAL_QUANTITY_OUT_OF_RANGE" });
+  });
+
   it("refuses to enable a product that is already tracked", async () => {
     const { repository } = makeFakeRepository({
       product: { id: "product-1", trackInventory: true, stockQuantity: 5, reserved: 0 },
@@ -312,6 +349,40 @@ describe("setProductTrackInventory", () => {
       "admin-1",
     );
     expect(result).toEqual({ outcome: "alreadyEnabled" });
+  });
+
+  it("Chat 3 Finding 1 (HIGH): maps the repository's own reasonRequired outcome to the same invalidInput error, when a concurrent write makes this function's own pre-check stale", async () => {
+    const { repository } = makeFakeRepository({
+      product: { id: "product-1", trackInventory: false, stockQuantity: 15, reserved: 0 },
+    });
+    // This function's own pre-check calls `getProductAvailability`
+    // first and decides, from THAT read, whether a reason is required.
+    // Here it is handed a deliberately stale snapshot (`stockQuantity:
+    // 10`) while the repository's real, authoritative state is 15 —
+    // simulating a concurrent write landing between the pre-check and
+    // the actual `setTrackInventory` call. `initialQuantity: 10`
+    // therefore looks like a zero delta to the stale pre-check (no
+    // reason required) but is a real delta of -5 once the repository
+    // re-derives it from its own state.
+    const staleRepository: InventoryRepository = {
+      ...repository,
+      async getProductAvailability(productId) {
+        const real = await repository.getProductAvailability(productId);
+        return real ? { ...real, stockQuantity: 10 } : real;
+      },
+    };
+
+    const result = await setProductTrackInventory(
+      staleRepository,
+      "product-1",
+      { trackInventory: true, initialQuantity: 10 },
+      "admin-1",
+    );
+
+    expect(result).toEqual({
+      outcome: "invalidInput",
+      error: "MISSING_REASON_FOR_INITIAL_QUANTITY",
+    });
   });
 
   it("disables tracking for a tracked product with no active reservations", async () => {
@@ -383,6 +454,38 @@ describe("adjustProductStock", () => {
       "admin-1",
     );
     expect(result).toEqual({ ok: false, error: "INVALID_QUANTITY_CHANGE" });
+  });
+
+  it("Chat 3 Finding 6 (LOW): rejects a quantity change outside the Postgres integer range", async () => {
+    const { repository } = makeFakeRepository();
+    const result = await adjustProductStock(
+      repository,
+      { productId: "product-1", quantityChange: -2147483649, reason: "test" }, // one past int4 min
+      "admin-1",
+    );
+    expect(result).toEqual({ ok: false, error: "QUANTITY_CHANGE_OUT_OF_RANGE" });
+  });
+
+  it("Chat 3 Finding 6 (LOW): rejects when the resulting stock quantity would exceed the Postgres integer range", async () => {
+    const { repository } = makeFakeRepository({
+      product: { id: "product-1", trackInventory: true, stockQuantity: 2147483640, reserved: 0 },
+    });
+    const result = await adjustProductStock(
+      repository,
+      { productId: "product-1", quantityChange: 100, reason: "test" }, // 2147483640 + 100 > int4 max
+      "admin-1",
+    );
+    expect(result).toEqual({ ok: false, error: "RESULTING_STOCK_QUANTITY_OUT_OF_RANGE" });
+  });
+
+  it("Chat 3 Finding 6 (LOW): skips the resulting-quantity check for a nonexistent product, letting the repository's own productNotFound surface unchanged", async () => {
+    const { repository } = makeFakeRepository();
+    const result = await adjustProductStock(
+      repository,
+      { productId: "does-not-exist", quantityChange: 5, reason: "test" },
+      "admin-1",
+    );
+    expect(result).toEqual({ ok: true, result: { outcome: "productNotFound" } });
   });
 
   it("requires a non-empty reason", async () => {

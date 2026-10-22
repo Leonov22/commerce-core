@@ -46,13 +46,18 @@ import type {
  *    never be acquired in conflicting order — deadlock between these
  *    operations is structurally impossible, not just unlikely.
  * 3. Every operation that targets ONE already-identified row by its own
- *    key (`consumeReservation`, `releaseReservation`,
- *    `securePaymentWindow`'s per-item touch) needs no product lock: it is
- *    a single conditional `UPDATE ... WHERE id = ... AND status = ...`,
- *    safe via Postgres's own per-row locking. Two such operations for
- *    DIFFERENT orders can never target the same row at all (a
- *    reservation is keyed by `(orderId, productId)`), so there is no
- *    lock-ordering concern between them either.
+ *    key (`releaseReservation`, `securePaymentWindow`'s per-item touch)
+ *    needs no product lock: it is a single conditional
+ *    `UPDATE ... WHERE id = ... AND status = ...`, safe via Postgres's
+ *    own per-row locking. Two such operations for DIFFERENT orders can
+ *    never target the same row at all (a reservation is keyed by
+ *    `(orderId, productId)`), so there is no lock-ordering concern
+ *    between them either. `consumeReservation` is the one exception:
+ *    because it also writes `stockQuantity`, it takes the SAME product
+ *    `FOR UPDATE` lock as step 1 FIRST, before touching its own
+ *    `stockReservation` row — see its own doc comment (Chat 3 Finding 2)
+ *    for why a reversed order here once produced a real, reproduced
+ *    deadlock against this file's other operations.
  * 4. Reservation expiry is never decided by filtering `expiresAt > now()`
  *    at read time alone — that cannot prevent a late webhook from
  *    consuming stock already granted to a second order (filtering
@@ -142,6 +147,51 @@ function toDomainException(row: {
 
 /** Mirrors `prisma-product-repository.ts`'s own `ADMIN_LOCALE` — this project has exactly one locale (`en`) today. */
 const STOCK_HISTORY_LOCALE = "en";
+
+/**
+ * Chat 3 Finding 2 (MEDIUM): `setTrackInventory`'s deadlock cycle
+ * against `consumeReservation` is now closed at the root — both lock
+ * the `products` row FIRST, in the same order, so the cycle that once
+ * produced a reproduced Postgres `40P01` is structurally impossible
+ * (see `consumeReservation`'s own doc comment). This retry stays as
+ * supplemental protection, exactly as instructed: it never replaces the
+ * lock-order analysis above, and it never retries any failure other
+ * than the two specific, recognized Postgres codes that mean "no data
+ * was corrupted, the transaction was aborted cleanly, try again" —
+ * 40P01 (deadlock_detected) and 40001 (serialization_failure). Those
+ * two codes are not unique to the lock-order bug just closed — Postgres
+ * can raise either one under ordinary `SERIALIZABLE`-style contention
+ * unrelated to this specific cycle — so keeping the retry is still
+ * worthwhile defense in depth, not dead code.
+ */
+const RETRYABLE_POSTGRES_ERROR_CODES = ["40P01", "40001"];
+const MAX_DEADLOCK_RETRY_ATTEMPTS = 3;
+
+function isRetryableTransactionError(error: unknown): boolean {
+  if (!(error instanceof Prisma.PrismaClientKnownRequestError)) {
+    return false;
+  }
+  return RETRYABLE_POSTGRES_ERROR_CODES.some((code) => error.message.includes(code));
+}
+
+async function runTransactionWithDeadlockRetry<T>(
+  run: () => Promise<T>,
+  maxAttempts: number = MAX_DEADLOCK_RETRY_ATTEMPTS,
+): Promise<T> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await run();
+    } catch (error) {
+      if (attempt < maxAttempts && isRetryableTransactionError(error)) {
+        continue;
+      }
+      throw error;
+    }
+  }
+  // Unreachable: the loop above always either returns or throws by the
+  // final attempt. Satisfies the compiler's control-flow analysis only.
+  throw new Error("runTransactionWithDeadlockRetry: exhausted attempts without a result");
+}
 
 /** Thrown inside `securePaymentWindow`'s transaction purely to force a rollback of any already-applied per-item extensions once a later item fails — caught immediately outside, never leaks. */
 class SecurePaymentWindowAbort extends Error {
@@ -285,6 +335,32 @@ export function createPrismaInventoryRepository(
       productId: string,
     ): Promise<ConsumeReservationResult> {
       return prisma.$transaction(async (tx) => {
+        // Chat 3 Finding 2 (MEDIUM) — root-cause fix. This used to lock
+        // one `stockReservation` row FIRST (via the conditional `UPDATE`
+        // below), then the `products` row SECOND (via the decrement
+        // further down) — the reverse of every other writer in this
+        // file, which locks `products` first and only ever touches
+        // `stockReservation` rows afterward (see this file's own
+        // top-of-file doc comment, points 1–3). That reversal created a
+        // genuine cycle with `reserveStock`/`adjustStock`/
+        // `setTrackInventory`'s own expiry sweep whenever a reservation
+        // sat right at its expiry boundary — directly reproduced as a
+        // real Postgres `40P01` deadlock (not merely theorized; see this
+        // round's report). Taking the SAME `products` row lock FIRST
+        // here, before touching the `stockReservation` row at all,
+        // restores the single, consistent lock-acquisition order every
+        // writer now shares — which, per point 2 of this file's own
+        // doc comment, makes a cross-method deadlock structurally
+        // impossible rather than just unlikely, regardless of timing.
+        // The reservation referenced by `(orderId, productId)` always
+        // belongs to a product that still exists (`StockReservation
+        // .productId` is `ON DELETE RESTRICT`), so this lock is always
+        // available to take; it changes no observable outcome below —
+        // the lookup, the conditional transition, and the decrement
+        // amount are byte-for-byte what they were before this lock was
+        // added.
+        await tx.$queryRaw`SELECT "id" FROM "products" WHERE "id" = ${productId} FOR UPDATE`;
+
         const existing = await tx.stockReservation.findUnique({
           where: { orderId_productId: { orderId, productId } },
         });
@@ -476,20 +552,106 @@ export function createPrismaInventoryRepository(
 
     async setTrackInventory(input: SetTrackInventoryInput): Promise<SetTrackInventoryResult> {
       const { productId, trackInventory, initialQuantity, reason, adminUserId } = input;
-      return prisma.$transaction(async (tx) => {
-        const locked = await tx.$queryRaw<
-          { id: string; stockQuantity: number }[]
-        >`SELECT "id", "stockQuantity" FROM "products" WHERE "id" = ${productId} FOR UPDATE`;
-        if (locked.length === 0) {
-          return { outcome: "productNotFound" as const };
-        }
-        const currentStockQuantity = locked[0]!.stockQuantity;
+      return runTransactionWithDeadlockRetry(() =>
+        prisma.$transaction(async (tx) => {
+          const locked = await tx.$queryRaw<
+            { id: string; stockQuantity: number }[]
+          >`SELECT "id", "stockQuantity" FROM "products" WHERE "id" = ${productId} FOR UPDATE`;
+          if (locked.length === 0) {
+            return { outcome: "productNotFound" as const };
+          }
+          const currentStockQuantity = locked[0]!.stockQuantity;
 
-        if (!trackInventory) {
-          // Same sweep-then-aggregate sequence `adjustStock` uses, under
-          // the same product-row lock, so a reservation that is only
-          // nominally `ACTIVE` because nothing has swept it yet can never
-          // cause a false "still has active reservations" refusal.
+          if (!trackInventory) {
+            // Same sweep-then-aggregate sequence `adjustStock` uses, under
+            // the same product-row lock, so a reservation that is only
+            // nominally `ACTIVE` because nothing has swept it yet can never
+            // cause a false "still has active reservations" refusal.
+            const now = new Date();
+            await tx.stockReservation.updateMany({
+              where: { productId, status: "ACTIVE", expiresAt: { lt: now } },
+              data: { status: "EXPIRED" },
+            });
+            const aggregate = await tx.stockReservation.aggregate({
+              where: { productId, status: "ACTIVE" },
+              _sum: { quantity: true },
+            });
+            const reserved = aggregate._sum.quantity ?? 0;
+            if (reserved > 0) {
+              return { outcome: "activeReservationsExist" as const, reserved };
+            }
+
+            await tx.product.update({ where: { id: productId }, data: { trackInventory: false } });
+            return {
+              outcome: "updated" as const,
+              trackInventory: false,
+              stockQuantity: currentStockQuantity,
+              adjustment: null,
+            };
+          }
+
+          // Enabling. `initialQuantity` is an absolute target, not a
+          // signed delta — the delta is computed here, against the
+          // row-locked `currentStockQuantity`, never against a value read
+          // by an earlier, separate call. This is what makes the flag
+          // flip and the stock write a single atomic operation: there is
+          // no gap, visible to any other transaction, in which
+          // `trackInventory` is already `true` but `stockQuantity` is
+          // still stale (the race an earlier two-transaction version of
+          // this method had — `reserveStock` takes the same `FOR UPDATE`
+          // lock on this row, so it can only ever observe this row either
+          // fully before or fully after this entire transaction commits).
+          if (initialQuantity === undefined) {
+            await tx.product.update({ where: { id: productId }, data: { trackInventory: true } });
+            return {
+              outcome: "updated" as const,
+              trackInventory: true,
+              stockQuantity: currentStockQuantity,
+              adjustment: null,
+            };
+          }
+
+          const quantityChange = initialQuantity - currentStockQuantity;
+          if (quantityChange === 0) {
+            await tx.product.update({ where: { id: productId }, data: { trackInventory: true } });
+            return {
+              outcome: "updated" as const,
+              trackInventory: true,
+              stockQuantity: currentStockQuantity,
+              adjustment: null,
+            };
+          }
+
+          // Finding 1 (Chat 3, HIGH): re-checked HERE, against the real,
+          // row-locked `currentStockQuantity` — never against whatever a
+          // caller's own pre-check assumed `stockQuantity` was before this
+          // transaction acquired its lock. A caller (e.g. the application
+          // layer) may have computed `quantityChange` as 0 from a stale
+          // read and therefore omitted `reason`, while a concurrent write
+          // to this same product (any `adjustStock` call, which never
+          // requires `trackInventory` to be true) changed the real
+          // on-hand count in between. If the ACTUAL delta is nonzero and
+          // no reason was supplied, this returns without writing anything
+          // — `trackInventory` has not been flipped yet at this point in
+          // the function, so there is nothing to roll back; the
+          // transaction simply never performs its write. An empty string
+          // is never substituted for a required reason.
+          if (!reason || reason.trim().length === 0) {
+            return { outcome: "reasonRequired" as const };
+          }
+
+          const newStockQuantity = currentStockQuantity + quantityChange;
+          if (newStockQuantity < 0) {
+            return { outcome: "wouldGoNegative" as const, currentStockQuantity };
+          }
+
+          // Same sweep-then-aggregate-then-floor sequence `adjustStock`
+          // itself uses — duplicated here, not called via a nested
+          // `prisma.$transaction`, since Prisma cannot compose an
+          // interactive transaction inside another on the same
+          // connection; calling `adjustStock` here would silently start a
+          // SECOND, independent transaction and reintroduce exactly the
+          // two-transaction race this method exists to close.
           const now = new Date();
           await tx.stockReservation.updateMany({
             where: { productId, status: "ACTIVE", expiresAt: { lt: now } },
@@ -499,116 +661,53 @@ export function createPrismaInventoryRepository(
             where: { productId, status: "ACTIVE" },
             _sum: { quantity: true },
           });
-          const reserved = aggregate._sum.quantity ?? 0;
-          if (reserved > 0) {
-            return { outcome: "activeReservationsExist" as const, reserved };
+          const activeReserved = aggregate._sum.quantity ?? 0;
+          if (newStockQuantity < activeReserved) {
+            return {
+              outcome: "belowActiveReservations" as const,
+              currentStockQuantity,
+              activeReserved,
+            };
           }
 
-          await tx.product.update({ where: { id: productId }, data: { trackInventory: false } });
-          return {
-            outcome: "updated" as const,
-            trackInventory: false,
-            stockQuantity: currentStockQuantity,
-            adjustment: null,
-          };
-        }
+          await tx.product.update({
+            where: { id: productId },
+            data: { trackInventory: true, stockQuantity: newStockQuantity },
+          });
 
-        // Enabling. `initialQuantity` is an absolute target, not a
-        // signed delta — the delta is computed here, against the
-        // row-locked `currentStockQuantity`, never against a value read
-        // by an earlier, separate call. This is what makes the flag
-        // flip and the stock write a single atomic operation: there is
-        // no gap, visible to any other transaction, in which
-        // `trackInventory` is already `true` but `stockQuantity` is
-        // still stale (the race an earlier two-transaction version of
-        // this method had — `reserveStock` takes the same `FOR UPDATE`
-        // lock on this row, so it can only ever observe this row either
-        // fully before or fully after this entire transaction commits).
-        if (initialQuantity === undefined) {
-          await tx.product.update({ where: { id: productId }, data: { trackInventory: true } });
-          return {
-            outcome: "updated" as const,
-            trackInventory: true,
-            stockQuantity: currentStockQuantity,
-            adjustment: null,
-          };
-        }
+          // Round 7: test-only hook, invoked after the combined
+          // flag-and-stock write but before the audit row is created —
+          // lets a test (a) run a REAL, unmodified `reserveStock` call
+          // concurrently from here, deterministically proving it blocks
+          // on this same row's lock until this transaction commits, and
+          // (b) throw, deterministically proving the whole transaction
+          // (including the `tx.product.update` just above) rolls back
+          // rather than partially applying. See `beforeExpirySweep`'s own
+          // doc comment for why this is a hook rather than `Promise.all`
+          // or hand-replicated SQL.
+          if (testHooks.beforeInitialStockAdjustmentInsert) {
+            await testHooks.beforeInitialStockAdjustmentInsert();
+          }
 
-        const quantityChange = initialQuantity - currentStockQuantity;
-        if (quantityChange === 0) {
-          await tx.product.update({ where: { id: productId }, data: { trackInventory: true } });
+          const adjustment = await tx.stockAdjustment.create({
+            data: {
+              productId,
+              quantityChange,
+              // Never a silent `""` fallback — the `reasonRequired` check
+              // above already guaranteed a non-empty, trimmed string
+              // whenever this line is reached.
+              reason: reason.trim(),
+              adminUserId: adminUserId ?? null,
+            },
+          });
           return {
             outcome: "updated" as const,
             trackInventory: true,
-            stockQuantity: currentStockQuantity,
-            adjustment: null,
+            stockQuantity: newStockQuantity,
+            adjustment: toDomainAdjustment(adjustment),
           };
-        }
-
-        const newStockQuantity = currentStockQuantity + quantityChange;
-        if (newStockQuantity < 0) {
-          return { outcome: "wouldGoNegative" as const, currentStockQuantity };
-        }
-
-        // Same sweep-then-aggregate-then-floor sequence `adjustStock`
-        // itself uses — duplicated here, not called via a nested
-        // `prisma.$transaction`, since Prisma cannot compose an
-        // interactive transaction inside another on the same
-        // connection; calling `adjustStock` here would silently start a
-        // SECOND, independent transaction and reintroduce exactly the
-        // two-transaction race this method exists to close.
-        const now = new Date();
-        await tx.stockReservation.updateMany({
-          where: { productId, status: "ACTIVE", expiresAt: { lt: now } },
-          data: { status: "EXPIRED" },
-        });
-        const aggregate = await tx.stockReservation.aggregate({
-          where: { productId, status: "ACTIVE" },
-          _sum: { quantity: true },
-        });
-        const activeReserved = aggregate._sum.quantity ?? 0;
-        if (newStockQuantity < activeReserved) {
-          return {
-            outcome: "belowActiveReservations" as const,
-            currentStockQuantity,
-            activeReserved,
-          };
-        }
-
-        await tx.product.update({
-          where: { id: productId },
-          data: { trackInventory: true, stockQuantity: newStockQuantity },
-        });
-
-        // Round 7: test-only hook, invoked after the combined
-        // flag-and-stock write but before the audit row is created —
-        // lets a test (a) run a REAL, unmodified `reserveStock` call
-        // concurrently from here, deterministically proving it blocks
-        // on this same row's lock until this transaction commits, and
-        // (b) throw, deterministically proving the whole transaction
-        // (including the `tx.product.update` just above) rolls back
-        // rather than partially applying. See `beforeExpirySweep`'s own
-        // doc comment for why this is a hook rather than `Promise.all`
-        // or hand-replicated SQL.
-        if (testHooks.beforeInitialStockAdjustmentInsert) {
-          await testHooks.beforeInitialStockAdjustmentInsert();
-        }
-
-        const adjustment = await tx.stockAdjustment.create({
-          data: {
-            productId,
-            quantityChange,
-            reason: reason ?? "",
-            adminUserId: adminUserId ?? null,
-          },
-        });
-        return {
-          outcome: "updated" as const,
-          trackInventory: true,
-          stockQuantity: newStockQuantity,
-          adjustment: toDomainAdjustment(adjustment),
-        };
-      });
+        }),
+      );
     },
 
     async recordInventoryException(
@@ -672,6 +771,62 @@ export function createPrismaInventoryRepository(
         reserved,
         available: product.stockQuantity - reserved,
       };
+    },
+
+    async getProductsAvailability(productIds: string[]): Promise<Map<string, ProductAvailability>> {
+      const result = new Map<string, ProductAvailability>();
+      if (productIds.length === 0) {
+        return result;
+      }
+
+      const products = await prisma.product.findMany({
+        where: { id: { in: productIds } },
+        select: { id: true, trackInventory: true, stockQuantity: true },
+      });
+
+      const trackedProductIds = products
+        .filter((product) => product.trackInventory)
+        .map((product) => product.id);
+
+      const now = new Date();
+      const grouped =
+        trackedProductIds.length > 0
+          ? await prisma.stockReservation.groupBy({
+              by: ["productId"],
+              where: {
+                productId: { in: trackedProductIds },
+                status: "ACTIVE",
+                expiresAt: { gt: now },
+              },
+              _sum: { quantity: true },
+            })
+          : [];
+      const reservedByProductId = new Map(
+        grouped.map((row) => [row.productId, row._sum.quantity ?? 0]),
+      );
+
+      for (const product of products) {
+        if (!product.trackInventory) {
+          result.set(product.id, {
+            productId: product.id,
+            trackInventory: false,
+            stockQuantity: product.stockQuantity,
+            reserved: 0,
+            available: null,
+          });
+          continue;
+        }
+        const reserved = reservedByProductId.get(product.id) ?? 0;
+        result.set(product.id, {
+          productId: product.id,
+          trackInventory: true,
+          stockQuantity: product.stockQuantity,
+          reserved,
+          available: product.stockQuantity - reserved,
+        });
+      }
+
+      return result;
     },
 
     async listLowStockProducts(threshold: number): Promise<ProductAvailability[]> {
