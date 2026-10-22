@@ -46,7 +46,7 @@ export default defineConfig({
           name: "server",
           environment: "node",
           include: ["src/**/*.test.ts"],
-          exclude: ["src/**/*.strict-mode.test.ts"],
+          exclude: ["src/**/*.strict-mode.test.ts", "src/**/*.client.test.ts"],
         },
       },
       {
@@ -62,7 +62,17 @@ export default defineConfig({
         test: {
           name: "client",
           environment: "jsdom",
-          include: ["src/**/*.strict-mode.test.ts"],
+          // `*.strict-mode.test.ts` is the original, narrowly-named file
+          // (React Strict Mode's double-invoked mount effects).
+          // `*.client.test.ts` is the general name for any OTHER test
+          // that likewise needs a real DOM and `react-dom/client` (e.g.
+          // mounting a Client Component and dispatching real DOM
+          // events) — added for Chat 3 Finding 3's
+          // `admin-inventory-adjust-form` regression tests. Both stay
+          // plain `.test.ts` (never `.test.tsx`), consistent with
+          // `cart-context.strict-mode.test.ts`'s own documented reason
+          // for using `React.createElement` instead of JSX.
+          include: ["src/**/*.strict-mode.test.ts", "src/**/*.client.test.ts"],
         },
       },
     ],

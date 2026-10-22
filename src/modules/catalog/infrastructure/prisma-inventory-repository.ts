@@ -163,13 +163,47 @@ const STOCK_HISTORY_LOCALE = "en";
  * can raise either one under ordinary `SERIALIZABLE`-style contention
  * unrelated to this specific cycle — so keeping the retry is still
  * worthwhile defense in depth, not dead code.
+ *
+ * Chat 3 Finding 4 (LOW): which top-level Prisma error CODE wraps a
+ * `40P01`/`40001` is not stable — directly, empirically reproducing a
+ * real deadlock against this project's actual `@prisma/adapter-pg`
+ * setup showed the SAME underlying Postgres error surfaces as `P2010`
+ * ("Raw query failed") when the statement Postgres chose to abort was
+ * one of this file's raw `$queryRaw ... FOR UPDATE` locks, or as
+ * `P2039` ("Database error") when it was an ORM call instead — which
+ * one occurs depends on which side of the race Postgres's own deadlock
+ * detector decided to abort, not on anything this code controls. The
+ * reliable, structured field that is present in both cases is
+ * `error.meta.driverAdapterError.cause.originalCode` — the raw
+ * Postgres SQLSTATE, set by `@prisma/adapter-pg`'s own
+ * `convertDriverError` for every error that actually came from the
+ * `pg` driver, confirmed by reading that exact installed package's
+ * source (version pinned by this repo's lockfile) and by directly
+ * reproducing a real `40P01` against it (see this round's own
+ * report for the captured object). That field is checked FIRST; the
+ * message-substring check below is kept only as a fallback for the
+ * case — not observed, but not provably impossible on some future
+ * Prisma/adapter version — where `meta.driverAdapterError` is absent.
  */
 const RETRYABLE_POSTGRES_ERROR_CODES = ["40P01", "40001"];
 const MAX_DEADLOCK_RETRY_ATTEMPTS = 3;
 
+function extractDriverAdapterOriginalCode(
+  error: Prisma.PrismaClientKnownRequestError,
+): string | undefined {
+  const meta = error.meta as
+    { driverAdapterError?: { cause?: { originalCode?: unknown } } } | undefined;
+  const originalCode = meta?.driverAdapterError?.cause?.originalCode;
+  return typeof originalCode === "string" ? originalCode : undefined;
+}
+
 function isRetryableTransactionError(error: unknown): boolean {
   if (!(error instanceof Prisma.PrismaClientKnownRequestError)) {
     return false;
+  }
+  const structuredCode = extractDriverAdapterOriginalCode(error);
+  if (structuredCode !== undefined) {
+    return RETRYABLE_POSTGRES_ERROR_CODES.includes(structuredCode);
   }
   return RETRYABLE_POSTGRES_ERROR_CODES.some((code) => error.message.includes(code));
 }
@@ -225,9 +259,13 @@ export interface PrismaInventoryRepositoryTestHooks {
    * without resorting to `Promise.all`'s non-deterministic scheduling or
    * copying this statement's SQL into the test. Exercised only by this
    * repository's own integration test, against a repository instance
-   * this factory built specifically for that one test.
+   * this factory built specifically for that one test. Receives the
+   * transaction's own `tx` client (Chat 3 Finding 1) so a test can
+   * query that SAME connection's `pg_backend_pid()` — never a
+   * different, unrelated connection's — to correlate it precisely
+   * against a concurrently-blocked backend.
    */
-  beforeExpirySweep?: () => Promise<void>;
+  beforeExpirySweep?: (tx: Prisma.TransactionClient) => Promise<void>;
 
   /**
    * Round 7 (race fix): invoked inside `setTrackInventory`'s enabling
@@ -236,8 +274,25 @@ export interface PrismaInventoryRepositoryTestHooks {
    * that method's own doc comment for exactly what this proves.
    * Exercised only by this repository's own integration test, against a
    * repository instance this factory built specifically for that test.
+   * Receives `tx` for the same reason `beforeExpirySweep` does.
    */
-  beforeInitialStockAdjustmentInsert?: () => Promise<void>;
+  beforeInitialStockAdjustmentInsert?: (tx: Prisma.TransactionClient) => Promise<void>;
+
+  /**
+   * Chat 3 Finding 2 (MEDIUM): invoked inside `securePaymentWindow`'s
+   * transaction, immediately before the conditional `UPDATE` for ONE
+   * canonically-ordered tracked item — lets a test deterministically
+   * pause one concurrent call mid-loop (after it has already locked an
+   * earlier item in the canonical order, before it locks the next one)
+   * and prove a second, real, unmodified concurrent call is genuinely
+   * blocked waiting on that SAME row, never a different one. Exercised
+   * only by this repository's own integration test, against a
+   * repository instance this factory built specifically for that test.
+   */
+  beforeSecurePaymentWindowItemTouch?: (
+    tx: Prisma.TransactionClient,
+    productId: string,
+  ) => Promise<void>;
 }
 
 export function createPrismaInventoryRepository(
@@ -283,7 +338,7 @@ export function createPrismaInventoryRepository(
             // deterministic, and the pair is permanently terminal either
             // way (never revived, never a second row).
             if (testHooks.beforeExpirySweep) {
-              await testHooks.beforeExpirySweep();
+              await testHooks.beforeExpirySweep(tx);
             }
             await tx.stockReservation.updateMany({
               where: { id: existing.id, status: "ACTIVE", expiresAt: { lte: new Date() } },
@@ -462,8 +517,43 @@ export function createPrismaInventoryRepository(
             throw new SecurePaymentWindowAbort(failures);
           }
 
+          // Chat 3 Finding 2 (MEDIUM): canonicalize the per-item update
+          // order — ascending by `productId` — before touching any
+          // `stockReservation` row below. Each iteration's conditional
+          // `UPDATE` holds that one row's lock for the rest of this
+          // transaction (same as every other per-row write in this
+          // file), and `requiredItems`' own array order is entirely
+          // caller-supplied. Two concurrent `securePaymentWindow` calls
+          // for the same order (e.g. a payment resume racing a retry)
+          // that share more than one tracked product, supplied in
+          // DIFFERENT array orders by their own callers, could
+          // otherwise each come to hold one shared row's lock while
+          // waiting on the other's — a genuine AB-BA cycle, the same
+          // shape as the product-lock cycle this file already closed
+          // for `consumeReservation` (see its own doc comment). Sorting
+          // here means every concurrent call acquires these locks in
+          // the SAME relative order regardless of its own caller's
+          // array order, which makes that specific cycle impossible
+          // the same way a single canonical order always does. This
+          // changes nothing about WHICH items are touched, the
+          // all-or-nothing rollback behavior, or the expiry/terminal-
+          // state checks below — only the sequence in which rows are
+          // touched within one transaction. This never creates a
+          // reverse-order dependency against the `products` row lock:
+          // this method never takes that lock at all (it only ever
+          // reads `trackInventory` via a plain, non-locking
+          // `findUnique` above), so it cannot invert against
+          // `reserveStock`/`adjustStock`/`setTrackInventory`/
+          // `consumeReservation`'s own product-first protocol.
+          const canonicallyOrderedProductIds = [...trackedProductIds].sort((a, b) =>
+            a < b ? -1 : a > b ? 1 : 0,
+          );
+
           const now = new Date();
-          for (const productId of trackedProductIds) {
+          for (const productId of canonicallyOrderedProductIds) {
+            if (testHooks.beforeSecurePaymentWindowItemTouch) {
+              await testHooks.beforeSecurePaymentWindowItemTouch(tx, productId);
+            }
             const touched = await tx.stockReservation.updateMany({
               where: { orderId, productId, status: "ACTIVE", expiresAt: { gt: now } },
               data: { expiresAt: newExpiresAt },
@@ -686,7 +776,7 @@ export function createPrismaInventoryRepository(
           // doc comment for why this is a hook rather than `Promise.all`
           // or hand-replicated SQL.
           if (testHooks.beforeInitialStockAdjustmentInsert) {
-            await testHooks.beforeInitialStockAdjustmentInsert();
+            await testHooks.beforeInitialStockAdjustmentInsert(tx);
           }
 
           const adjustment = await tx.stockAdjustment.create({

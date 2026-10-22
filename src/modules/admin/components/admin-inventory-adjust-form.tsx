@@ -37,6 +37,19 @@ type Direction = "increase" | "decrease";
  * below reflects whatever the server actually did, for the admin to
  * check before deciding. This is honest, UI-level risk disclosure, not
  * a substitute for real idempotency.
+ *
+ * Chat 3 Finding 3 (MEDIUM): `hasUnknownOutcome` is cleared ONLY by a
+ * definite 2xx success — never merely because SOME response (even a
+ * non-2xx one) eventually arrived for a later attempt. A server
+ * response to attempt N is evidence about attempt N; it is never
+ * evidence, one way or the other, about whether an EARLIER,
+ * still-unresolved attempt was applied. An unrelated validation error
+ * on a retry (e.g. a mistyped reason) must not silently erase a real,
+ * still-open ambiguity from a previous attempt — doing so would let an
+ * admin walk away believing the risk was resolved when nothing actually
+ * resolved it. The warning therefore stays visible across any number of
+ * non-2xx responses, clearing only once a request is KNOWN to have
+ * succeeded.
  */
 export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustFormProps) {
   const router = useRouter();
@@ -92,13 +105,23 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
       if (!response.ok) {
         const data: { error?: string } = await response.json().catch(() => ({}));
         setErrorCode(data.error ?? "UNKNOWN_ERROR");
-        // The server responded (even if with an error), so this
-        // outcome is known — a prior "unknown" state is now resolved.
-        setHasUnknownOutcome(false);
+        // Chat 3 Finding 3 (MEDIUM): deliberately NOT touching
+        // `hasUnknownOutcome` here. This response is evidence about
+        // THIS attempt only — never about whether an earlier,
+        // still-ambiguous attempt was applied. If a prior attempt's
+        // outcome was unknown, it stays unknown and the warning stays
+        // visible, no matter what this unrelated error says. Still
+        // refreshing so the stock/history below reflects the latest
+        // known server state — but that refresh is not treated as
+        // proof of anything about either request.
+        router.refresh();
         return;
       }
       setQuantity("");
       setReason("");
+      // The only path that actually resolves a prior ambiguous
+      // outcome: THIS exact request reached the server and is now
+      // known, definitively, to have succeeded.
       setHasUnknownOutcome(false);
       router.refresh();
     } catch {

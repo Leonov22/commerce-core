@@ -8,12 +8,66 @@ import {
 import { prisma } from "@/modules/catalog/infrastructure/prisma-client";
 import type { ReserveStockResult } from "@/modules/catalog/repositories/inventory-repository";
 
-/** Matches the exact shape Prisma 7 actually throws for a Postgres deadlock, captured by direct reproduction while developing Finding 2's fix — see this file's own "lock order" section for the full analysis. */
-function makeDeadlockError(): Prisma.PrismaClientKnownRequestError {
-  return new Prisma.PrismaClientKnownRequestError(
-    "Database error. Code: `40P01`. Message: `deadlock detected`",
-    { code: "P2039", clientVersion: "test" },
-  );
+/**
+ * Chat 3 Finding 4 (LOW): matches the exact shape this project's actual
+ * installed Prisma 7.9.1 + `@prisma/adapter-pg` combination throws for
+ * a real Postgres `40P01` deadlock — confirmed by directly reproducing
+ * one (two transactions taking `FOR UPDATE` locks on two product rows
+ * in reverse order) and logging the resulting error's `.code`, `.meta`,
+ * and `Object.keys`, not by reading the (minified) source alone. That
+ * reproduction showed the SAME underlying `40P01` can surface as
+ * EITHER Prisma error code `P2010` ("Raw query failed", when the
+ * statement Postgres chose to abort was a raw `$queryRaw ... FOR
+ * UPDATE`) or `P2039` ("Database error", for an ORM call) — which one
+ * occurs depends on which side of the race Postgres's own deadlock
+ * detector aborts, not on anything application code controls. Both
+ * carry the SAME structured `meta.driverAdapterError.cause.originalCode`
+ * field, which is what `isRetryableTransactionError` now checks first
+ * (see that function's own doc comment) — `prismaCode` lets a test
+ * prove that check is genuinely code-agnostic by constructing both
+ * observed shapes with an identical structured code.
+ *
+ * `40001` (serialization_failure) was NOT independently reproduced
+ * against this project's own transactions — they all run at Prisma's
+ * default isolation level (Postgres `READ COMMITTED`), under which
+ * ordinary concurrent writes block rather than abort with `40001`
+ * (that code is realistically reachable only under `SERIALIZABLE`/
+ * `REPEATABLE READ`, which nothing in this file uses). Its structured
+ * shape below is therefore based on reading `@prisma/adapter-pg`'s own
+ * installed source (the exact same `mapDriverError` function already
+ * confirmed accurate for `40P01` above), not an independent live
+ * reproduction — stated here honestly rather than claimed as verified.
+ */
+function makeDeadlockError(
+  options: { prismaCode?: "P2010" | "P2039"; sqlState?: "40P01" | "40001" } = {},
+): Prisma.PrismaClientKnownRequestError {
+  const prismaCode = options.prismaCode ?? "P2039";
+  const sqlState = options.sqlState ?? "40P01";
+  const originalMessage = sqlState === "40P01" ? "deadlock detected" : "could not serialize access";
+  const message =
+    prismaCode === "P2010"
+      ? `Invalid \`prisma.$queryRaw()\` invocation:\n\n\nRaw query failed. Code: \`${sqlState}\`. Message: \`${originalMessage}\``
+      : `Database error. Code: \`${sqlState}\`. Message: \`${originalMessage}\``;
+  return new Prisma.PrismaClientKnownRequestError(message, {
+    code: prismaCode,
+    clientVersion: "test",
+    meta: {
+      driverAdapterError: {
+        name: "DriverAdapterError",
+        cause: {
+          originalCode: sqlState,
+          originalMessage,
+          // `40001` maps to the adapter's own named `TransactionWriteConflict`
+          // kind (no raw `code` field in that branch); `40P01` falls
+          // through to the generic `postgres` kind, which does carry one.
+          // `originalCode` (checked by production code) is present either way.
+          ...(sqlState === "40001"
+            ? { kind: "TransactionWriteConflict" }
+            : { kind: "postgres", code: sqlState, severity: "ERROR", message: originalMessage }),
+        },
+      },
+    },
+  });
 }
 
 /**
@@ -26,19 +80,41 @@ function makeDeadlockError(): Prisma.PrismaClientKnownRequestError {
  */
 
 /**
- * Chat 3 Finding 4 (MEDIUM): polls Postgres's own `pg_locks` system view
- * — never a fixed sleep — for a real, currently-waiting
- * `transactionid` lock request. That specific lock type is exactly
- * what a second transaction's blocked `SELECT ... FOR UPDATE` shows up
- * as while it waits for the row-locking transaction's XID to finish
- * (Postgres implements row-level lock waits this way internally). A
- * test using this resolves only once Postgres itself confirms another
- * backend has actually reached and is genuinely blocked at its
- * intended lock-wait point — never merely "probably enough time has
- * passed." Throws (failing the test with a clear message, not a false
- * pass) if nothing is observed waiting within `timeoutMs`.
+ * Chat 3 Finding 1 (MEDIUM): reads the backend process id of the
+ * Postgres connection a given interactive-transaction `tx` client is
+ * currently running on, via `pg_backend_pid()` executed ON THAT SAME
+ * CONNECTION (never a separate `prisma.$queryRaw` call, which would run
+ * on a different pooled connection and report the wrong pid entirely).
+ * This is what makes it possible to name, precisely, which backend a
+ * test expects to be the LOCK HOLDER, rather than inferring it from
+ * timing.
  */
-async function waitUntilAnotherTransactionIsBlockedOnARowLock(
+async function getBackendPid(tx: Prisma.TransactionClient): Promise<number> {
+  const rows = await tx.$queryRaw<{ pid: number }[]>`SELECT pg_backend_pid() AS pid`;
+  return rows[0]!.pid;
+}
+
+/**
+ * Chat 3 Finding 1 (MEDIUM): the previous version of this helper polled
+ * `pg_locks` for ANY backend, anywhere in the database, waiting on ANY
+ * `transactionid` lock — it could not distinguish the specific
+ * competing transaction this test cares about from a completely
+ * unrelated one blocked by a completely unrelated holder (e.g. another
+ * test file's own concurrency test, running against the same shared
+ * database at the same time). This version instead polls
+ * `pg_stat_activity` joined through Postgres's own
+ * `pg_blocking_pids(pid)` function, resolving only once it finds SOME
+ * backend whose blocking set actually contains `holderBackendPid` —
+ * the exact, named backend the calling test captured via
+ * `getBackendPid` for the transaction it set up as the lock holder.
+ * This can never pass because of an unrelated transaction: the
+ * correlation is to that one specific pid, not to lock activity in
+ * general. Still never a fixed sleep — still throws a clear error,
+ * failing the test, if that specific correlation is not observed
+ * within `timeoutMs`.
+ */
+async function waitUntilBackendIsBlockedBy(
+  holderBackendPid: number,
   options: { timeoutMs?: number; pollIntervalMs?: number } = {},
 ): Promise<void> {
   const timeoutMs = options.timeoutMs ?? 5000;
@@ -46,21 +122,21 @@ async function waitUntilAnotherTransactionIsBlockedOnARowLock(
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    const rows = await prisma.$queryRaw<{ count: bigint }[]>`
-      SELECT count(*)::bigint AS count
-      FROM pg_locks
-      WHERE locktype = 'transactionid' AND granted = false
+    const rows = await prisma.$queryRaw<{ pid: number }[]>`
+      SELECT pid
+      FROM pg_stat_activity
+      WHERE ${holderBackendPid} = ANY(pg_blocking_pids(pid))
     `;
-    if (Number(rows[0]?.count ?? 0) > 0) {
+    if (rows.length > 0) {
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
   }
 
   throw new Error(
-    "waitUntilAnotherTransactionIsBlockedOnARowLock: no backend was observed waiting on a " +
-      "transactionid lock within the timeout — the test is not exercising the intended " +
-      "lock-wait window, and the assertions that follow would not be deterministic.",
+    `waitUntilBackendIsBlockedBy: no backend was observed specifically blocked by backend ` +
+      `${holderBackendPid} within ${timeoutMs}ms — the test is not exercising the intended ` +
+      `lock-wait window, and the assertions that follow would not be deterministic.`,
   );
 }
 describe("prismaInventoryRepository", () => {
@@ -511,7 +587,7 @@ describe("prismaInventoryRepository", () => {
       } = { consumeReservationPromise: null };
 
       const testRepository = createPrismaInventoryRepository({
-        beforeInitialStockAdjustmentInsert: async () => {
+        beforeInitialStockAdjustmentInsert: async (tx) => {
           // At this point `setTrackInventory`'s transaction already
           // holds the product row's `FOR UPDATE` lock, uncommitted.
           // Firing the real, unmodified `consumeReservation` here (on
@@ -519,32 +595,49 @@ describe("prismaInventoryRepository", () => {
           // and not awaiting it yet is what lets the assertion below
           // prove it is genuinely blocked on that SAME lock, not on the
           // `stockReservation` row it will eventually also touch.
+          const holderPid = await getBackendPid(tx);
           box.consumeReservationPromise = prismaInventoryRepository.consumeReservation(
             orderId,
             product.id,
           );
-          await waitUntilAnotherTransactionIsBlockedOnARowLock();
+          // Chat 3 Finding 1: correlates specifically to THIS holder's
+          // backend pid — passing cannot be explained by an unrelated
+          // transaction blocked by an unrelated holder elsewhere.
+          await waitUntilBackendIsBlockedBy(holderPid);
         },
       });
 
-      const enableResult = await testRepository.setTrackInventory({
-        productId: product.id,
-        trackInventory: true,
-        initialQuantity: 10,
-        reason: "Initial stock count",
-      });
-      expect(enableResult.outcome).toBe("updated");
-      if (enableResult.outcome !== "updated") throw new Error("unreachable");
-      expect(enableResult.stockQuantity).toBe(10);
+      try {
+        const enableResult = await testRepository.setTrackInventory({
+          productId: product.id,
+          trackInventory: true,
+          initialQuantity: 10,
+          reason: "Initial stock count",
+        });
+        expect(enableResult.outcome).toBe("updated");
+        if (enableResult.outcome !== "updated") throw new Error("unreachable");
+        expect(enableResult.stockQuantity).toBe(10);
 
-      if (!box.consumeReservationPromise) {
-        throw new Error("the hook never fired — test is not exercising the intended window");
+        if (!box.consumeReservationPromise) {
+          throw new Error("the hook never fired — test is not exercising the intended window");
+        }
+        // The decisive assertion: this resolves at all (no deadlock error
+        // was thrown by either side) and reports the reservation as
+        // consumed against the now-fully-initialized stock.
+        const consumeResult = await box.consumeReservationPromise;
+        expect(consumeResult.outcome).toBe("consumed");
+      } finally {
+        // Chat 3 Finding 1: on EVERY path — success, an assertion above
+        // throwing, or the holder's own transaction rolling back after
+        // `waitUntilBackendIsBlockedBy` timed out inside the hook — the
+        // holder's lock has already been released (committed or rolled
+        // back) by the time control reaches here, so the competing call
+        // has either already settled or is settling right now. Awaiting
+        // it here (and swallowing any rejection) drains it on every
+        // path, so it can never become a detached/unhandled rejection
+        // surfacing after this test has already finished.
+        await box.consumeReservationPromise?.catch(() => {});
       }
-      // The decisive assertion: this resolves at all (no deadlock error
-      // was thrown by either side) and reports the reservation as
-      // consumed against the now-fully-initialized stock.
-      const consumeResult = await box.consumeReservationPromise;
-      expect(consumeResult.outcome).toBe("consumed");
 
       const finalProduct = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
       expect(finalProduct.stockQuantity).toBe(5); // 10 initialized - 5 consumed
@@ -750,6 +843,119 @@ describe("prismaInventoryRepository", () => {
         new Date(Date.now() + 900_000),
       );
       expect(result).toEqual({ ok: true });
+    });
+
+    // Chat 3 Finding 2 (MEDIUM) — root-cause fix for a SECOND, distinct
+    // lock-order risk from the one already closed for `consumeReservation`:
+    // this method's own per-item loop used to acquire each tracked item's
+    // `stockReservation` row lock in whatever order the CALLER's own
+    // `requiredItems` array happened to list them. Two concurrent calls
+    // for the same order, sharing more than one tracked item but supplied
+    // in different array orders by their own callers (e.g. a payment
+    // resume racing a retry), could each come to hold one shared row's
+    // lock while waiting on the other's — a genuine AB-BA cycle. The fix
+    // canonicalizes the order (ascending by `productId`) before touching
+    // any row, so every concurrent call now contends for the SAME first
+    // resource regardless of its own caller's array order — eliminating
+    // the cycle structurally, the same way `consumeReservation`'s own
+    // fix did for the product-row lock. This test forces a real,
+    // uncommitted call to hold the FIRST canonical item's lock, proves
+    // via `pg_blocking_pids` that a second, real, unmodified concurrent
+    // call — given the exact same two items in the OPPOSITE array order —
+    // is genuinely blocked waiting for that same lock (never a deadlock),
+    // then releases the holder and confirms both calls complete
+    // successfully with a single, consistent final state.
+    it("Chat 3 Finding 2 (MEDIUM): two concurrent securePaymentWindow calls for the same order, given the same two tracked items in opposite array orders, wait cleanly instead of risking an AB-BA deadlock", async () => {
+      const productOne = await createTestProduct({ stockQuantity: 5 });
+      const productTwo = await createTestProduct({ stockQuantity: 5 });
+      const [firstId, secondId] = [productOne.id, productTwo.id].sort((a, b) =>
+        a < b ? -1 : a > b ? 1 : 0,
+      );
+
+      const orderId = testOrderId();
+      await prismaInventoryRepository.reserveStock({
+        orderId,
+        productId: firstId,
+        quantity: 1,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      await prismaInventoryRepository.reserveStock({
+        orderId,
+        productId: secondId,
+        quantity: 1,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+
+      const newExpiresAtA = new Date(Date.now() + 300_000);
+      const newExpiresAtB = new Date(Date.now() + 600_000);
+
+      const box: {
+        callBPromise: Promise<
+          Awaited<ReturnType<typeof prismaInventoryRepository.securePaymentWindow>>
+        > | null;
+      } = { callBPromise: null };
+
+      const testRepository = createPrismaInventoryRepository({
+        beforeSecurePaymentWindowItemTouch: async (tx, productId) => {
+          // Only pause when about to touch the SECOND canonical item —
+          // by then, call A has already locked and updated the FIRST
+          // canonical item's row within this same still-open
+          // transaction, which is the precondition the competing call
+          // below needs to actually collide with.
+          if (productId !== secondId) {
+            return;
+          }
+          const holderPid = await getBackendPid(tx);
+          // Call B supplies the exact same two items in the OPPOSITE
+          // order to ITS OWN `requiredItems` — proving the fix does not
+          // depend on either caller happening to agree on an order.
+          box.callBPromise = prismaInventoryRepository.securePaymentWindow(
+            orderId,
+            [
+              { productId: secondId, quantity: 1 },
+              { productId: firstId, quantity: 1 },
+            ],
+            newExpiresAtB,
+          );
+          await waitUntilBackendIsBlockedBy(holderPid);
+        },
+      });
+
+      try {
+        const resultA = await testRepository.securePaymentWindow(
+          orderId,
+          [
+            { productId: firstId, quantity: 1 },
+            { productId: secondId, quantity: 1 },
+          ],
+          newExpiresAtA,
+        );
+        expect(resultA).toEqual({ ok: true });
+
+        if (!box.callBPromise) {
+          throw new Error("the hook never fired — test is not exercising the intended window");
+        }
+        // The decisive assertion: this resolves at all (no deadlock
+        // error was thrown by either side).
+        const resultB = await box.callBPromise;
+        expect(resultB).toEqual({ ok: true });
+      } finally {
+        await box.callBPromise?.catch(() => {});
+      }
+
+      // Call A committed first (it held the first canonical item's lock
+      // throughout); call B could only proceed once A released it, so
+      // B's writes landed LAST for both items — a single, consistent
+      // final state, never a mix of A's and B's values across the two
+      // rows.
+      const reservationFirst = await prisma.stockReservation.findUniqueOrThrow({
+        where: { orderId_productId: { orderId, productId: firstId } },
+      });
+      const reservationSecond = await prisma.stockReservation.findUniqueOrThrow({
+        where: { orderId_productId: { orderId, productId: secondId } },
+      });
+      expect(reservationFirst.expiresAt.getTime()).toBe(newExpiresAtB.getTime());
+      expect(reservationSecond.expiresAt.getTime()).toBe(newExpiresAtB.getTime());
     });
   });
 
@@ -1461,6 +1667,107 @@ describe("prismaInventoryRepository", () => {
           const availability = await prismaInventoryRepository.getProductAvailability(product.id);
           expect(availability?.trackInventory).toBe(false);
         });
+
+        // Chat 3 Finding 4 (LOW): the top-level Prisma error code that
+        // wraps a `40P01` is not stable (see `makeDeadlockError`'s own
+        // doc comment for the direct reproduction proving this) — the
+        // retry helper must key off the structured
+        // `meta.driverAdapterError.cause.originalCode` field, not the
+        // top-level `.code`, so it retries correctly no matter which
+        // Prisma code happened to wrap this particular occurrence.
+        it('retries a deadlock wrapped as P2010 ("Raw query failed") exactly the same as one wrapped as P2039 ("Database error")', async () => {
+          const product = await createTestProduct({ trackInventory: false, stockQuantity: 0 });
+          let attempts = 0;
+          const testRepository = createPrismaInventoryRepository({
+            beforeInitialStockAdjustmentInsert: async () => {
+              attempts += 1;
+              if (attempts < 2) {
+                throw makeDeadlockError({ prismaCode: "P2010" });
+              }
+            },
+          });
+
+          const result = await testRepository.setTrackInventory({
+            productId: product.id,
+            trackInventory: true,
+            initialQuantity: 10,
+            reason: "test",
+          });
+          expect(result.outcome).toBe("updated");
+          expect(attempts).toBe(2);
+        });
+
+        // Chat 3 Finding 4 (LOW): proves the structured field is checked
+        // FIRST and takes precedence — an error whose structured code is
+        // a non-retryable one (a unique-constraint violation) must never
+        // be retried, even though nothing here claims its message text
+        // avoids the substring "40P01"; this specifically guards against
+        // a future regression where someone reverts to message-only
+        // matching and a coincidental substring match causes a wrong
+        // retry.
+        it("never retries a non-retryable error, judged by its structured code, regardless of any coincidental message text", async () => {
+          const product = await createTestProduct({ trackInventory: false, stockQuantity: 0 });
+          let attempts = 0;
+          const testRepository = createPrismaInventoryRepository({
+            beforeInitialStockAdjustmentInsert: async () => {
+              attempts += 1;
+              throw new Prisma.PrismaClientKnownRequestError(
+                "Unique constraint failed on fields mentioning 40P01 only incidentally",
+                {
+                  code: "P2002",
+                  clientVersion: "test",
+                  meta: {
+                    driverAdapterError: {
+                      name: "DriverAdapterError",
+                      cause: { originalCode: "23505", originalMessage: "duplicate key value" },
+                    },
+                  },
+                },
+              );
+            },
+          });
+
+          await expect(
+            testRepository.setTrackInventory({
+              productId: product.id,
+              trackInventory: true,
+              initialQuantity: 10,
+              reason: "test",
+            }),
+          ).rejects.toThrow("Unique constraint failed");
+          expect(attempts).toBe(1);
+        });
+
+        // Chat 3 Finding 4 (LOW): the fallback path — kept for the case
+        // (not observed in this project's own reproduction, but not
+        // provably impossible on some future Prisma/adapter version)
+        // where `meta.driverAdapterError` is absent entirely. Confirms
+        // the helper still recognizes a retryable error purely from its
+        // message text when the structured field cannot be read at all.
+        it("falls back to the message-text check when the structured driver-adapter field is absent", async () => {
+          const product = await createTestProduct({ trackInventory: false, stockQuantity: 0 });
+          let attempts = 0;
+          const testRepository = createPrismaInventoryRepository({
+            beforeInitialStockAdjustmentInsert: async () => {
+              attempts += 1;
+              if (attempts < 2) {
+                throw new Prisma.PrismaClientKnownRequestError(
+                  "Database error. Code: `40P01`. Message: `deadlock detected`",
+                  { code: "P2039", clientVersion: "test" }, // no `meta` at all
+                );
+              }
+            },
+          });
+
+          const result = await testRepository.setTrackInventory({
+            productId: product.id,
+            trackInventory: true,
+            initialQuantity: 10,
+            reason: "test",
+          });
+          expect(result.outcome).toBe("updated");
+          expect(attempts).toBe(2);
+        });
       });
 
       it("a concurrent reserveStock call can never observe trackInventory=true paired with the pre-initialization stock — it is blocked by the same row lock until the enabling transaction commits", async () => {
@@ -1472,7 +1779,7 @@ describe("prismaInventoryRepository", () => {
         };
 
         const testRepository = createPrismaInventoryRepository({
-          beforeInitialStockAdjustmentInsert: async () => {
+          beforeInitialStockAdjustmentInsert: async (tx) => {
             // At this exact point, inside the still-open enabling
             // transaction, the product row's `trackInventory`/
             // `stockQuantity` have already been written but NOT yet
@@ -1482,42 +1789,55 @@ describe("prismaInventoryRepository", () => {
             // repository, a separate connection — and NOT awaiting it
             // yet proves it cannot proceed past its own `FOR UPDATE`
             // read until this transaction ends.
+            const holderPid = await getBackendPid(tx);
             box.reserveStockPromise = prismaInventoryRepository.reserveStock({
               orderId,
               productId: product.id,
               quantity: 20,
               expiresAt: new Date(Date.now() + 60_000),
             });
-            // Chat 3 Finding 4: proves, via Postgres's own `pg_locks`,
-            // that the call above has actually reached and is genuinely
-            // blocked at its own `FOR UPDATE` statement — not a fixed
-            // sleep standing in for that proof. This transaction's own
-            // commit (immediately after this hook returns) is therefore
-            // provably what unblocks it, not a lucky timing guess.
-            await waitUntilAnotherTransactionIsBlockedOnARowLock();
+            // Chat 3 Finding 1 (MEDIUM): proves, via Postgres's own
+            // `pg_blocking_pids`, that the call above is blocked
+            // SPECIFICALLY by this transaction's own backend — not a
+            // fixed sleep, and not merely "something, somewhere is
+            // waiting." This transaction's own commit (immediately
+            // after this hook returns) is therefore provably what
+            // unblocks it, not a lucky timing guess or an unrelated
+            // transaction's unrelated lock.
+            await waitUntilBackendIsBlockedBy(holderPid);
           },
         });
 
-        const enableResult = await testRepository.setTrackInventory({
-          productId: product.id,
-          trackInventory: true,
-          initialQuantity: 20,
-          reason: "Initial stock count",
-        });
-        expect(enableResult.outcome).toBe("updated");
+        try {
+          const enableResult = await testRepository.setTrackInventory({
+            productId: product.id,
+            trackInventory: true,
+            initialQuantity: 20,
+            reason: "Initial stock count",
+          });
+          expect(enableResult.outcome).toBe("updated");
 
-        if (!box.reserveStockPromise) {
-          throw new Error("the hook never fired — test is not exercising the intended window");
+          if (!box.reserveStockPromise) {
+            throw new Error("the hook never fired — test is not exercising the intended window");
+          }
+          const reserveResult = await box.reserveStockPromise;
+
+          // The decisive assertion: by the time `reserveStock` actually
+          // ran its own availability check, it was reading the FULLY
+          // committed post-initialization row (trackInventory=true AND
+          // stockQuantity=20 together) — never the old, two-transaction
+          // design's partial state (trackInventory=true, stockQuantity=0)
+          // that would have wrongly reported `insufficientStock` here.
+          expect(reserveResult.outcome).toBe("reserved");
+        } finally {
+          // Chat 3 Finding 1: drains the competing promise on every
+          // path (success, an assertion throwing, or a hook timeout
+          // that rolled the holder back) so it can never become a
+          // detached/unhandled rejection — see the sibling
+          // `consumeReservation` test's own comment for the full
+          // reasoning, identical here.
+          await box.reserveStockPromise?.catch(() => {});
         }
-        const reserveResult = await box.reserveStockPromise;
-
-        // The decisive assertion: by the time `reserveStock` actually
-        // ran its own availability check, it was reading the FULLY
-        // committed post-initialization row (trackInventory=true AND
-        // stockQuantity=20 together) — never the old, two-transaction
-        // design's partial state (trackInventory=true, stockQuantity=0)
-        // that would have wrongly reported `insufficientStock` here.
-        expect(reserveResult.outcome).toBe("reserved");
 
         // `reserveStock` never decrements `stockQuantity` itself (only
         // `consumeReservation` does) — it only creates the reservation
