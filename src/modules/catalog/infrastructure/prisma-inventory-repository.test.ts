@@ -95,28 +95,51 @@ async function getBackendPid(tx: Prisma.TransactionClient): Promise<number> {
 }
 
 /**
- * Chat 3 Finding 1 (MEDIUM): the previous version of this helper polled
- * `pg_locks` for ANY backend, anywhere in the database, waiting on ANY
- * `transactionid` lock — it could not distinguish the specific
- * competing transaction this test cares about from a completely
+ * Chat 3 Finding 1 (MEDIUM), round 3: the ORIGINAL version of this
+ * helper polled `pg_locks` for ANY backend, anywhere in the database,
+ * waiting on ANY `transactionid` lock — it could not distinguish the
+ * specific competing transaction a test cares about from a completely
  * unrelated one blocked by a completely unrelated holder (e.g. another
  * test file's own concurrency test, running against the same shared
- * database at the same time). This version instead polls
- * `pg_stat_activity` joined through Postgres's own
- * `pg_blocking_pids(pid)` function, resolving only once it finds SOME
- * backend whose blocking set actually contains `holderBackendPid` —
- * the exact, named backend the calling test captured via
- * `getBackendPid` for the transaction it set up as the lock holder.
- * This can never pass because of an unrelated transaction: the
- * correlation is to that one specific pid, not to lock activity in
- * general. Still never a fixed sleep — still throws a clear error,
- * failing the test, if that specific correlation is not observed
- * within `timeoutMs`.
+ * database at the same time). Round 3 narrowed this to `pg_stat_activity`
+ * joined through `pg_blocking_pids(pid)`, resolving once SOME backend's
+ * blocking set contains the named `holderBackendPid`.
+ *
+ * Chat 3 Finding 2 (MEDIUM), round 4: being blocked BY the right holder
+ * is necessary but, on its own, still not sufficient proof that the
+ * waiting backend is THIS test's own competing call specifically — only
+ * that it's blocked by something this holder's connection did. This
+ * version adds a second, independent condition: the waiting backend's
+ * own `pg_stat_activity.query` text must also match `expectedQueryPattern`
+ * (a `LIKE` pattern), i.e. it must be running the EXACT kind of
+ * statement the test's competing call is expected to issue — captured
+ * by directly running each real call and logging the resulting
+ * `pg_stat_activity.query` text (see each call site's own comment for
+ * the exact pattern used and why). `wait_event_type = 'Lock'` is
+ * checked too, as a third, independently-sourced confirmation that
+ * this backend is genuinely blocked on a lock (not merely idle or busy
+ * elsewhere) at the moment it matches.
+ *
+ * Capturing the competing call's own backend pid directly (e.g. via a
+ * hook on ITS side) was deliberately NOT done: every one of this file's
+ * competing calls is fired through the unmodified, unhooked PRODUCTION
+ * singleton specifically to prove the real method blocks — adding a
+ * hook there to extract its pid would reintroduce exactly the kind of
+ * production-code change to an already-reviewed primitive this round
+ * is told to avoid unless strictly necessary, and the query-text
+ * correlation below achieves the same precision without it.
+ *
+ * Resolves with the one matching pid once found. Throws — failing the
+ * test with a clear, actionable message, never a silent false pass —
+ * if zero backends match within `timeoutMs`, or if MORE than one
+ * backend matches at once (an ambiguous result this helper refuses to
+ * guess through, rather than arbitrarily picking one).
  */
 async function waitUntilBackendIsBlockedBy(
   holderBackendPid: number,
+  expectedQueryPattern: string,
   options: { timeoutMs?: number; pollIntervalMs?: number } = {},
-): Promise<void> {
+): Promise<number> {
   const timeoutMs = options.timeoutMs ?? 5000;
   const pollIntervalMs = options.pollIntervalMs ?? 20;
   const deadline = Date.now() + timeoutMs;
@@ -126,19 +149,39 @@ async function waitUntilBackendIsBlockedBy(
       SELECT pid
       FROM pg_stat_activity
       WHERE ${holderBackendPid} = ANY(pg_blocking_pids(pid))
+        AND wait_event_type = 'Lock'
+        AND query LIKE ${expectedQueryPattern}
     `;
-    if (rows.length > 0) {
-      return;
+    if (rows.length === 1) {
+      return rows[0]!.pid;
+    }
+    if (rows.length > 1) {
+      throw new Error(
+        `waitUntilBackendIsBlockedBy: ${rows.length} distinct backends (pids: ` +
+          `${rows.map((r) => r.pid).join(", ")}) are simultaneously blocked by backend ` +
+          `${holderBackendPid} while matching the expected query pattern — ambiguous, cannot ` +
+          `determine which one is this test's own competing call. The test's setup is not as ` +
+          `isolated as assumed (check for leftover state or an unrelated concurrent operation ` +
+          `on the same row).`,
+      );
     }
     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
   }
 
   throw new Error(
-    `waitUntilBackendIsBlockedBy: no backend was observed specifically blocked by backend ` +
-      `${holderBackendPid} within ${timeoutMs}ms — the test is not exercising the intended ` +
-      `lock-wait window, and the assertions that follow would not be deterministic.`,
+    `waitUntilBackendIsBlockedBy: no backend was observed blocked specifically by backend ` +
+      `${holderBackendPid} while running a statement matching ${JSON.stringify(expectedQueryPattern)} ` +
+      `within ${timeoutMs}ms — the test is not exercising the intended lock-wait window, and the ` +
+      `assertions that follow would not be deterministic.`,
   );
 }
+
+/** The exact tail Prisma/`@prisma/adapter-pg` generates for every raw `products` row lock in this file (`reserveStock`, `adjustStock`, `setTrackInventory`, `consumeReservation`) — confirmed by direct reproduction, not assumed; see this helper's own doc comment. */
+const PRODUCT_FOR_UPDATE_QUERY_PATTERN = '%WHERE "id" = $1 FOR UPDATE%';
+
+/** The exact tail Prisma generates for `securePaymentWindow`'s per-item conditional `stockReservation` update — confirmed by direct reproduction (temporarily logging `pg_stat_activity` from inside the real test), not assumed. */
+const SECURE_PAYMENT_WINDOW_RESERVATION_UPDATE_QUERY_PATTERN =
+  '%UPDATE "public"."stock_reservations" SET "expiresAt"%';
 describe("prismaInventoryRepository", () => {
   const createdProductIds: string[] = [];
 
@@ -600,10 +643,13 @@ describe("prismaInventoryRepository", () => {
             orderId,
             product.id,
           );
-          // Chat 3 Finding 1: correlates specifically to THIS holder's
-          // backend pid — passing cannot be explained by an unrelated
-          // transaction blocked by an unrelated holder elsewhere.
-          await waitUntilBackendIsBlockedBy(holderPid);
+          // Chat 3 Finding 1/2: correlates specifically to THIS holder's
+          // backend pid AND requires the waiter to be running exactly
+          // `consumeReservation`'s own raw product-row lock statement —
+          // passing cannot be explained by an unrelated transaction
+          // blocked by an unrelated holder, nor by some other statement
+          // that happens to be blocked by this same holder.
+          await waitUntilBackendIsBlockedBy(holderPid, PRODUCT_FOR_UPDATE_QUERY_PATTERN);
         },
       });
 
@@ -917,7 +963,13 @@ describe("prismaInventoryRepository", () => {
             ],
             newExpiresAtB,
           );
-          await waitUntilBackendIsBlockedBy(holderPid);
+          // Chat 3 Finding 2 (round 4): requires the waiter to be
+          // running exactly the per-item `stockReservation` update
+          // statement, not merely "something" blocked by this holder.
+          await waitUntilBackendIsBlockedBy(
+            holderPid,
+            SECURE_PAYMENT_WINDOW_RESERVATION_UPDATE_QUERY_PATTERN,
+          );
         },
       });
 
@@ -1796,15 +1848,18 @@ describe("prismaInventoryRepository", () => {
               quantity: 20,
               expiresAt: new Date(Date.now() + 60_000),
             });
-            // Chat 3 Finding 1 (MEDIUM): proves, via Postgres's own
+            // Chat 3 Finding 1/2: proves, via Postgres's own
             // `pg_blocking_pids`, that the call above is blocked
-            // SPECIFICALLY by this transaction's own backend — not a
-            // fixed sleep, and not merely "something, somewhere is
-            // waiting." This transaction's own commit (immediately
-            // after this hook returns) is therefore provably what
-            // unblocks it, not a lucky timing guess or an unrelated
+            // SPECIFICALLY by this transaction's own backend, AND that
+            // it is running exactly `reserveStock`'s own raw
+            // product-row lock statement — not a fixed sleep, not
+            // merely "something, somewhere is waiting," and not some
+            // other statement that happens to be blocked by this same
+            // holder. This transaction's own commit (immediately after
+            // this hook returns) is therefore provably what unblocks
+            // it, not a lucky timing guess or an unrelated
             // transaction's unrelated lock.
-            await waitUntilBackendIsBlockedBy(holderPid);
+            await waitUntilBackendIsBlockedBy(holderPid, PRODUCT_FOR_UPDATE_QUERY_PATTERN);
           },
         });
 

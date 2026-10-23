@@ -38,18 +38,36 @@ type Direction = "increase" | "decrease";
  * check before deciding. This is honest, UI-level risk disclosure, not
  * a substitute for real idempotency.
  *
- * Chat 3 Finding 3 (MEDIUM): `hasUnknownOutcome` is cleared ONLY by a
- * definite 2xx success — never merely because SOME response (even a
- * non-2xx one) eventually arrived for a later attempt. A server
- * response to attempt N is evidence about attempt N; it is never
- * evidence, one way or the other, about whether an EARLIER,
- * still-unresolved attempt was applied. An unrelated validation error
- * on a retry (e.g. a mistyped reason) must not silently erase a real,
- * still-open ambiguity from a previous attempt — doing so would let an
- * admin walk away believing the risk was resolved when nothing actually
- * resolved it. The warning therefore stays visible across any number of
- * non-2xx responses, clearing only once a request is KNOWN to have
- * succeeded.
+ * Chat 3 Finding 3 (MEDIUM): a server response to attempt N is evidence
+ * about attempt N only; it is never evidence, one way or the other,
+ * about whether an EARLIER, still-unresolved attempt was applied. An
+ * unrelated validation error on a retry (e.g. a mistyped reason) must
+ * not silently erase a real, still-open ambiguity from a previous
+ * attempt.
+ *
+ * Chat 3 Finding 1 (HIGH), round 4: the previous version of this
+ * component still cleared `hasUnknownOutcome` on a SUCCESSFUL retry —
+ * which is just as unsound as clearing it on an error. A later,
+ * independent request succeeding proves only that THAT request
+ * committed; it proves nothing about whether the EARLIER request that
+ * caused the ambiguity in the first place also committed server-side
+ * before its response was lost. Both may have gone through, in which
+ * case stock has now been adjusted twice. There is no durable,
+ * server-side way to tell these two requests apart within this round's
+ * scope — no schema change, no idempotency key, no invented
+ * reconciliation mechanism that cannot actually identify the original
+ * request (see this round's own report for the proposed
+ * `clientRequestId` column, not implemented here). So once an outcome
+ * goes unknown, `hasUnknownOutcome` never flips back to `false` again
+ * for the rest of this component's mounted lifetime, REGARDLESS of
+ * what any later request — success, non-2xx, or another network
+ * failure — reports. `router.refresh()` only refreshes displayed data;
+ * it is never treated as authoritative reconciliation of which request
+ * actually committed. The warning's own copy and the resubmission
+ * confirm dialog both say this plainly, so an admin is never misled
+ * into thinking a later success "cleared" the risk, and is told to
+ * check the stock history for a duplicate rather than keep retrying
+ * blindly.
  */
 export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustFormProps) {
   const router = useRouter();
@@ -80,8 +98,11 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
 
     if (hasUnknownOutcome) {
       const acknowledgedRisk = window.confirm(
-        "The previous attempt's outcome is unknown — it may already have been applied. " +
-          "Check the stock history below before continuing. Submit this adjustment anyway?",
+        "An earlier attempt's outcome is still unknown, and will stay unresolved for the rest " +
+          "of this session — even if this new attempt succeeds. That earlier attempt may " +
+          "already have been applied, so submitting again could create a DUPLICATE stock " +
+          "change. Do not keep retrying based on this page alone: check the stock history " +
+          "below for a possible duplicate first. Submit this adjustment anyway?",
       );
       if (!acknowledgedRisk) {
         return;
@@ -105,24 +126,25 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
       if (!response.ok) {
         const data: { error?: string } = await response.json().catch(() => ({}));
         setErrorCode(data.error ?? "UNKNOWN_ERROR");
-        // Chat 3 Finding 3 (MEDIUM): deliberately NOT touching
-        // `hasUnknownOutcome` here. This response is evidence about
-        // THIS attempt only — never about whether an earlier,
-        // still-ambiguous attempt was applied. If a prior attempt's
-        // outcome was unknown, it stays unknown and the warning stays
-        // visible, no matter what this unrelated error says. Still
-        // refreshing so the stock/history below reflects the latest
-        // known server state — but that refresh is not treated as
-        // proof of anything about either request.
+        // Deliberately NOT touching `hasUnknownOutcome` here. This
+        // response is evidence about THIS attempt only — never about
+        // whether an earlier, still-ambiguous attempt was applied. If a
+        // prior attempt's outcome was unknown, it stays unknown and the
+        // warning stays visible, no matter what this unrelated error
+        // says. Still refreshing so the stock/history below reflects
+        // the latest known server state — but that refresh is not
+        // treated as proof of anything about either request.
         router.refresh();
         return;
       }
       setQuantity("");
       setReason("");
-      // The only path that actually resolves a prior ambiguous
-      // outcome: THIS exact request reached the server and is now
-      // known, definitively, to have succeeded.
-      setHasUnknownOutcome(false);
+      // Chat 3 Finding 1 (HIGH), round 4: deliberately NOT clearing
+      // `hasUnknownOutcome` even on THIS definite success — see this
+      // component's own doc comment for why a later success is not
+      // evidence that an EARLIER, still-ambiguous attempt did or did
+      // not also commit. If no prior attempt was ever ambiguous,
+      // `hasUnknownOutcome` is already `false` and nothing changes.
       router.refresh();
     } catch {
       setErrorCode("NETWORK_ERROR");
@@ -149,8 +171,12 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
           role="alert"
           className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-sm text-amber-700 dark:text-amber-400"
         >
-          The last attempt&rsquo;s outcome is unknown — the request may already have been applied.
-          Check the stock history below before submitting again.
+          An earlier attempt&rsquo;s outcome is unknown — it may already have been applied on the
+          server even though this page never confirmed it. This warning will stay visible for the
+          rest of this session, even after a later attempt succeeds, because a later success does
+          not prove the earlier one failed: if both went through, stock may now be adjusted twice.
+          Do not keep retrying based on this page alone — check the stock history below for a
+          possible duplicate.
         </div>
       ) : null}
       {errorCode ? (

@@ -1,10 +1,10 @@
 /**
- * Chat 3 Finding 3 (MEDIUM) regression tests for
- * `AdminInventoryAdjustForm`'s unresolved-outcome warning. Needs a real
- * DOM and `react-dom/client` (jsdom, no `react-server` resolve
- * condition) — matched by `vitest.config.ts`'s "client" project, the
- * same one `cart-context.strict-mode.test.ts` uses, via the
- * `*.client.test.ts` naming added alongside it. Written with
+ * Chat 3 Finding 3 (MEDIUM) and Finding 1 (HIGH, round 4) regression
+ * tests for `AdminInventoryAdjustForm`'s unresolved-outcome warning.
+ * Needs a real DOM and `react-dom/client` (jsdom, no `react-server`
+ * resolve condition) — matched by `vitest.config.ts`'s "client"
+ * project, the same one `cart-context.strict-mode.test.ts` uses, via
+ * the `*.client.test.ts` naming added alongside it. Written with
  * `React.createElement` rather than JSX for the same reason that file
  * gives: staying out of the one `.test.tsx` file in the suite.
  */
@@ -112,7 +112,7 @@ describe("AdminInventoryAdjustForm — Chat 3 Finding 3 (MEDIUM): the unresolved
     expect(refresh).toHaveBeenCalledTimes(2);
   });
 
-  it("the warning survives any number of non-2xx responses and clears only once a later attempt is known to succeed", async () => {
+  it("the warning survives any number of non-2xx responses", async () => {
     fetchMock.mockRejectedValueOnce(new Error("network down"));
     await fillAndSubmit("5", "restock from supplier");
     expect(unresolvedOutcomeWarningVisible()).toBe(true);
@@ -132,11 +132,45 @@ describe("AdminInventoryAdjustForm — Chat 3 Finding 3 (MEDIUM): the unresolved
     });
     await fillAndSubmit("5", "restock from supplier");
     expect(unresolvedOutcomeWarningVisible()).toBe(true);
+  });
 
-    // The documented reconciliation path: a request that is actually
-    // known, definitively, to have succeeded.
-    fetchMock.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) });
+  // Chat 3 Finding 1 (HIGH), round 4 — the decisive regression test.
+  // The previous version of this suite asserted the OPPOSITE of this:
+  // that a later successful retry cleared the warning. That assumption
+  // was unsound — a retry succeeding proves only that the RETRY
+  // committed, never that the EARLIER, still-ambiguous request did or
+  // did not ALSO commit (both may have, producing a duplicate stock
+  // change the admin would otherwise believe was ruled out).
+  it("Chat 3 Finding 1 (HIGH): a later independent retry returning 2xx must NOT clear a still-unresolved outcome from an earlier attempt", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("network down"));
     await fillAndSubmit("5", "restock from supplier");
+    expect(unresolvedOutcomeWarningVisible()).toBe(true);
+
+    // The retry itself succeeds outright...
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) });
+    await fillAndSubmit("3", "second attempt, unrelated to the ambiguous one");
+
+    // ...but the warning from the EARLIER, still-unidentified attempt
+    // must still be visible: this success is not reconciliation.
+    expect(unresolvedOutcomeWarningVisible()).toBe(true);
+    expect(refresh).toHaveBeenCalledTimes(2);
+
+    // And it survives yet another successful attempt after that, too —
+    // this is a one-way latch for the rest of the session, not a
+    // one-time grace period.
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) });
+    await fillAndSubmit("1", "third attempt");
+    expect(unresolvedOutcomeWarningVisible()).toBe(true);
+  });
+
+  // Requirement 7: normal behavior is preserved when no earlier request
+  // ever had an unknown outcome — the warning must never appear out of
+  // nowhere on an ordinary, uneventful successful submission.
+  it("never shows the warning for an ordinary successful submission when no earlier attempt was ever ambiguous", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) });
+    await fillAndSubmit("5", "ordinary restock");
+
     expect(unresolvedOutcomeWarningVisible()).toBe(false);
+    expect(refresh).toHaveBeenCalledTimes(1);
   });
 });
