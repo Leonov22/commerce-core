@@ -1,12 +1,13 @@
 /**
  * Chat 3 Finding 3 (MEDIUM), Finding 1 (HIGH, round 4), the round-5
- * remount-persistence Finding (HIGH), and the round-6
- * restoration/storage-failure-safety Finding (HIGH) — regression
- * tests for `AdminInventoryAdjustForm`'s unresolved-outcome warning.
- * Needs a real DOM and `react-dom/client` (jsdom, no `react-server`
- * resolve condition) — matched by `vitest.config.ts`'s "client"
- * project, the same one `cart-context.strict-mode.test.ts` uses, via
- * the `*.client.test.ts` naming added alongside it. Written with
+ * remount-persistence Finding (HIGH), the round-6
+ * restoration/storage-failure-safety Finding (HIGH), and the round-7
+ * stale-request Finding (HIGH) — regression tests for
+ * `AdminInventoryAdjustForm`'s unresolved-outcome warning. Needs a
+ * real DOM and `react-dom/client` (jsdom, no `react-server` resolve
+ * condition) — matched by `vitest.config.ts`'s "client" project, the
+ * same one `cart-context.strict-mode.test.ts` uses, via the
+ * `*.client.test.ts` naming added alongside it. Written with
  * `React.createElement` rather than JSX for the same reason that file
  * gives: staying out of the one `.test.tsx` file in the suite.
  */
@@ -32,6 +33,17 @@ function setNativeValue(element: HTMLInputElement, value: string) {
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
   setter.call(element, value);
   element.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+/** Round 7: a controllable, pending `fetch` response — settled explicitly by the test, at the exact moment it chooses, rather than via a mock that resolves immediately. */
+function createDeferredResponse<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 describe("AdminInventoryAdjustForm — Chat 3 Finding 3 (MEDIUM): the unresolved-outcome warning", () => {
@@ -386,5 +398,148 @@ describe("AdminInventoryAdjustForm — Chat 3 Finding 3 (MEDIUM): the unresolved
     await rerenderWithProductId("product-3");
 
     expect(unresolvedOutcomeWarningVisible()).toBe(true);
+  });
+
+  // Round 7, Test A — stale rejection. `handleSubmit` closes over
+  // product-1's `productId` when the admin submits; if the admin then
+  // switches to product-2 on this SAME component instance before that
+  // request settles, its eventual rejection must not leak into
+  // product-2's warning/error/input/submission state — but product-1's
+  // OWN ambiguity must still be correctly recorded under product-1's
+  // own key, regardless.
+  it("Round 7, Test A: a stale rejection does not leak into a different product's visible state, and the original product's ambiguity is still persisted under its own key", async () => {
+    const deferredA = createDeferredResponse<unknown>();
+    fetchMock.mockImplementationOnce(() => deferredA.promise);
+
+    // Submit for product-1, leaving its request pending.
+    await fillAndSubmit("5", "restock for product-1");
+
+    // Switch to product-2 on the SAME instance, completing ITS OWN
+    // restoration (no unmount at all).
+    await rerenderWithProductId("product-2");
+    expect(unresolvedOutcomeWarningVisible()).toBe(false);
+    expect(container.textContent ?? "").not.toContain("NETWORK_ERROR");
+
+    // Only now does product-1's request actually reject.
+    await act(async () => {
+      deferredA.reject(new Error("network down for product-1"));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // product-2's warning, error text, and submit control must be
+    // completely unaffected by product-1's stale rejection.
+    expect(unresolvedOutcomeWarningVisible()).toBe(false);
+    expect(container.textContent ?? "").not.toContain("NETWORK_ERROR");
+    const button = container.querySelector("button[type=submit]") as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+    expect(button.textContent).toBe("Adjust stock");
+
+    // product-1's own ambiguity must still exist, under product-1's
+    // own key — switching to product-2 must never be mistaken for
+    // reconciling product-1.
+    expect(adjustStorage.readUnresolvedAdjustmentOutcome("product-1")).toEqual({
+      status: "present",
+    });
+  });
+
+  // Round 7, Test B — stale success. A later success for the ORIGINAL
+  // product must not clear or otherwise change the CURRENTLY displayed
+  // different product's own, independently-typed input values.
+  it("Round 7, Test B: a stale success does not clear or change a different product's own input values", async () => {
+    const deferredA = createDeferredResponse<unknown>();
+    fetchMock.mockImplementationOnce(() => deferredA.promise);
+
+    await fillAndSubmit("7", "restock for product-1, stale success");
+
+    await rerenderWithProductId("product-2");
+
+    // product-2's own, independent input — never submitted.
+    const quantityInput = container.querySelector<HTMLInputElement>("#quantity")!;
+    const reasonInput = container.querySelector<HTMLInputElement>("#adjustReason")!;
+    setNativeValue(quantityInput, "99");
+    setNativeValue(reasonInput, "product-2's own unsaved input");
+
+    await act(async () => {
+      deferredA.resolve({ ok: true, status: 200, json: async () => ({}) });
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // If product-1's stale success had been applied to the currently
+    // displayed form, these would have been cleared to "".
+    expect(quantityInput.value).toBe("99");
+    expect(reasonInput.value).toBe("product-2's own unsaved input");
+    expect(unresolvedOutcomeWarningVisible()).toBe(false);
+  });
+
+  // Round 7, Test C — stale non-2xx response. The ORIGINAL product's
+  // error response must not overwrite the CURRENTLY displayed
+  // different product's own error state.
+  it("Round 7, Test C: a stale non-2xx response does not overwrite a different product's error state", async () => {
+    const deferredA = createDeferredResponse<unknown>();
+    fetchMock.mockImplementationOnce(() => deferredA.promise);
+
+    await fillAndSubmit("5", "restock for product-1");
+
+    await rerenderWithProductId("product-2");
+
+    await act(async () => {
+      deferredA.resolve({
+        ok: false,
+        status: 400,
+        json: async () => ({ error: "PRODUCT_1_SPECIFIC_ERROR" }),
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.textContent ?? "").not.toContain("PRODUCT_1_SPECIFIC_ERROR");
+  });
+
+  // Round 7, Test D — submission state isolation. The ORIGINAL
+  // product's in-flight (then completed) request must never enable or
+  // disable the CURRENTLY displayed different product's own submit
+  // control, and that different product must still be able to submit
+  // its own adjustment normally once its own restoration is ready.
+  it("Round 7, Test D: a different product's stale completion cannot toggle this product's submit control, and this product can still submit normally", async () => {
+    const deferredA = createDeferredResponse<unknown>();
+    fetchMock.mockImplementationOnce(() => deferredA.promise);
+
+    await fillAndSubmit("5", "restock for product-1");
+
+    await rerenderWithProductId("product-2");
+
+    const button = container.querySelector("button[type=submit]") as HTMLButtonElement;
+    // product-2's own button is already enabled — not stuck "Saving…"
+    // just because product-1 has a request in flight in the background.
+    expect(button.disabled).toBe(false);
+    expect(button.textContent).toBe("Adjust stock");
+
+    // product-1's request resolves while product-2 is displayed.
+    await act(async () => {
+      deferredA.resolve({ ok: true, status: 200, json: async () => ({}) });
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Still enabled — product-1's completion did not toggle it either way.
+    expect(button.disabled).toBe(false);
+    expect(button.textContent).toBe("Adjust stock");
+
+    // And product-2 can genuinely submit its own adjustment now.
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) });
+    await fillAndSubmit("3", "product-2's own real submission");
+
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "/api/admin/inventory/product-2/adjust",
+      expect.objectContaining({
+        body: JSON.stringify({ quantityChange: 3, reason: "product-2's own real submission" }),
+      }),
+    );
   });
 });

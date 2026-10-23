@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useRouter } from "@/core/i18n/navigation";
 import { Button } from "@/shared/components/ui/button";
 import { Input } from "@/shared/components/ui/input";
@@ -133,6 +133,47 @@ type Direction = "increase" | "decrease";
  * already taken over — inert today since `sessionStorage` reads are
  * synchronous, but the explicit, standard React idiom for exactly this
  * class of bug if that read ever stopped being synchronous.
+ *
+ * Chat 3 Finding (HIGH), round 7 — round 6 fixed `productId` changing
+ * SYNCHRONOUSLY, but `handleSubmit` itself is `async`: it closes over
+ * the `productId` that was current when the admin clicked submit,
+ * `await`s `fetch`, and only resumes afterward. Nothing stops
+ * `productId` from changing (synchronously, per round 6) WHILE that
+ * `fetch` is still in flight — the admin can submit for product A,
+ * then navigate to product B on this SAME component instance before
+ * A's request ever settles. When it finally does settle, the
+ * resumed code was about to call `setErrorCode`/`setHasUnknownOutcome`/
+ * `setPersistenceConfirmed`/`setQuantity`/`setReason`/`setIsSubmitting`
+ * — every one of which is CURRENTLY-VISIBLE, shared state that, by
+ * then, belongs to product B's own rendering, not A's.
+ *
+ * `generationRef` is a plain `useRef` counter, incremented in the
+ * SAME synchronous block that already resets state on a `productId`
+ * change (so it is never one tick behind that reset). Each submission
+ * captures the counter's value at the moment the admin actually
+ * confirmed it (`submissionGeneration`, right before the first
+ * `await`); `stillCurrent()` compares that snapshot against the
+ * counter's CURRENT value at each point afterward where the code is
+ * about to touch shared state. If they no longer match, this
+ * submission belongs to a product that is no longer displayed, and
+ * every one of those setters is skipped — not merely the warning, but
+ * `errorCode`/`quantity`/`reason`/`isSubmitting` too, since all of
+ * them are equally visible, equally shared, and equally wrong to
+ * mutate on behalf of a product the admin has since navigated away
+ * from. `AbortController` was deliberately NOT used for this: aborting
+ * the outgoing request only stops THIS CLIENT from waiting on it — it
+ * proves nothing about whether the server already committed the
+ * adjustment, which is exactly the ambiguity this form exists to
+ * surface, never to paper over by pretending the request never
+ * happened.
+ *
+ * The one deliberate exception: `markAdjustmentOutcomeUnresolved` is
+ * still called, keyed by the SUBMISSION's own original product id —
+ * never the currently-displayed one — regardless of staleness. A's
+ * own persisted ambiguity must exist whether or not the admin has
+ * since moved on to B, and moving on to B must never be mistaken for
+ * reconciling A (see this component's own round 4/5 reasoning for why
+ * nothing is ever allowed to look like reconciliation that isn't).
  */
 type RestorationState = "pending" | "ready";
 
@@ -151,16 +192,29 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
   // comment (round 6) for why that distinction changes the copy below.
   const [persistenceConfirmed, setPersistenceConfirmed] = useState(true);
   const [currentProductId, setCurrentProductId] = useState(productId);
+  // Round 7: see this component's own doc comment. A plain `useRef`,
+  // not state — nothing ever renders based on its value directly, it
+  // only needs to be read/incremented synchronously and survive
+  // across renders, which a ref already does without triggering an
+  // extra one.
+  const generationRef = useRef(0);
 
   // Round 6: resets synchronously, DURING render, the moment a new
   // `productId` prop is observed on this already-mounted instance —
   // see this component's own doc comment for why this must not be an
-  // effect.
+  // effect. Round 7: also resets `isSubmitting` — a newly-displayed
+  // product has never submitted anything of its own yet, regardless
+  // of whether the PREVIOUS product's own request is still pending in
+  // the background — and bumps `generationRef`, which is what lets
+  // that previous product's eventual completion recognize itself as
+  // stale once it resumes.
   if (productId !== currentProductId) {
+    generationRef.current += 1;
     setCurrentProductId(productId);
     setHasUnknownOutcome(false);
     setRestorationState("pending");
     setPersistenceConfirmed(true);
+    setIsSubmitting(false);
   }
 
   // Chat 3 Finding (HIGH), round 5: starts `false`/`"pending"` on
@@ -254,15 +308,31 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
       return;
     }
 
+    // Round 7: snapshot taken at the LAST possible synchronous point —
+    // immediately before the first `await` — so it reflects exactly
+    // which product this specific submission is for. Nothing async
+    // has happened yet, so `generationRef.current` is still guaranteed
+    // to equal `submissionGeneration` right now; the only question is
+    // whether it STILL will once this resumes after `fetch` settles.
+    const submissionProductId = productId;
+    const submissionGeneration = generationRef.current;
+    const stillCurrent = () => generationRef.current === submissionGeneration;
+
     setIsSubmitting(true);
     try {
-      const response = await fetch(`/api/admin/inventory/${productId}/adjust`, {
+      const response = await fetch(`/api/admin/inventory/${submissionProductId}/adjust`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ quantityChange, reason: reason.trim() }),
       });
       if (!response.ok) {
         const data: { error?: string } = await response.json().catch(() => ({}));
+        if (!stillCurrent()) {
+          // Round 7: this product is no longer the one displayed —
+          // never overwrite whatever error state (or anything else)
+          // the CURRENTLY displayed product's own form already has.
+          return;
+        }
         setErrorCode(data.error ?? "UNKNOWN_ERROR");
         // Deliberately NOT touching `hasUnknownOutcome` here. This
         // response is evidence about THIS attempt only — never about
@@ -275,6 +345,13 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
         router.refresh();
         return;
       }
+      if (!stillCurrent()) {
+        // Round 7: a stale SUCCESS must not clear the currently
+        // displayed product's own quantity/reason either — this
+        // request's success says nothing about what the admin is
+        // doing with a different product right now.
+        return;
+      }
       setQuantity("");
       setReason("");
       // Chat 3 Finding 1 (HIGH), round 4: deliberately NOT clearing
@@ -285,26 +362,48 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
       // `hasUnknownOutcome` is already `false` and nothing changes.
       router.refresh();
     } catch {
+      // Round 7: the storage write is keyed to `submissionProductId` —
+      // the product this submission was ACTUALLY for — and happens
+      // UNCONDITIONALLY, regardless of staleness. A's own ambiguity
+      // must be recorded whether or not the admin has since moved on
+      // to B; navigating to B is never allowed to look like
+      // reconciling A.
+      const persisted = markAdjustmentOutcomeUnresolved(submissionProductId);
+      if (!stillCurrent()) {
+        // The CURRENTLY displayed product's own in-memory warning/
+        // error state belongs to a different product now — never
+        // touch it on behalf of this stale rejection. A's own
+        // ambiguity is already correctly recorded above, under A's
+        // own key, independent of anything below this line.
+        return;
+      }
       setErrorCode("NETWORK_ERROR");
       // Genuinely ambiguous: the request may have reached the server
       // and been applied despite this client never seeing a response.
       // The in-memory flag is set UNCONDITIONALLY — this mount's own
       // warning must show regardless of whether persisting it below
-      // actually succeeds. Persisted (round 5) in the SAME event as the
-      // in-memory flag, so a remount of this exact product's form
+      // actually succeeded. Persisted (round 5) in the SAME event as
+      // the in-memory flag, so a remount of this exact product's form
       // within this tab normally picks the ambiguity back up instead of
       // losing it — but round 6: the write can itself fail, so its own
       // result is what `persistenceConfirmed` reflects, never an
       // assumption that it worked.
       setHasUnknownOutcome(true);
-      const persisted = markAdjustmentOutcomeUnresolved(productId);
       setPersistenceConfirmed(persisted);
       // Refresh anyway — if the adjustment actually went through, the
       // stock/history below will already show it, which is the admin's
       // best evidence for deciding whether to resubmit.
       router.refresh();
     } finally {
-      setIsSubmitting(false);
+      // Round 7: only this submission's OWN generation may clear
+      // `isSubmitting` — if stale, either the currently displayed
+      // product was never submitting on this request's behalf (reset
+      // to `false` already, synchronously, the moment `productId`
+      // changed) or it has its OWN, unrelated submission in flight
+      // whose loading state this must not clobber.
+      if (stillCurrent()) {
+        setIsSubmitting(false);
+      }
     }
   }
 
