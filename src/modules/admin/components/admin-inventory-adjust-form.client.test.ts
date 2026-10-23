@@ -1,10 +1,11 @@
 /**
- * Chat 3 Finding 3 (MEDIUM) and Finding 1 (HIGH, round 4) regression
- * tests for `AdminInventoryAdjustForm`'s unresolved-outcome warning.
- * Needs a real DOM and `react-dom/client` (jsdom, no `react-server`
- * resolve condition) — matched by `vitest.config.ts`'s "client"
- * project, the same one `cart-context.strict-mode.test.ts` uses, via
- * the `*.client.test.ts` naming added alongside it. Written with
+ * Chat 3 Finding 3 (MEDIUM), Finding 1 (HIGH, round 4), and the
+ * round-5 remount-persistence Finding (HIGH) — regression tests for
+ * `AdminInventoryAdjustForm`'s unresolved-outcome warning. Needs a
+ * real DOM and `react-dom/client` (jsdom, no `react-server` resolve
+ * condition) — matched by `vitest.config.ts`'s "client" project, the
+ * same one `cart-context.strict-mode.test.ts` uses, via the
+ * `*.client.test.ts` naming added alongside it. Written with
  * `React.createElement` rather than JSX for the same reason that file
  * gives: staying out of the one `.test.tsx` file in the suite.
  */
@@ -36,8 +37,12 @@ describe("AdminInventoryAdjustForm — Chat 3 Finding 3 (MEDIUM): the unresolved
   let root: Root;
   let fetchMock: ReturnType<typeof vi.fn>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     refresh.mockClear();
+    // Round 5's whole point is `sessionStorage` persistence — tests
+    // must start from a clean slate, never bleeding a flag set by one
+    // test into the next one running in this same jsdom `window`.
+    window.sessionStorage.clear();
     container = document.createElement("div");
     document.body.appendChild(container);
 
@@ -45,10 +50,7 @@ describe("AdminInventoryAdjustForm — Chat 3 Finding 3 (MEDIUM): the unresolved
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("confirm", vi.fn().mockReturnValue(true));
 
-    act(() => {
-      root = createRoot(container);
-      root.render(createElement(AdminInventoryAdjustForm, { productId: "product-1" }));
-    });
+    await mount("product-1");
   });
 
   afterEach(() => {
@@ -57,7 +59,34 @@ describe("AdminInventoryAdjustForm — Chat 3 Finding 3 (MEDIUM): the unresolved
     });
     container.remove();
     vi.unstubAllGlobals();
+    window.sessionStorage.clear();
   });
+
+  async function mount(productId: string) {
+    await act(async () => {
+      root = createRoot(container);
+      root.render(createElement(AdminInventoryAdjustForm, { productId }));
+      // Flushes the mount effect that reads `sessionStorage` — a
+      // synchronous `act` callback does not reliably guarantee passive
+      // effects have run yet, an `async` one awaiting a microtask does.
+      await Promise.resolve();
+    });
+  }
+
+  /**
+   * Round 5: simulates exactly what the Finding describes — this
+   * component instance is destroyed and a genuinely NEW one is
+   * created, e.g. by leaving this product's inventory page and coming
+   * back — never merely re-rendering the same mounted instance (which
+   * would never lose in-memory state in the first place and would
+   * prove nothing about this round's own fix).
+   */
+  async function remount(productId: string) {
+    act(() => {
+      root.unmount();
+    });
+    await mount(productId);
+  }
 
   async function fillAndSubmit(quantity: string, reason: string) {
     const quantityInput = container.querySelector<HTMLInputElement>("#quantity")!;
@@ -172,5 +201,39 @@ describe("AdminInventoryAdjustForm — Chat 3 Finding 3 (MEDIUM): the unresolved
 
     expect(unresolvedOutcomeWarningVisible()).toBe(false);
     expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  // Round 5, the decisive regression test for the Finding itself: a
+  // network failure followed by an ORDINARY UNMOUNT/REMOUNT (not a
+  // re-render of the same instance) for the SAME product must not lose
+  // the ambiguity. Round 4 alone could not catch this, since it never
+  // destroyed and recreated the component instance.
+  it("Chat 3 Finding (HIGH), round 5: a fetch rejection's warning survives unmounting and remounting the form for the SAME product", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("network down"));
+    await fillAndSubmit("5", "restock from supplier");
+    expect(unresolvedOutcomeWarningVisible()).toBe(true);
+
+    await remount("product-1");
+
+    expect(unresolvedOutcomeWarningVisible()).toBe(true);
+  });
+
+  it("Chat 3 Finding (HIGH), round 5: an unresolved outcome for one product never contaminates a different product's form", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("network down"));
+    await fillAndSubmit("5", "restock from supplier");
+    expect(unresolvedOutcomeWarningVisible()).toBe(true);
+
+    // A DIFFERENT product, mounted fresh (as Next.js's own routing
+    // would do for a different `[productId]` route segment) — this is
+    // not the same product remounting, it's an entirely different one.
+    await remount("product-2");
+
+    expect(unresolvedOutcomeWarningVisible()).toBe(false);
+
+    // And switching back to the original product's own form still
+    // shows ITS warning — proving the isolation is per-product, not a
+    // side effect of simply clearing on any remount.
+    await remount("product-1");
+    expect(unresolvedOutcomeWarningVisible()).toBe(true);
   });
 });

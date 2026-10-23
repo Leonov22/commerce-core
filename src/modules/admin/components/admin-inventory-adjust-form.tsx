@@ -1,10 +1,14 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { useRouter } from "@/core/i18n/navigation";
 import { Button } from "@/shared/components/ui/button";
 import { Input } from "@/shared/components/ui/input";
 import { Select } from "@/shared/components/ui/select";
+import {
+  hasUnresolvedAdjustmentOutcome,
+  markAdjustmentOutcomeUnresolved,
+} from "@/modules/admin/components/admin-inventory-adjust-storage";
 
 interface AdminInventoryAdjustFormProps {
   productId: string;
@@ -58,16 +62,32 @@ type Direction = "increase" | "decrease";
  * reconciliation mechanism that cannot actually identify the original
  * request (see this round's own report for the proposed
  * `clientRequestId` column, not implemented here). So once an outcome
- * goes unknown, `hasUnknownOutcome` never flips back to `false` again
- * for the rest of this component's mounted lifetime, REGARDLESS of
- * what any later request — success, non-2xx, or another network
- * failure — reports. `router.refresh()` only refreshes displayed data;
- * it is never treated as authoritative reconciliation of which request
- * actually committed. The warning's own copy and the resubmission
- * confirm dialog both say this plainly, so an admin is never misled
- * into thinking a later success "cleared" the risk, and is told to
- * check the stock history for a duplicate rather than keep retrying
- * blindly.
+ * goes unknown, `hasUnknownOutcome` never flips back to `false` again,
+ * REGARDLESS of what any later request — success, non-2xx, or another
+ * network failure — reports. `router.refresh()` only refreshes
+ * displayed data; it is never treated as authoritative reconciliation
+ * of which request actually committed.
+ *
+ * Chat 3 Finding (HIGH), round 5: "for the rest of this component's
+ * mounted lifetime" (round 4's own limit) was not actually enough —
+ * React local state does not survive this component unmounting, which
+ * happens on perfectly ordinary navigation (leaving this product's
+ * inventory page and coming back), silently resetting a real,
+ * still-open ambiguity back to "resolved" while the SAME inventory
+ * item remained fully actionable. `admin-inventory-adjust-storage.ts`
+ * persists the flag in `sessionStorage`, keyed by `productId`, scoped
+ * to exactly the current browser tab (see that module's own doc
+ * comment for why `sessionStorage` rather than `localStorage`) — read
+ * once on mount via `useEffect` (never during the initial render
+ * itself, which would make the server-rendered and client-hydrated
+ * output disagree — a hydration mismatch — since `sessionStorage`
+ * doesn't exist during SSR) and written only at the exact same moment
+ * `hasUnknownOutcome` itself is set to `true`. Nothing else about this
+ * round's own logic changed: still a one-way latch, still never
+ * cleared by any later response, still never treated as reconciled by
+ * `router.refresh()`. The warning's own copy and the resubmission
+ * confirm dialog now say "this browser tab" rather than "this
+ * session," to describe the actual persistence scope accurately.
  */
 export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustFormProps) {
   const router = useRouter();
@@ -77,6 +97,19 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorCode, setErrorCode] = useState<string | null>(null);
   const [hasUnknownOutcome, setHasUnknownOutcome] = useState(false);
+
+  // Chat 3 Finding (HIGH), round 5: starts `false` on every render
+  // (including the server-rendered one) and only reads `sessionStorage`
+  // here, in an effect — never in the initial state itself — so the
+  // server-rendered HTML and the client's first hydration pass always
+  // agree; this one-render "no warning, then possibly a warning" flash
+  // for a returning tab is the same accepted tradeoff `cart-context.tsx`
+  // documents for its own `localStorage` hydration.
+  useEffect(() => {
+    if (hasUnresolvedAdjustmentOutcome(productId)) {
+      setHasUnknownOutcome(true);
+    }
+  }, [productId]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -98,11 +131,12 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
 
     if (hasUnknownOutcome) {
       const acknowledgedRisk = window.confirm(
-        "An earlier attempt's outcome is still unknown, and will stay unresolved for the rest " +
-          "of this session — even if this new attempt succeeds. That earlier attempt may " +
-          "already have been applied, so submitting again could create a DUPLICATE stock " +
-          "change. Do not keep retrying based on this page alone: check the stock history " +
-          "below for a possible duplicate first. Submit this adjustment anyway?",
+        "An earlier attempt's outcome is still unknown, and will stay unresolved for this " +
+          "product in this browser tab — even if this new attempt succeeds, and even if you " +
+          "leave and come back to this page. That earlier attempt may already have been " +
+          "applied, so submitting again could create a DUPLICATE stock change. Do not keep " +
+          "retrying based on this page alone: check the stock history below for a possible " +
+          "duplicate first. Submit this adjustment anyway?",
       );
       if (!acknowledgedRisk) {
         return;
@@ -150,7 +184,11 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
       setErrorCode("NETWORK_ERROR");
       // Genuinely ambiguous: the request may have reached the server
       // and been applied despite this client never seeing a response.
+      // Persisted (round 5) in the SAME place and at the SAME moment as
+      // the in-memory flag, so a remount of this exact product's form
+      // within this tab picks the ambiguity back up instead of losing it.
       setHasUnknownOutcome(true);
+      markAdjustmentOutcomeUnresolved(productId);
       // Refresh anyway — if the adjustment actually went through, the
       // stock/history below will already show it, which is the admin's
       // best evidence for deciding whether to resubmit.
@@ -172,11 +210,11 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
           className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-sm text-amber-700 dark:text-amber-400"
         >
           An earlier attempt&rsquo;s outcome is unknown — it may already have been applied on the
-          server even though this page never confirmed it. This warning will stay visible for the
-          rest of this session, even after a later attempt succeeds, because a later success does
-          not prove the earlier one failed: if both went through, stock may now be adjusted twice.
-          Do not keep retrying based on this page alone — check the stock history below for a
-          possible duplicate.
+          server even though this page never confirmed it. This warning will stay visible for this
+          product in this browser tab, even after a later attempt succeeds and even if you leave
+          this page and come back, because a later success does not prove the earlier one failed: if
+          both went through, stock may now be adjusted twice. Do not keep retrying based on this
+          page alone — check the stock history below for a possible duplicate.
         </div>
       ) : null}
       {errorCode ? (
