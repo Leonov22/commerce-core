@@ -475,17 +475,49 @@ describe("AdminInventoryAdjustForm — Chat 3 Finding 3 (MEDIUM): the unresolved
     expect(unresolvedOutcomeWarningVisible()).toBe(false);
   });
 
-  // Round 7, Test C — stale non-2xx response. The ORIGINAL product's
-  // error response must not overwrite the CURRENTLY displayed
-  // different product's own error state.
-  it("Round 7, Test C: a stale non-2xx response does not overwrite a different product's error state", async () => {
+  // Round 7, Test C, STRENGTHENED in round 8 — stale non-2xx response.
+  // The original (round 7) version of this test only confirmed
+  // product-1's error text never appeared on product-2's form — but
+  // product-2 never had any error of its own to begin with, so that
+  // assertion would have passed even if product-1's stale response
+  // HAD overwritten product-2's error with something else entirely.
+  // This version first gives product-2 a REAL, distinguishable error
+  // of its own (via product-2's own, independent, deferred submission)
+  // before product-1's stale request is allowed to resolve — so the
+  // test actually proves product-2's own error survives UNCHANGED,
+  // not merely that one specific string is absent.
+  it("Round 7/8, Test C: a stale non-2xx response for one product does not overwrite a different, already-erroring product's own error state", async () => {
     const deferredA = createDeferredResponse<unknown>();
     fetchMock.mockImplementationOnce(() => deferredA.promise);
 
+    // Submit for product-1, leaving its request pending.
     await fillAndSubmit("5", "restock for product-1");
 
+    // Switch to product-2 on the SAME instance, completing its own
+    // restoration.
     await rerenderWithProductId("product-2");
 
+    // Establish product-2's OWN, real, distinguishable error —
+    // independent of product-1's still-pending request — via its own
+    // deferred submission, kept deterministic rather than relying on
+    // any implicit mock-resolution ordering.
+    const deferredB = createDeferredResponse<unknown>();
+    fetchMock.mockImplementationOnce(() => deferredB.promise);
+    await fillAndSubmit("9", "restock for product-2, which will fail");
+    await act(async () => {
+      deferredB.resolve({
+        ok: false,
+        status: 422,
+        json: async () => ({ error: "PRODUCT_2_OWN_ERROR" }),
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent ?? "").toContain("PRODUCT_2_OWN_ERROR");
+
+    // Only now does product-1's stale request resolve, with a non-2xx
+    // response bearing ITS OWN, differently-named error.
     await act(async () => {
       deferredA.resolve({
         ok: false,
@@ -497,6 +529,9 @@ describe("AdminInventoryAdjustForm — Chat 3 Finding 3 (MEDIUM): the unresolved
       await Promise.resolve();
     });
 
+    // product-2's own, already-displayed error must survive exactly
+    // as it was; product-1's stale error must never appear at all.
+    expect(container.textContent ?? "").toContain("PRODUCT_2_OWN_ERROR");
     expect(container.textContent ?? "").not.toContain("PRODUCT_1_SPECIFIC_ERROR");
   });
 

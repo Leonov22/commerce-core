@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { useRouter } from "@/core/i18n/navigation";
 import { Button } from "@/shared/components/ui/button";
 import { Input } from "@/shared/components/ui/input";
@@ -147,9 +147,7 @@ type Direction = "increase" | "decrease";
  * — every one of which is CURRENTLY-VISIBLE, shared state that, by
  * then, belongs to product B's own rendering, not A's.
  *
- * `generationRef` is a plain `useRef` counter, incremented in the
- * SAME synchronous block that already resets state on a `productId`
- * change (so it is never one tick behind that reset). Each submission
+ * `generationRef` is a plain `useRef` counter. Each submission
  * captures the counter's value at the moment the admin actually
  * confirmed it (`submissionGeneration`, right before the first
  * `await`); `stillCurrent()` compares that snapshot against the
@@ -174,6 +172,72 @@ type Direction = "increase" | "decrease";
  * since moved on to B, and moving on to B must never be mistaken for
  * reconciling A (see this component's own round 4/5 reasoning for why
  * nothing is ever allowed to look like reconciliation that isn't).
+ *
+ * Chat 3 Finding (MAJOR), round 8 — round 7 incremented
+ * `generationRef.current` INSIDE the render-phase `if (productId !==
+ * currentProductId)` block, alongside the `setState` calls. That is
+ * unsafe in a way the `setState` calls next to it are not: React can
+ * call a component's render function more than once for what ends up
+ * being a SINGLE eventual commit (React Strict Mode's extra
+ * development round-trip, or — the more consequential case —
+ * concurrent rendering starting a render speculatively and then
+ * abandoning it, e.g. because a higher-priority update interrupts it
+ * before it ever commits). React's own state updates are safe to
+ * repeat or discard this way: an abandoned render's `setState` calls
+ * are simply discarded along with the rest of that render, as if they
+ * never happened, and a genuinely retried render recomputes the SAME
+ * state from the SAME props deterministically. A plain `useRef`
+ * mutation has NO such protection — writing to `generationRef.current`
+ * during a render that never commits still leaves that write in
+ * place, forever, with nothing to ever correct it, because nothing
+ * about React's render/commit cycle is aware that ref — unlike
+ * state — needs to be rolled back. Concretely: if React speculatively
+ * started rendering toward product B while product A's own request
+ * was genuinely still in flight and still the one actually displayed,
+ * and that speculative render was then abandoned (B never actually
+ * shown), the OLD code's render-phase bump would have already
+ * invalidated A's own, entirely legitimate, still-current request —
+ * even though the admin never actually left product A.
+ *
+ * The fix moves the bump into a `useLayoutEffect`'s CLEANUP, keyed on
+ * `[productId]`, instead of the render body:
+ *
+ *   useLayoutEffect(() => {
+ *     return () => { generationRef.current += 1; };
+ *   }, [productId]);
+ *
+ * This is correct under BOTH failure modes the render-phase version
+ * had, for two different reasons:
+ *   1. Abandoned renders: a `useLayoutEffect` (its setup AND its
+ *      cleanup) is only ever invoked by React for a render that
+ *      ACTUALLY COMMITTED — never for one that was started and then
+ *      discarded. An abandoned speculative render toward B therefore
+ *      cannot bump this at all; the bump only happens once React has
+ *      genuinely committed to showing a different product.
+ *   2. The commit-to-cleanup window: `useLayoutEffect`'s cleanup for
+ *      the PREVIOUS commit runs SYNCHRONOUSLY, as part of the very
+ *      same uninterrupted synchronous phase as the commit that
+ *      replaces it — before the browser paints, and before control is
+ *      ever yielded back to the microtask queue. A regular
+ *      `useEffect` (used elsewhere in this component, for the
+ *      restoration read) is deliberately NOT used for this specific
+ *      bump: passive effects are scheduled to run AFTER paint, which
+ *      leaves a real window, between "the new product has committed"
+ *      and "the passive effect queue gets around to running," during
+ *      which a stale request's OWN microtask-scheduled continuation
+ *      (its `await fetch(...)` resolving) could resume and find
+ *      `generationRef` not yet bumped — passing `stillCurrent()` by
+ *      accident and mutating the NEWLY committed product's state
+ *      anyway. `useLayoutEffect`'s synchronous timing closes that gap
+ *      to zero: nothing else can run between the commit and the bump.
+ *
+ * The render-phase block still synchronously resets
+ * `hasUnknownOutcome`/`restorationState`/`persistenceConfirmed`/
+ * `isSubmitting`/`currentProductId` exactly as round 6/7 did — ONLY
+ * the generation bump moved out of it. Those `setState` calls remain
+ * safe to run during render precisely because they ARE state, with
+ * React's own discard-on-abandon guarantee already covering them;
+ * nothing about THIS round changes that reasoning, or needs to.
  */
 type RestorationState = "pending" | "ready";
 
@@ -194,9 +258,11 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
   const [currentProductId, setCurrentProductId] = useState(productId);
   // Round 7: see this component's own doc comment. A plain `useRef`,
   // not state — nothing ever renders based on its value directly, it
-  // only needs to be read/incremented synchronously and survive
-  // across renders, which a ref already does without triggering an
-  // extra one.
+  // only needs to be read synchronously inside `handleSubmit` and
+  // survive across renders, which a ref already does without
+  // triggering an extra one. Round 8: bumped from a `useLayoutEffect`
+  // cleanup below, never from render itself — see this component's
+  // own doc comment for why.
   const generationRef = useRef(0);
 
   // Round 6: resets synchronously, DURING render, the moment a new
@@ -205,17 +271,28 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
   // effect. Round 7: also resets `isSubmitting` — a newly-displayed
   // product has never submitted anything of its own yet, regardless
   // of whether the PREVIOUS product's own request is still pending in
-  // the background — and bumps `generationRef`, which is what lets
-  // that previous product's eventual completion recognize itself as
-  // stale once it resumes.
+  // the background. Round 8: no longer touches `generationRef` here —
+  // see the `useLayoutEffect` below and this component's own doc
+  // comment for why that bump moved out of render.
   if (productId !== currentProductId) {
-    generationRef.current += 1;
     setCurrentProductId(productId);
     setHasUnknownOutcome(false);
     setRestorationState("pending");
     setPersistenceConfirmed(true);
     setIsSubmitting(false);
   }
+
+  // Chat 3 Finding (MAJOR), round 8: the ONLY place `generationRef` is
+  // ever written. A `useLayoutEffect`'s cleanup runs synchronously,
+  // immediately after a commit, before paint and before any other
+  // microtask gets a chance to run — and only ever for a render that
+  // actually committed, never an abandoned one. See this component's
+  // own doc comment for the full reasoning.
+  useLayoutEffect(() => {
+    return () => {
+      generationRef.current += 1;
+    };
+  }, [productId]);
 
   // Chat 3 Finding (HIGH), round 5: starts `false`/`"pending"` on
   // every render (including the server-rendered one) and only reads
