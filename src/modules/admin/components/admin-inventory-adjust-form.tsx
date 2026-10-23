@@ -6,7 +6,7 @@ import { Button } from "@/shared/components/ui/button";
 import { Input } from "@/shared/components/ui/input";
 import { Select } from "@/shared/components/ui/select";
 import {
-  hasUnresolvedAdjustmentOutcome,
+  readUnresolvedAdjustmentOutcome,
   markAdjustmentOutcomeUnresolved,
 } from "@/modules/admin/components/admin-inventory-adjust-storage";
 
@@ -85,10 +85,57 @@ type Direction = "increase" | "decrease";
  * `hasUnknownOutcome` itself is set to `true`. Nothing else about this
  * round's own logic changed: still a one-way latch, still never
  * cleared by any later response, still never treated as reconciled by
- * `router.refresh()`. The warning's own copy and the resubmission
- * confirm dialog now say "this browser tab" rather than "this
- * session," to describe the actual persistence scope accurately.
+ * `router.refresh()`.
+ *
+ * Chat 3 Finding (HIGH), round 6 — two gaps round 5 left open:
+ *
+ * 1. Between this component mounting and that `useEffect` actually
+ *    running, `hasUnknownOutcome` still read as its initial `false` —
+ *    a submission in that window could not possibly have seen a real,
+ *    persisted flag, silently skipping the exact protection this whole
+ *    mechanism exists for. `restorationState` makes that window
+ *    explicit (`"pending"` until the stored flag for the CURRENT
+ *    `productId` has actually been checked, `"ready"` after) and
+ *    `handleSubmit` itself refuses to proceed while pending — not
+ *    merely via the submit button's own `disabled` attribute, which
+ *    guards normal clicks but is not what `handleSubmit` itself relies
+ *    on to decide whether it's safe to run.
+ * 2. `readUnresolvedAdjustmentOutcome` can report `"unreadable"` (the
+ *    read itself failed) — round 5's boolean-only read conflated this
+ *    with `"absent"`, meaning a storage failure was silently treated
+ *    as "nothing to worry about." It is instead treated the SAME as
+ *    `"present"` here — conservatively surfacing the warning rather
+ *    than risking a false "all clear" — but flagged as
+ *    `persistenceConfirmed: false`, which changes the warning's own
+ *    copy (see the JSX below) to stop promising a persistence
+ *    guarantee that was never actually confirmed. The exact same
+ *    `persistenceConfirmed` flag also covers a WRITE failure: if
+ *    `markAdjustmentOutcomeUnresolved` reports it could not persist a
+ *    brand-new ambiguity, this mount's own warning still shows (the
+ *    in-memory flag is unconditional), but the copy is honest that it
+ *    might not survive leaving the page.
+ *
+ * Round 6 also fixes `productId` changing on an ALREADY-mounted
+ * instance (Next.js can do this for a dynamic route segment without a
+ * full unmount in some navigation patterns) — resetting
+ * `hasUnknownOutcome`/`restorationState`/`persistenceConfirmed`
+ * SYNCHRONOUSLY, during render, the moment a new `productId` prop is
+ * observed (the React-documented "adjusting state when a prop
+ * changes" pattern — see the `if (productId !== currentProductId)`
+ * block below), rather than in an effect. An effect-based reset would
+ * commit at least one render where the NEW product's form still shows
+ * the OLD product's warning/button state before the effect catches
+ * up; resetting during render itself means React re-renders with the
+ * reset state before anything is ever painted, so that stale frame
+ * never exists. The restoration effect's own stale-result guard (the
+ * `isCurrent` flag) additionally protects against the read itself
+ * resolving out of order for an old `productId` after a newer one has
+ * already taken over — inert today since `sessionStorage` reads are
+ * synchronous, but the explicit, standard React idiom for exactly this
+ * class of bug if that read ever stopped being synchronous.
  */
+type RestorationState = "pending" | "ready";
+
 export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustFormProps) {
   const router = useRouter();
   const [direction, setDirection] = useState<Direction>("increase");
@@ -97,23 +144,70 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorCode, setErrorCode] = useState<string | null>(null);
   const [hasUnknownOutcome, setHasUnknownOutcome] = useState(false);
+  const [restorationState, setRestorationState] = useState<RestorationState>("pending");
+  // Whether the CURRENT `hasUnknownOutcome: true` is reliably backed by
+  // storage — `false` means it either came from an unreadable
+  // restoration or a failed write; see this component's own doc
+  // comment (round 6) for why that distinction changes the copy below.
+  const [persistenceConfirmed, setPersistenceConfirmed] = useState(true);
+  const [currentProductId, setCurrentProductId] = useState(productId);
 
-  // Chat 3 Finding (HIGH), round 5: starts `false` on every render
-  // (including the server-rendered one) and only reads `sessionStorage`
-  // here, in an effect — never in the initial state itself — so the
-  // server-rendered HTML and the client's first hydration pass always
-  // agree; this one-render "no warning, then possibly a warning" flash
-  // for a returning tab is the same accepted tradeoff `cart-context.tsx`
-  // documents for its own `localStorage` hydration.
+  // Round 6: resets synchronously, DURING render, the moment a new
+  // `productId` prop is observed on this already-mounted instance —
+  // see this component's own doc comment for why this must not be an
+  // effect.
+  if (productId !== currentProductId) {
+    setCurrentProductId(productId);
+    setHasUnknownOutcome(false);
+    setRestorationState("pending");
+    setPersistenceConfirmed(true);
+  }
+
+  // Chat 3 Finding (HIGH), round 5: starts `false`/`"pending"` on
+  // every render (including the server-rendered one) and only reads
+  // `sessionStorage` here, in an effect — never in the initial state
+  // itself — so the server-rendered HTML and the client's first
+  // hydration pass always agree; this one-render "pending, then
+  // possibly a warning" flash for a returning tab is the same accepted
+  // tradeoff `cart-context.tsx` documents for its own `localStorage`
+  // hydration.
   useEffect(() => {
-    if (hasUnresolvedAdjustmentOutcome(productId)) {
-      setHasUnknownOutcome(true);
+    let isCurrent = true;
+    const result = readUnresolvedAdjustmentOutcome(productId);
+    if (!isCurrent) {
+      return;
     }
+    if (result.status === "present") {
+      setHasUnknownOutcome(true);
+      setPersistenceConfirmed(true);
+    } else if (result.status === "unreadable") {
+      // Round 6, requirement 3.5: never treat a restoration failure as
+      // confirmed absence — conservatively surface the same handling
+      // as a real, present flag, but mark it as not confirmed so the
+      // copy stays honest about the uncertainty.
+      setHasUnknownOutcome(true);
+      setPersistenceConfirmed(false);
+    } else {
+      setHasUnknownOutcome(false);
+      setPersistenceConfirmed(true);
+    }
+    setRestorationState("ready");
+    return () => {
+      isCurrent = false;
+    };
   }, [productId]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (isSubmitting) return;
+    // Round 6, requirements 3.1/3.2: enforced here, in `handleSubmit`
+    // itself — not merely via the submit button's own `disabled`
+    // attribute (which guards an ordinary click, but is not what this
+    // function itself checks before doing anything irreversible).
+    if (restorationState !== "ready") {
+      setErrorCode("RESTORATION_PENDING");
+      return;
+    }
 
     setErrorCode(null);
 
@@ -130,13 +224,23 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
     const quantityChange = direction === "increase" ? parsedQuantity : -parsedQuantity;
 
     if (hasUnknownOutcome) {
+      // Round 6, requirement 4.4: only promise the cross-remount
+      // persistence guarantee when it was actually confirmed —
+      // otherwise this says so plainly instead of overstating it.
       const acknowledgedRisk = window.confirm(
-        "An earlier attempt's outcome is still unknown, and will stay unresolved for this " +
-          "product in this browser tab — even if this new attempt succeeds, and even if you " +
-          "leave and come back to this page. That earlier attempt may already have been " +
-          "applied, so submitting again could create a DUPLICATE stock change. Do not keep " +
-          "retrying based on this page alone: check the stock history below for a possible " +
-          "duplicate first. Submit this adjustment anyway?",
+        persistenceConfirmed
+          ? "An earlier attempt's outcome is still unknown, and will stay unresolved for this " +
+              "product in this browser tab — even if this new attempt succeeds, and even if " +
+              "you leave and come back to this page. That earlier attempt may already have " +
+              "been applied, so submitting again could create a DUPLICATE stock change. Do " +
+              "not keep retrying based on this page alone: check the stock history below for " +
+              "a possible duplicate first. Submit this adjustment anyway?"
+          : "An earlier attempt's outcome is still unknown, and this warning could NOT be " +
+              "reliably saved for this product — it may be LOST if you leave this page, even " +
+              "though the underlying risk is not. That earlier attempt may already have been " +
+              "applied, so submitting again could create a DUPLICATE stock change. Check the " +
+              "stock history below for a possible duplicate before leaving this page. Submit " +
+              "this adjustment anyway?",
       );
       if (!acknowledgedRisk) {
         return;
@@ -184,11 +288,17 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
       setErrorCode("NETWORK_ERROR");
       // Genuinely ambiguous: the request may have reached the server
       // and been applied despite this client never seeing a response.
-      // Persisted (round 5) in the SAME place and at the SAME moment as
-      // the in-memory flag, so a remount of this exact product's form
-      // within this tab picks the ambiguity back up instead of losing it.
+      // The in-memory flag is set UNCONDITIONALLY — this mount's own
+      // warning must show regardless of whether persisting it below
+      // actually succeeds. Persisted (round 5) in the SAME event as the
+      // in-memory flag, so a remount of this exact product's form
+      // within this tab normally picks the ambiguity back up instead of
+      // losing it — but round 6: the write can itself fail, so its own
+      // result is what `persistenceConfirmed` reflects, never an
+      // assumption that it worked.
       setHasUnknownOutcome(true);
-      markAdjustmentOutcomeUnresolved(productId);
+      const persisted = markAdjustmentOutcomeUnresolved(productId);
+      setPersistenceConfirmed(persisted);
       // Refresh anyway — if the adjustment actually went through, the
       // stock/history below will already show it, which is the admin's
       // best evidence for deciding whether to resubmit.
@@ -209,12 +319,24 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
           role="alert"
           className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-sm text-amber-700 dark:text-amber-400"
         >
-          An earlier attempt&rsquo;s outcome is unknown — it may already have been applied on the
-          server even though this page never confirmed it. This warning will stay visible for this
-          product in this browser tab, even after a later attempt succeeds and even if you leave
-          this page and come back, because a later success does not prove the earlier one failed: if
-          both went through, stock may now be adjusted twice. Do not keep retrying based on this
-          page alone — check the stock history below for a possible duplicate.
+          {persistenceConfirmed ? (
+            <>
+              An earlier attempt&rsquo;s outcome is unknown — it may already have been applied on
+              the server even though this page never confirmed it. This warning will stay visible
+              for this product in this browser tab, even after a later attempt succeeds and even if
+              you leave this page and come back, because a later success does not prove the earlier
+              one failed: if both went through, stock may now be adjusted twice. Do not keep
+              retrying based on this page alone — check the stock history below for a possible
+              duplicate.
+            </>
+          ) : (
+            <>
+              An earlier attempt&rsquo;s outcome is unknown, and this warning could NOT be reliably
+              saved for this product in this browser tab — it may be lost if you leave this page,
+              even though the underlying risk is not. Check the stock history below for a possible
+              duplicate before leaving this page.
+            </>
+          )}
         </div>
       ) : null}
       {errorCode ? (
@@ -273,8 +395,12 @@ export function AdminInventoryAdjustForm({ productId }: AdminInventoryAdjustForm
         />
       </div>
       <div>
-        <Button type="submit" size="sm" disabled={isSubmitting}>
-          {isSubmitting ? "Saving…" : "Adjust stock"}
+        {/* Round 6, requirement 3.3: visibly unavailable while
+            restoration is pending — the REAL guard is in
+            `handleSubmit` itself (above); this is the user-visible
+            half of the same rule, not a substitute for it. */}
+        <Button type="submit" size="sm" disabled={isSubmitting || restorationState !== "ready"}>
+          {isSubmitting ? "Saving…" : restorationState !== "ready" ? "Checking…" : "Adjust stock"}
         </Button>
       </div>
     </form>

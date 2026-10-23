@@ -1,11 +1,12 @@
 /**
- * Chat 3 Finding 3 (MEDIUM), Finding 1 (HIGH, round 4), and the
- * round-5 remount-persistence Finding (HIGH) — regression tests for
- * `AdminInventoryAdjustForm`'s unresolved-outcome warning. Needs a
- * real DOM and `react-dom/client` (jsdom, no `react-server` resolve
- * condition) — matched by `vitest.config.ts`'s "client" project, the
- * same one `cart-context.strict-mode.test.ts` uses, via the
- * `*.client.test.ts` naming added alongside it. Written with
+ * Chat 3 Finding 3 (MEDIUM), Finding 1 (HIGH, round 4), the round-5
+ * remount-persistence Finding (HIGH), and the round-6
+ * restoration/storage-failure-safety Finding (HIGH) — regression
+ * tests for `AdminInventoryAdjustForm`'s unresolved-outcome warning.
+ * Needs a real DOM and `react-dom/client` (jsdom, no `react-server`
+ * resolve condition) — matched by `vitest.config.ts`'s "client"
+ * project, the same one `cart-context.strict-mode.test.ts` uses, via
+ * the `*.client.test.ts` naming added alongside it. Written with
  * `React.createElement` rather than JSX for the same reason that file
  * gives: staying out of the one `.test.tsx` file in the suite.
  */
@@ -13,6 +14,7 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { AdminInventoryAdjustForm } from "@/modules/admin/components/admin-inventory-adjust-form";
+import * as adjustStorage from "@/modules/admin/components/admin-inventory-adjust-storage";
 
 const refresh = vi.fn();
 vi.mock("@/core/i18n/navigation", () => ({
@@ -88,6 +90,22 @@ describe("AdminInventoryAdjustForm — Chat 3 Finding 3 (MEDIUM): the unresolved
     await mount(productId);
   }
 
+  /**
+   * Round 6, requirement 5: re-renders the SAME mounted root with a
+   * new `productId` prop — a genuinely different scenario from
+   * `remount`, which destroys and recreates the instance. This is
+   * "Next.js changed the dynamic route segment without a full
+   * unmount," which is its own, separate failure mode this round
+   * fixes (the synchronous `if (productId !== currentProductId)`
+   * reset inside the component, not an effect).
+   */
+  async function rerenderWithProductId(productId: string) {
+    await act(async () => {
+      root.render(createElement(AdminInventoryAdjustForm, { productId }));
+      await Promise.resolve();
+    });
+  }
+
   async function fillAndSubmit(quantity: string, reason: string) {
     const quantityInput = container.querySelector<HTMLInputElement>("#quantity")!;
     const reasonInput = container.querySelector<HTMLInputElement>("#adjustReason")!;
@@ -102,6 +120,30 @@ describe("AdminInventoryAdjustForm — Chat 3 Finding 3 (MEDIUM): the unresolved
       await Promise.resolve();
       await Promise.resolve();
     });
+  }
+
+  /**
+   * Round 6: fills the form and dispatches `submit` synchronously,
+   * with no `act` wrapper and no awaited microtask — used ONLY as the
+   * synchronous side effect fired FROM WITHIN a mocked
+   * `readUnresolvedAdjustmentOutcome` call (see the "before the
+   * restoration effect completes" test below) — the earliest possible
+   * point `handleSubmit` could ever run relative to the restoration
+   * effect, deterministically, regardless of how this test
+   * environment happens to schedule passive effects relative to
+   * ordinary synchronous test code (empirically, trying to "race" a
+   * real mount effect via `act`/`flushSync` timing alone did not work
+   * here — this React/jsdom combination flushes the mount effect
+   * before either returns, which is WHY this test instead fires the
+   * submission from inside the mocked read itself).
+   */
+  function dispatchSubmitSynchronously(quantity: string, reason: string) {
+    const quantityInput = container.querySelector<HTMLInputElement>("#quantity")!;
+    const reasonInput = container.querySelector<HTMLInputElement>("#adjustReason")!;
+    setNativeValue(quantityInput, quantity);
+    setNativeValue(reasonInput, reason);
+    const form = container.querySelector("form")!;
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
   }
 
   function unresolvedOutcomeWarningVisible(): boolean {
@@ -234,6 +276,115 @@ describe("AdminInventoryAdjustForm — Chat 3 Finding 3 (MEDIUM): the unresolved
     // shows ITS warning — proving the isolation is per-product, not a
     // side effect of simply clearing on any remount.
     await remount("product-1");
+    expect(unresolvedOutcomeWarningVisible()).toBe(true);
+  });
+
+  // Round 6, requirement 3 — the decisive regression test for the
+  // restoration-window gap. Before this round's fix, `hasUnknownOutcome`
+  // started `false` and a submission dispatched in the brief window
+  // before the mount effect ran would see that stale `false` and
+  // proceed completely unprotected. `restorationState` makes that
+  // window explicit, and `handleSubmit` itself (not just the disabled
+  // button) now refuses to run while it is `"pending"`.
+  it("Chat 3 Finding (HIGH), round 6: a submission attempted before the restoration effect completes sends no request", async () => {
+    // Fires a real submission from WITHIN the mocked
+    // `readUnresolvedAdjustmentOutcome` call itself — the earliest
+    // possible point in the component's whole lifecycle at which
+    // `handleSubmit` could ever run relative to the restoration
+    // effect: `restorationState` is still its initial `"pending"`
+    // here, since the line that would flip it to `"ready"` has not
+    // executed yet. This deterministically proves `handleSubmit`'s
+    // own guard blocks it, independent of real timing/scheduling (an
+    // actual wall-clock race between a real mount effect and a real
+    // submission could not be made to reproduce reliably in this
+    // React/jsdom test environment — passive effects from an initial
+    // mount are flushed eagerly here regardless of `act`/`flushSync`
+    // usage, which this test's own history empirically confirmed).
+    const readSpy = vi
+      .spyOn(adjustStorage, "readUnresolvedAdjustmentOutcome")
+      .mockImplementationOnce(() => {
+        dispatchSubmitSynchronously("5", "restock from supplier");
+        return { status: "absent" };
+      });
+
+    await remount("product-1");
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("RESTORATION_PENDING");
+
+    readSpy.mockRestore();
+  });
+
+  // Round 6, requirement 4 — a storage READ failure must never be
+  // represented as "no unresolved outcome." Spies on the real
+  // `sessionStorage.getItem` (not a mock of the whole storage module)
+  // so this exercises the actual module's own try/catch path end to
+  // end, exactly as it would really fail (e.g. a private-browsing
+  // restriction throwing on access).
+  it("Chat 3 Finding (HIGH), round 6: a storage read failure is treated as unresolved, never as a confirmed clean state", async () => {
+    const getItemSpy = vi.spyOn(Storage.prototype, "getItem").mockImplementationOnce(() => {
+      throw new Error("storage access blocked");
+    });
+
+    await remount("product-1");
+
+    // Conservative: surfaced exactly like a real, present flag would
+    // be — the admin still gets the SAME extra confirmation gate
+    // before submitting, never a silent "all clear."
+    expect(unresolvedOutcomeWarningVisible()).toBe(true);
+    // And the copy is honest that this one was never actually
+    // confirmed as persisted (see the component's own `persistenceConfirmed`
+    // branch) — distinct wording from a genuinely restored flag.
+    expect(container.textContent).toContain("could NOT be");
+
+    getItemSpy.mockRestore();
+  });
+
+  // Round 6, requirement 4 — a storage WRITE failure (persisting a
+  // brand-new ambiguity) must not crash the form, and the CURRENT
+  // mount's warning must still show even though it could not be saved.
+  it("Chat 3 Finding (HIGH), round 6: a storage write failure after a fetch rejection keeps the current warning visible and does not crash", async () => {
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem").mockImplementationOnce(() => {
+      throw new Error("quota exceeded");
+    });
+
+    fetchMock.mockRejectedValueOnce(new Error("network down"));
+
+    await expect(fillAndSubmit("5", "restock from supplier")).resolves.toBeUndefined();
+
+    expect(unresolvedOutcomeWarningVisible()).toBe(true);
+    expect(container.textContent).toContain("could NOT be");
+
+    setItemSpy.mockRestore();
+  });
+
+  // Round 6, requirement 5 — `productId` changing on an ALREADY
+  // mounted instance (no unmount at all) must not leak product A's
+  // warning into product B's rendering of the SAME component.
+  it("Chat 3 Finding (HIGH), round 6: changing productId on the same mounted component does not leak product A's warning into product B", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("network down"));
+    await fillAndSubmit("5", "restock from supplier");
+    expect(unresolvedOutcomeWarningVisible()).toBe(true);
+
+    await rerenderWithProductId("product-2");
+
+    expect(unresolvedOutcomeWarningVisible()).toBe(false);
+  });
+
+  // Round 6, requirement 5 — the other direction: switching (without
+  // unmounting) TO a product that already has its own stored flag
+  // must restore that product's own warning correctly.
+  it("Chat 3 Finding (HIGH), round 6: changing productId on the same mounted component restores the NEW product's own stored flag", async () => {
+    // product-3 already has a real, persisted unresolved outcome from
+    // "earlier in this tab" — using the actual production function,
+    // not a hand-rolled key, so this doesn't assume the storage
+    // module's internal key format.
+    adjustStorage.markAdjustmentOutcomeUnresolved("product-3");
+
+    expect(unresolvedOutcomeWarningVisible()).toBe(false); // still showing product-1, clean
+
+    await rerenderWithProductId("product-3");
+
     expect(unresolvedOutcomeWarningVisible()).toBe(true);
   });
 });
