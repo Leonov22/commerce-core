@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { isValidOrderStatusTransition } from "@/modules/order/domain/order";
+import {
+  isValidOrderStatusTransition,
+  calculateOrderDiscountAmountMinor,
+} from "@/modules/order/domain/order";
+import type { OrderItem } from "@/modules/order/domain/order";
 
 describe("isValidOrderStatusTransition", () => {
   it("allows PENDING -> PAID", () => {
@@ -33,5 +37,73 @@ describe("isValidOrderStatusTransition", () => {
 
   it("forbids a no-op PENDING -> PENDING transition", () => {
     expect(isValidOrderStatusTransition("PENDING", "PENDING")).toBe(false);
+  });
+});
+
+function makeOrderItem(overrides: Partial<OrderItem> = {}): OrderItem {
+  return {
+    id: "item-1",
+    orderId: "order-1",
+    productId: "1",
+    productName: "Studio Chair",
+    regularUnitPriceAmountMinor: 22000,
+    unitPriceAmountMinor: 22000,
+    quantity: 1,
+    lineTotalAmountMinor: 22000,
+    currency: "EUR",
+    ...overrides,
+  };
+}
+
+describe("calculateOrderDiscountAmountMinor", () => {
+  it("is zero when no line was discounted", () => {
+    const items = [
+      makeOrderItem({ regularUnitPriceAmountMinor: 22000, unitPriceAmountMinor: 22000 }),
+    ];
+    expect(calculateOrderDiscountAmountMinor(items)).toBe(0);
+  });
+
+  it("computes the discount for a single discounted line — the Studio Chair €220 -> €187 scenario", () => {
+    const items = [
+      makeOrderItem({
+        regularUnitPriceAmountMinor: 22000,
+        unitPriceAmountMinor: 18700,
+        quantity: 1,
+      }),
+    ];
+    expect(calculateOrderDiscountAmountMinor(items)).toBe(3300);
+  });
+
+  it("scales a discounted line's total by quantity", () => {
+    const items = [
+      makeOrderItem({
+        regularUnitPriceAmountMinor: 22000,
+        unitPriceAmountMinor: 18700,
+        quantity: 3,
+      }),
+    ];
+    expect(calculateOrderDiscountAmountMinor(items)).toBe(3300 * 3);
+  });
+
+  it("sums the discount across multiple lines, including undiscounted ones contributing zero", () => {
+    const items = [
+      makeOrderItem({
+        id: "item-1",
+        regularUnitPriceAmountMinor: 22000,
+        unitPriceAmountMinor: 18700,
+        quantity: 1,
+      }),
+      makeOrderItem({
+        id: "item-2",
+        regularUnitPriceAmountMinor: 4500,
+        unitPriceAmountMinor: 4500,
+        quantity: 2,
+      }),
+    ];
+    expect(calculateOrderDiscountAmountMinor(items)).toBe(3300);
+  });
+
+  it("returns zero for an order with no items", () => {
+    expect(calculateOrderDiscountAmountMinor([])).toBe(0);
   });
 });

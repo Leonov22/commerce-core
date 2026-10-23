@@ -4,6 +4,7 @@ import { Package } from "lucide-react";
 import { Container } from "@/shared/components/layout/container";
 import { Link } from "@/core/i18n/navigation";
 import { formatProductPrice } from "@/shared/utils/format-price";
+import { calculateOrderDiscountAmountMinor } from "@/modules/order/domain/order";
 import type { Order } from "@/modules/order/domain/order";
 
 interface CustomerOrderDetailViewProps {
@@ -42,6 +43,10 @@ export async function CustomerOrderDetailView({
   const locale = await getLocale();
   const dateFormatter = new Intl.DateTimeFormat(locale, { dateStyle: "medium" });
 
+  // The PR2-F02 single-currency invariant (every line shares the Order's
+  // own `currency`) is what makes summing raw minor units here safe.
+  const discountAmountMinor = calculateOrderDiscountAmountMinor(order.items);
+
   return (
     <section className="py-16 sm:py-24">
       <Container>
@@ -56,8 +61,29 @@ export async function CustomerOrderDetailView({
           {t("placedOn", { date: dateFormatter.format(order.createdAt) })}
         </p>
         <p className="mt-1 text-sm text-muted-foreground">{t(`status.${order.status}`)}</p>
+        {order.payment ? (
+          <p className="mt-1 text-sm text-muted-foreground">
+            {t("paymentStatusLabel")}: {t(`paymentStatus.${order.payment.status}`)}
+          </p>
+        ) : null}
 
-        <div className="mt-10 rounded-lg border border-border p-6">
+        <div className="mt-8 rounded-lg border border-border p-6">
+          <h2 className="text-sm font-medium">{t("customer.heading")}</h2>
+          <dl className="mt-3 grid gap-2 text-sm sm:grid-cols-2">
+            <div>
+              <dt className="text-muted-foreground">{t("customer.name")}</dt>
+              <dd className="mt-0.5">
+                {order.firstName} {order.lastName}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-muted-foreground">{t("customer.email")}</dt>
+              <dd className="mt-0.5">{order.email}</dd>
+            </div>
+          </dl>
+        </div>
+
+        <div className="mt-6 rounded-lg border border-border p-6">
           <ul className="flex flex-col gap-4">
             {order.items.map((item) => (
               <li key={item.id} className="flex items-start gap-3">
@@ -92,6 +118,15 @@ export async function CustomerOrderDetailView({
                         ),
                       })}
                     </p>
+                    {item.regularUnitPriceAmountMinor > item.unitPriceAmountMinor ? (
+                      <p className="text-xs text-muted-foreground line-through">
+                        {formatProductPrice(
+                          item.regularUnitPriceAmountMinor,
+                          item.currency,
+                          locale,
+                        )}
+                      </p>
+                    ) : null}
                   </div>
                 </div>
               </li>
@@ -102,9 +137,32 @@ export async function CustomerOrderDetailView({
             <div className="flex items-center justify-between">
               <span className="text-muted-foreground">{t("subtotal")}</span>
               <span className="font-medium">
-                {formatProductPrice(order.subtotalAmountMinor, order.currency, locale)}
+                {/* `order.subtotalAmountMinor` is already POST-discount
+                    (IMP-047: it's the sum of each line's actually-charged
+                    `lineTotalAmountMinor`). Shown here as the REGULAR,
+                    pre-discount subtotal instead — adding the discount
+                    back — specifically so the "Discount" line below can
+                    subtract it visibly without double-counting: regular
+                    subtotal − discount = `order.subtotalAmountMinor`
+                    (unchanged, still exactly what Checkout charged),
+                    + delivery = `order.totalAmountMinor` (also unchanged).
+                    When there is no discount this is numerically
+                    identical to `order.subtotalAmountMinor` on its own. */}
+                {formatProductPrice(
+                  order.subtotalAmountMinor + discountAmountMinor,
+                  order.currency,
+                  locale,
+                )}
               </span>
             </div>
+            {discountAmountMinor > 0 ? (
+              <div className="flex items-center justify-between">
+                <span className="text-muted-foreground">{t("discount")}</span>
+                <span className="font-medium">
+                  -{formatProductPrice(discountAmountMinor, order.currency, locale)}
+                </span>
+              </div>
+            ) : null}
             <div className="flex items-center justify-between">
               <span className="text-muted-foreground">{t("delivery")}</span>
               <span className="font-medium">

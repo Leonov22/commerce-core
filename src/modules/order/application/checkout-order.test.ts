@@ -211,6 +211,7 @@ function makeFakeRepository(): {
         orderId: id,
         ...item,
       })),
+      payment: null,
     };
     ordersById.set(id, order);
     return order;

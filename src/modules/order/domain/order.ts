@@ -30,6 +30,44 @@ export function isValidOrderStatusTransition(from: OrderStatus, to: OrderStatus)
   return ALLOWED_ORDER_STATUS_TRANSITIONS[from].includes(to);
 }
 
+/**
+ * The Order record has no order-level discount column — each `OrderItem`
+ * already captures both its regular and actually-charged unit price
+ * (IMP-047), so the total discount is the sum of that difference across
+ * every line, scaled by quantity. Pulled out as a pure function (mirrors
+ * `calculateCartSubtotal` in Cart's own `types/cart.ts`) so the customer
+ * order detail view can render it without duplicating the arithmetic
+ * inline, and so it's directly unit-testable without rendering a React
+ * Server Component. Returns 0 for an order with no discounted lines.
+ */
+export function calculateOrderDiscountAmountMinor(items: OrderItem[]): number {
+  return items.reduce(
+    (sum, item) =>
+      sum + (item.regularUnitPriceAmountMinor - item.unitPriceAmountMinor) * item.quantity,
+    0,
+  );
+}
+
+/**
+ * Mirrors Prisma's `PaymentStatus` enum values exactly, as a local string
+ * literal union — same convention `OrderStatus` already uses for its own
+ * enum, and for the same reason: this domain layer stays framework/Prisma
+ * independent, and Order's own module boundary does not import from
+ * `@/modules/payment` (its presentation layer explicitly composes Payment
+ * UI via a slot the page provides, never by importing Payment directly —
+ * see `CustomerOrderDetailView`'s own doc comment). Reading `Payment` row
+ * data via Order's own `Order.payment` Prisma relation is not the same as
+ * importing Payment's module surface: it's the reverse side of a 1:1
+ * relation Order's own schema already declares.
+ */
+export type OrderPaymentStatus = "PENDING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
+
+export interface OrderPaymentSummary {
+  status: OrderPaymentStatus;
+  /** Provider-neutral reference (e.g. a Stripe PaymentIntent id) — never a card number or other payment secret. */
+  providerReference: string | null;
+}
+
 export interface OrderItem {
   id: string;
   orderId: string;
@@ -62,4 +100,6 @@ export interface Order {
   createdAt: Date;
   updatedAt: Date;
   items: OrderItem[];
+  /** `null` until a `Payment` row exists for this order (e.g. right after creation, before checkout's payment step begins) — never fabricated. */
+  payment: OrderPaymentSummary | null;
 }

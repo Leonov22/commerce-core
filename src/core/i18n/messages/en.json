@@ -233,6 +233,7 @@
         "description": "View the details of your order."
       },
       "title": "Order history",
+      "loading": "Loading…",
       "empty": "You haven't placed any orders yet.",
       "orderReference": "Order {id}",
       "placedOn": "Placed on {date}",
@@ -242,12 +243,25 @@
       "quantity": "Qty {quantity}",
       "unitPrice": "{amount} each",
       "subtotal": "Subtotal",
+      "discount": "Discount",
       "delivery": "Delivery",
       "total": "Total",
       "status": {
         "PENDING": "Pending",
         "PAID": "Paid",
         "CANCELLED": "Cancelled"
+      },
+      "paymentStatusLabel": "Payment status",
+      "paymentStatus": {
+        "PENDING": "Payment pending",
+        "SUCCEEDED": "Payment received",
+        "FAILED": "Payment failed",
+        "CANCELLED": "Payment cancelled"
+      },
+      "customer": {
+        "heading": "Customer",
+        "name": "Name",
+        "email": "Email"
       },
       "payment": {
         "loading": "Preparing payment…",

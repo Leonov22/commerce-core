@@ -49,6 +49,7 @@ function makeFakeRepository(
     createdAt: now,
     updatedAt: now,
     items: [],
+    payment: null,
   };
   const updateStatusIfCurrentCalls: {
     orderId: string;

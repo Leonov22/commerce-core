@@ -44,6 +44,7 @@ function makeOrder(overrides: Partial<Order> = {}): Order {
     createdAt: now,
     updatedAt: now,
     items: [],
+    payment: null,
     ...overrides,
   };
 }

@@ -4,7 +4,7 @@ import { Button, buttonVariants } from "@/shared/components/ui/button";
 import { cn } from "@/core/lib/utils";
 import { formatProductPrice } from "@/modules/catalog/client";
 import type { StorefrontProductSummary } from "@/modules/catalog/client";
-import { canCheckout } from "@/modules/cart/types/cart";
+import { canCheckout, calculateCartSubtotal } from "@/modules/cart/types/cart";
 import type { CartItem } from "@/modules/cart/types/cart";
 
 interface CartSummaryProps {
@@ -18,20 +18,12 @@ export function CartSummary({ items, productsById, isLoading }: CartSummaryProps
   const locale = useLocale();
 
   // Presentation-only calculation from currently-resolved catalog prices.
-  // Checkout must recalculate authoritative prices server-side.
-  // EUR is this store's default/only currency (business decision) — this
-  // initial value is only ever shown if the cart has no resolved products
-  // at all, since the loop below always overwrites it with the real
-  // product currency once one resolves.
-  let subtotalAmountMinor = 0;
-  let currency = "EUR";
-  for (const item of items) {
-    const product = productsById.get(item.productId);
-    if (product) {
-      subtotalAmountMinor += product.priceAmountMinor * item.quantity;
-      currency = product.currency;
-    }
-  }
+  // Checkout must recalculate authoritative prices server-side. See
+  // `calculateCartSubtotal`'s own doc comment for the bug this used to
+  // have (summing the pre-discount `priceAmountMinor` instead of
+  // `effectivePriceAmountMinor`) and why the logic now lives there,
+  // directly unit-tested, instead of inline here.
+  const { amountMinor: subtotalAmountMinor, currency } = calculateCartSubtotal(items, productsById);
   const subtotal = formatProductPrice(subtotalAmountMinor, currency, locale);
 
   const ready = canCheckout(items, productsById, isLoading);

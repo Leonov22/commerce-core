@@ -902,6 +902,46 @@ describe("prismaOrderRepository — customer order history", () => {
     expect(found?.items[0]?.unitPriceAmountMinor).toBe(1000);
   });
 
+  it("reports payment as null when no Payment row exists yet for this order", async () => {
+    const userId = await createTestUser("payment-null");
+    const order = await prismaOrderRepository.create(baseInput({ userId }));
+    historyOrderIds.push(order.id);
+
+    const found = await prismaOrderRepository.findByIdForUser(order.id, userId);
+    expect(found?.payment).toBeNull();
+
+    const page = await prismaOrderRepository.findManyByUserId(userId, { take: 10 });
+    expect(page.orders[0]?.payment).toBeNull();
+  });
+
+  it("includes the real Payment row's status and provider reference once one exists, for both findByIdForUser and findManyByUserId", async () => {
+    const userId = await createTestUser("payment-present");
+    const order = await prismaOrderRepository.create(baseInput({ userId }));
+    historyOrderIds.push(order.id);
+
+    await prisma.payment.create({
+      data: {
+        orderId: order.id,
+        status: "SUCCEEDED",
+        amountMinor: order.totalAmountMinor,
+        currency: order.currency,
+        providerReference: "pi_test_reference_123",
+      },
+    });
+
+    const found = await prismaOrderRepository.findByIdForUser(order.id, userId);
+    expect(found?.payment).toEqual({
+      status: "SUCCEEDED",
+      providerReference: "pi_test_reference_123",
+    });
+
+    const page = await prismaOrderRepository.findManyByUserId(userId, { take: 10 });
+    expect(page.orders[0]?.payment).toEqual({
+      status: "SUCCEEDED",
+      providerReference: "pi_test_reference_123",
+    });
+  });
+
   it("SET NULL: deleting the owning User leaves the Order intact with userId = null", async () => {
     const userId = await createTestUser("delete-set-null");
     const order = await prismaOrderRepository.create(baseInput({ userId }));

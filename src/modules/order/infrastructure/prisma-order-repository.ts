@@ -11,7 +11,13 @@ import type {
   CreateIdempotentOrderResult,
   IdempotencyRecord,
 } from "@/modules/order/repositories/order-repository";
-import type { Order, OrderItem, OrderStatus } from "@/modules/order/domain/order";
+import type {
+  Order,
+  OrderItem,
+  OrderStatus,
+  OrderPaymentStatus,
+  OrderPaymentSummary,
+} from "@/modules/order/domain/order";
 
 function toOrderCreateData(input: NewOrderInput) {
   return {
@@ -42,7 +48,7 @@ function toOrderCreateData(input: NewOrderInput) {
 async function createOrderRecord(input: NewOrderInput) {
   return prisma.order.create({
     data: toOrderCreateData(input),
-    include: { items: true },
+    include: { items: true, payment: true },
   });
 }
 
@@ -65,7 +71,7 @@ function isIdempotencyKeyViolation(error: unknown): boolean {
 async function findOrderRecord(orderId: string) {
   return prisma.order.findUnique({
     where: { id: orderId },
-    include: { items: true },
+    include: { items: true, payment: true },
   });
 }
 
@@ -85,6 +91,16 @@ function toDomainOrderItem(row: OrderRow["items"][number]): OrderItem {
   };
 }
 
+function toDomainPayment(payment: OrderRow["payment"]): OrderPaymentSummary | null {
+  if (!payment) {
+    return null;
+  }
+  return {
+    status: payment.status as OrderPaymentStatus,
+    providerReference: payment.providerReference,
+  };
+}
+
 function toDomainOrder(row: OrderRow): Order {
   return {
     id: row.id,
@@ -101,6 +117,7 @@ function toDomainOrder(row: OrderRow): Order {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     items: row.items.map(toDomainOrderItem),
+    payment: toDomainPayment(row.payment),
   };
 }
 
@@ -153,7 +170,7 @@ export const prismaOrderRepository: OrderRepository = {
       },
       orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       take: take + 1,
-      include: { items: true },
+      include: { items: true, payment: true },
     });
 
     const hasNextPage = rows.length > take;
@@ -175,7 +192,7 @@ export const prismaOrderRepository: OrderRepository = {
     // doesn't exist at all.
     const row = await prisma.order.findFirst({
       where: { id: orderId, userId },
-      include: { items: true },
+      include: { items: true, payment: true },
     });
     return row ? toDomainOrder(row) : null;
   },
@@ -228,7 +245,7 @@ export const prismaOrderRepository: OrderRepository = {
           idempotencyKey: input.idempotencyKey,
           idempotencyRequestHash: input.idempotencyRequestHash,
         },
-        include: { items: true },
+        include: { items: true, payment: true },
       });
       return { outcome: "created", order: toDomainOrder(row) };
     } catch (error) {
@@ -241,7 +258,7 @@ export const prismaOrderRepository: OrderRepository = {
       // for what happens next, never this call's own (rejected) input.
       const existing = await prisma.order.findUnique({
         where: { idempotencyKey: input.idempotencyKey },
-        include: { items: true },
+        include: { items: true, payment: true },
       });
       if (!existing) {
         // The row that caused the violation is gone by the time we
@@ -265,7 +282,7 @@ export const prismaOrderRepository: OrderRepository = {
     // (e.g. a product that resolved fine originally becoming unavailable).
     const row = await prisma.order.findUnique({
       where: { idempotencyKey },
-      include: { items: true },
+      include: { items: true, payment: true },
     });
     if (!row || row.idempotencyRequestHash === null) {
       return null;

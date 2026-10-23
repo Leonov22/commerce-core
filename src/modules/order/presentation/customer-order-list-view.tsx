@@ -49,6 +49,11 @@ export async function CustomerOrderListView({ orders, nextCursor }: CustomerOrde
                     </div>
                     <div className="text-right">
                       <p className="text-muted-foreground">{t(`status.${order.status}`)}</p>
+                      {order.payment ? (
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {t(`paymentStatus.${order.payment.status}`)}
+                        </p>
+                      ) : null}
                       <p className="mt-1 font-medium">
                         {formatProductPrice(order.totalAmountMinor, order.currency, locale)}
                       </p>
